@@ -182,6 +182,55 @@ Encrypted statements: `--password SECRET`, or derive them with
 `--name "<your name>" --dob DD/MM/YYYY --card-last4 1234` (tries the documented issuer
 conventions: `first4name+DDMM`, `FIRST4+DDMMYYYY`, `DDMMYYYY`, …).
 
+## Ask an LLM with MCP
+
+The project includes a read-only MCP server and a `statement-analytics` Agent
+Skill for questions that do not fit a fixed dashboard: period comparisons,
+merchant/category trends, recurring charges, unusual debits, card comparisons,
+and parser-health audits. The server exposes curated tools—never arbitrary SQL,
+passwords, PDF paths, or database writes.
+
+Install the project once, using absolute paths in client configuration:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -e .
+```
+
+LM Studio (Program → Install → Edit `mcp.json`) and Claude Desktop/Claude Code
+accept this stdio server shape:
+
+```json
+{
+  "mcpServers": {
+    "statement-analytics": {
+      "command": "/ABSOLUTE/PATH/statement-parser-delta/.venv/bin/python",
+      "args": ["-m", "sparser.mcp_server"],
+      "env": {
+        "SPARSER_DB": "/ABSOLUTE/PATH/statement-parser-delta/statements.db"
+      }
+    }
+  }
+}
+```
+
+For Codex, add the equivalent to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.statement-analytics]
+command = "/ABSOLUTE/PATH/statement-parser-delta/.venv/bin/python"
+args = ["-m", "sparser.mcp_server"]
+
+[mcp_servers.statement-analytics.env]
+SPARSER_DB = "/ABSOLUTE/PATH/statement-parser-delta/statements.db"
+```
+
+The repository's [.mcp.json](.mcp.json) is ready for clients launched from the
+project root. The portable skill lives at
+[`skills/statement-analytics/`](skills/statement-analytics/); clients supporting
+Agent Skills can load that folder directly or copy it into their skill directory.
+Restart the MCP client after changing its configuration.
+
 ## Tests
 
 ```bash

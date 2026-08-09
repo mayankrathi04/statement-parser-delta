@@ -1,0 +1,60 @@
+id: axis_cc_legacy_v1
+issuer: Axis Bank
+doc_type: credit_card
+currency: INR
+
+fingerprint:
+  all: ["Axis Bank"]
+  any: ["Credit Card Statement"]
+statement_date_pattern: 'Statement Generation Date\s*\n[^\n]*?(\d{2}/\d{2}/\d{4})\s*$'
+valid_through: 2025-10-31
+summary_amount: decimal
+
+layout:
+  y_tolerance: 2.0
+sections:
+  starts: {"Account Summary": domestic}
+  ends: ["End of Statement", "CASHBACK DETAILS", "IMPORTANT MESSAGE", "Page "]
+table:
+  header_tokens: ["DATE", "TRANSACTION DETAILS", "AMOUNT"]
+  header_clusters: [date, description, category, amount, "cashback?"]
+  cluster_gap: 8
+  bands:
+    date: ["date.x0 - 30", "date.x1 + 20"]
+    description: ["date.x1 + 20", "category.x0 - 35"]
+    category: ["category.x0 - 35", "amount.x0 - 10"]
+    amount: ["amount.x0 - 10", "cashback.x0 - 3 || amount.x1 + 30"]
+    cashback: ["cashback.x0 - 3", "cashback.x1 + 20"]
+row:
+  date_formats: ["%d/%m/%Y"]
+  date_pattern: '^\s*(\d{2}/\d{2}/\d{4})'
+  cardholder_pattern: '^(?!.*)$'
+  emi_token: "__none__"
+  fcy_pattern: '(?!x)x'
+  max_orphan_gap: 14.0
+  drop_patterns:
+    - '^Card No:'
+    # Legacy summaries classify card fees, tax, and EMI interest as finance
+    # charges. Keeping them in purchase rows would count them twice.
+    - '^\d{2}/\d{2}/\d{4}\s+(?:ANNUAL FEE|GST|EMI INTEREST)\b'
+    - '^\*+ End of Statement'
+    - '^Page \d+ of \d+$'
+header:
+  product: {regex: '^\s*(.*?)\s*Credit Card Statement\s*$'}
+  account_masked: {below: "Credit Card Number"}
+  statement_date: {below: "Statement Generation Date", kind: date}
+  billing_period: {text_below: "Statement Period", kind: period}
+period_separator: '\s+-\s+'
+summary:
+  previous_dues: {row_below: "Previous Balance", index: 0, kind: signed_amount}
+  payments_credits: {sum: [{row_below: "Previous Balance", index: 1}, {row_below: "Previous Balance", index: 2}]}
+  purchases_debits: {sum: [{row_below: "Previous Balance", index: 3}, {row_below: "Previous Balance", index: 4}]}
+  finance_charges: {row_below: "Previous Balance", index: 5}
+  total_dues: {row_below: "Previous Balance", index: 6, kind: signed_amount}
+  minimum_due: {below: "Minimum Payment Due"}
+  credit_limit: {below: "Credit Limit"}
+  available_credit: {below: "Available Credit Limit"}
+  available_cash: {below: "Available Cash Limit"}
+  due_date: {below: "Payment Due Date", kind: date}
+date_formats: ["%d/%m/%Y"]
+validate: [cc_summary_reconcile, debits_match_purchases, credits_match_payments, transactions_reconcile_to_total, transactions_within_period]

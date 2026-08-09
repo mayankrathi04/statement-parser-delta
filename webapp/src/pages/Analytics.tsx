@@ -14,6 +14,63 @@ const RANGES: { label: string; months: number }[] = [
 ]
 
 type SortKey = 'txn_date' | 'amount' | 'merchant' | 'category' | 'card'
+type ForeignSortKey = 'original' | 'billed'
+type PageSize = 25 | 50 | 75 | 'all'
+
+function usePagination<T>(rows: T[]) {
+  const [size, setSize] = useState<PageSize>(25)
+  const [page, setPage] = useState(0)
+  const pageSize = size === 'all' ? Math.max(rows.length, 1) : size
+  const pages = Math.max(1, Math.ceil(rows.length / pageSize))
+
+  useEffect(() => { setPage(0) }, [rows, size])
+
+  return {
+    rows: size === 'all' ? rows : rows.slice(page * pageSize, (page + 1) * pageSize),
+    page: Math.min(page, pages - 1),
+    pages,
+    size,
+    setPage,
+    setSize,
+  }
+}
+
+function TablePager({
+  count, page, pages, size, setPage, setSize,
+}: {
+  count: number
+  page: number
+  pages: number
+  size: PageSize
+  setPage: (page: number) => void
+  setSize: (size: PageSize) => void
+}) {
+  const pageSize = size === 'all' ? Math.max(count, 1) : size
+  const first = count ? page * pageSize + 1 : 0
+  const last = Math.min(count, (page + 1) * pageSize)
+
+  return (
+    <div className="table-pager">
+      <span className="sub">Rows {first}–{last} of {count}</span>
+      <span className="spacer" />
+      <label className="sub">
+        Per page{' '}
+        <select
+          value={size}
+          onChange={(e) => setSize(e.target.value === 'all' ? 'all' : Number(e.target.value) as PageSize)}
+        >
+          <option value={25}>25</option>
+          <option value={50}>50</option>
+          <option value={75}>75</option>
+          <option value="all">All</option>
+        </select>
+      </label>
+      <button className="btn" disabled={page === 0} onClick={() => setPage(page - 1)}>← Previous</button>
+      <span className="sub">Page {page + 1} of {pages}</span>
+      <button className="btn" disabled={page + 1 >= pages} onClick={() => setPage(page + 1)}>Next →</button>
+    </div>
+  )
+}
 
 export default function Analytics({ boot }: { boot: Bootstrap | null }) {
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -24,6 +81,8 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
   const [txns, setTxns] = useState<Txn[]>([])
   const [q, setQ] = useState('')
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'txn_date', dir: -1 })
+  const [emiAmountDir, setEmiAmountDir] = useState<1 | -1 | null>(null)
+  const [foreignSort, setForeignSort] = useState<{ key: ForeignSortKey; dir: 1 | -1 } | null>(null)
 
   // Colour follows the card, fixed by id order, so it is stable across filters.
   const colourIndex = useMemo(() => {
@@ -75,6 +134,25 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
       return (x < y ? -1 : x > y ? 1 : 0) * dir
     })
   }, [txns, q, sort])
+
+  const rewardRows = data?.rewards.by_month ?? []
+  const emiRows = useMemo(() => {
+    const source = data?.emi.rows ?? []
+    return emiAmountDir == null
+      ? source
+      : [...source].sort((a, b) => (a.amount - b.amount) * emiAmountDir)
+  }, [data?.emi.rows, emiAmountDir])
+  const fcyRows = useMemo(() => {
+    const source = data?.fcy.rows ?? []
+    if (!foreignSort) return source
+    const amount = (row: (typeof source)[number]) =>
+      foreignSort.key === 'original' ? row.fcy_amount : row.amount
+    return [...source].sort((a, b) => (amount(a) - amount(b)) * foreignSort.dir)
+  }, [data?.fcy.rows, foreignSort])
+  const rewardPager = usePagination(rewardRows)
+  const emiPager = usePagination(emiRows)
+  const fcyPager = usePagination(fcyRows)
+  const txnPager = usePagination(rows)
 
   const head = (key: SortKey, label: string, right = false) => (
     <th
@@ -191,11 +269,11 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             detail={(r) => `${r.n} earning transaction${r.n === 1 ? '' : 's'}`}
             empty="No reward points in this range."
           />
-          <div className="tbl-wrap" style={{ marginTop: 12 }}>
+          <div className="tbl-wrap tbl-scroll" style={{ marginTop: 12 }}>
             <table>
               <thead><tr><th>Month</th><th style={{ textAlign: 'right' }}>Points earned</th></tr></thead>
               <tbody>
-                {data.rewards.by_month.map((m) => (
+                {rewardPager.rows.map((m) => (
                   <tr key={m.month}>
                     <td>{m.month}</td>
                     <td className="num">{m.points.toLocaleString('en-IN')}</td>
@@ -204,6 +282,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
               </tbody>
             </table>
           </div>
+          <TablePager count={rewardRows.length} {...rewardPager} />
         </section>
       )}
 
@@ -213,14 +292,22 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             EMI transactions <span className="pill">{data.emi.count} · {money0(data.emi.total)}</span>
           </h2>
           <p className="hint">Rows the issuer flagged as converted to instalments.</p>
-          <div className="tbl-wrap">
+          <div className="tbl-wrap tbl-scroll">
             <table>
               <thead>
-                <tr><th>Date</th><th>Description</th><th>Card</th><th style={{ textAlign: 'right' }}>Amount</th></tr>
+                <tr>
+                  <th>Date</th><th>Description</th><th>Card</th>
+                  <th
+                    style={{ cursor: 'pointer', textAlign: 'right' }}
+                    onClick={() => setEmiAmountDir((dir) => dir === -1 ? 1 : -1)}
+                  >
+                    Amount {emiAmountDir == null ? '' : emiAmountDir === -1 ? '↓' : '↑'}
+                  </th>
+                </tr>
               </thead>
               <tbody>
-                {data.emi.rows.map((r, i) => (
-                  <tr key={i}>
+                {emiPager.rows.map((r, i) => (
+                  <tr key={`${r.txn_date}-${r.card_id}-${r.description}-${i}`}>
                     <td>{r.txn_date}</td>
                     <td className="desc">{r.description}</td>
                     <td><i className="swatch" style={{ background: colourOf(r.card_id) }} /> {r.card}</td>
@@ -230,6 +317,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
               </tbody>
             </table>
           </div>
+          <TablePager count={emiRows.length} {...emiPager} />
         </section>
       )}
 
@@ -239,18 +327,29 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             Foreign currency <span className="pill">{data.fcy.count} · {money0(data.fcy.total_inr)}</span>
           </h2>
           <p className="hint">Transactions billed in another currency, with the original amount alongside.</p>
-          <div className="tbl-wrap">
+          <div className="tbl-wrap tbl-scroll">
             <table>
               <thead>
                 <tr>
                   <th>Date</th><th>Description</th><th>Card</th>
-                  <th style={{ textAlign: 'right' }}>Original</th>
-                  <th style={{ textAlign: 'right' }}>Billed</th>
+                  {(['original', 'billed'] as const).map((key) => (
+                    <th
+                      key={key}
+                      style={{ cursor: 'pointer', textAlign: 'right' }}
+                      onClick={() => setForeignSort((current) => ({
+                        key,
+                        dir: current?.key === key && current.dir === -1 ? 1 : -1,
+                      }))}
+                    >
+                      {key === 'original' ? 'Original' : 'Billed'}{' '}
+                      {foreignSort?.key === key ? (foreignSort.dir === -1 ? '↓' : '↑') : ''}
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
-                {data.fcy.rows.map((r, i) => (
-                  <tr key={i}>
+                {fcyPager.rows.map((r, i) => (
+                  <tr key={`${r.txn_date}-${r.card_id}-${r.description}-${i}`}>
                     <td>{r.txn_date}</td>
                     <td className="desc">{r.description}</td>
                     <td><i className="swatch" style={{ background: colourOf(r.card_id) }} /> {r.card}</td>
@@ -261,6 +360,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
               </tbody>
             </table>
           </div>
+          <TablePager count={fcyRows.length} {...fcyPager} />
         </section>
       )}
 
@@ -279,7 +379,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             onChange={(e) => setQ(e.target.value)}
           />
         </div>
-        <div className="tbl-wrap">
+        <div className="tbl-wrap tbl-scroll">
           <table>
             <thead>
               <tr>
@@ -292,7 +392,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => (
+              {txnPager.rows.map((r) => (
                 <tr key={r.id}>
                   <td>{r.txn_date}{r.txn_time ? ` ${r.txn_time}` : ''}</td>
                   <td className="desc">
@@ -315,6 +415,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             </tbody>
           </table>
         </div>
+        <TablePager count={rows.length} {...txnPager} />
       </section>
     </>
   )

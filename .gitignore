@@ -21,3 +21,7 @@ webapp/node_modules/
 webapp/dist/
 sparser/web/dist/
 tests/
+!tests/
+tests/*
+!tests/test_template_versions.py
+!tests/test_mcp_server.py

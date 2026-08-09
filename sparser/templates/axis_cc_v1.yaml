@@ -9,6 +9,9 @@ fingerprint:
   any:
     - "Credit Card Statement"
 
+statement_date_pattern: 'Statement Generation Date\s*\n[^\n]*?(\d{2}/\d{2}/\d{4})\s*$'
+valid_from: 2025-11-01
+
 # This issuer prints no currency mark anywhere, so summary figures are found by
 # their two decimal places instead.
 summary_amount: decimal

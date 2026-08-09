@@ -89,7 +89,9 @@ def parse_signed_amount(text: str) -> Optional[Decimal]:
 def is_credit_marker(text: str) -> bool:
     """Credits are flagged either by a leading '+' (HDFC CC) or a trailing Cr."""
     t = text.replace(RUPEE, "").strip()
-    return t.startswith("+") or bool(re.search(r"\bCr\.?$", text.strip(), re.I))
+    # Some older HDFC PDFs kern the suffix directly against the amount
+    # ("315.60Cr"), so a word boundary before ``Cr`` is not guaranteed.
+    return t.startswith("+") or bool(re.search(r"Cr\.?$", text.strip(), re.I))
 
 
 def parse_date(text: str, fmts: list[str]) -> Optional[dt.date]:

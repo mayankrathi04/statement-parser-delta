@@ -1,0 +1,52 @@
+id: hdfc_cc_legacy_v1
+issuer: HDFC Bank
+doc_type: credit_card
+currency: INR
+
+fingerprint:
+  all: ["Statement for HDFC Bank Credit Card", "Statement Date:", "Account Summary"]
+  any: ["Domestic Transactions"]
+statement_date_pattern: 'Statement Date:\s*(\d{2}/\d{2}/\d{4})'
+valid_through: 2025-09-30
+period_from_statement_date: true
+summary_amount: decimal
+
+layout:
+  y_tolerance: 2.0
+sections:
+  starts: {"Domestic Transactions": domestic, "International Transactions": international}
+  ends: ["Reward Points Summary", "NeuCoins Summary", "Important Information", "IMPORTANT INFORMATION", "Page "]
+table:
+  header_tokens: ["Date", "Transaction Description", "Amount"]
+  header_clusters: [date, description, amount]
+  cluster_gap: 8
+  bands:
+    date: ["date.x0 - 30", "description.x0 - 15"]
+    description: ["description.x0 - 15", "amount.x0 - 25"]
+    amount: ["amount.x0 - 25", "amount.x1 + 35"]
+row:
+  date_formats: ["%d/%m/%Y"]
+  date_pattern: '^\s*(\d{2}/\d{2}/\d{4})'
+  cardholder_pattern: '^[A-Z][A-Z. ]{4,40}$'
+  emi_token: "__none__"
+  fcy_pattern: '(?!x)x'
+  max_orphan_gap: 20.0
+  drop_patterns: ['^Page \d+ of \d+$', '^\*']
+header:
+  product: {regex: '^(.*?)\s*Credit Card Statement\s*$'}
+  account_holder: {regex: '^Name\s*:\s*(.*?)\s+Statement for HDFC'}
+  account_masked: {regex: '^.*Card No:\s*(.+)$', compact: true}
+  statement_date: {regex: '^.*Statement Date:\s*(\d{2}/\d{2}/\d{4}).*$', kind: date}
+summary:
+  previous_dues: {row_below: "Opening Payment/", index: 0, kind: signed_amount}
+  payments_credits: {row_below: "Opening Payment/", index: 1}
+  purchases_debits: {row_below: "Opening Payment/", index: 2}
+  finance_charges: {row_below: "Opening Payment/", index: 3}
+  total_dues: {row_below: "Opening Payment/", index: 4, kind: signed_amount}
+  minimum_due: {below: "Minimum Amount Due"}
+  due_date: {below: "Payment Due Date", kind: date}
+  credit_limit: {below: "Credit Limit"}
+  available_credit: {below: "Available Credit Limit"}
+  available_cash: {below: "Available Cash Limit"}
+date_formats: ["%d/%m/%Y"]
+validate: [cc_summary_reconcile, debits_match_purchases, credits_match_payments, transactions_reconcile_to_total, transactions_within_period]

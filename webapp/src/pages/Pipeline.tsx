@@ -136,6 +136,30 @@ function ReviewList({
     }
   }
 
+  const waitForPipeline = async () => {
+    const deadline = Date.now() + 120_000
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      const state = await api.runs()
+      if (!state.busy) return
+    }
+    throw new Error('The pipeline is still running after two minutes. Check the pipeline history and server log.')
+  }
+
+  const reevaluate = async () => {
+    setBusy(true)
+    setErr(null)
+    try {
+      await api.reevaluatePending()
+      await waitForPipeline()
+      onImported()
+    } catch (e) {
+      setErr(String((e as Error).message))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const go = async () => {
     setBusy(true)
     setErr(null)
@@ -144,17 +168,8 @@ function ReviewList({
       // Approval starts a background job. Wait for the backend lock—not an
       // arbitrary delay—before removing the review rows. Fast imports used to
       // race the 600 ms refresh and leave this button stuck on "Importing…".
-      const deadline = Date.now() + 120_000
-      while (Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 500))
-        const state = await api.runs()
-        if (!state.busy) {
-          onImported()
-          setBusy(false)
-          return
-        }
-      }
-      throw new Error('Import is still running after two minutes. Check the pipeline history and server log.')
+      await waitForPipeline()
+      onImported()
     } catch (e) {
       setErr(String((e as Error).message))
       setBusy(false)
@@ -177,6 +192,9 @@ function ReviewList({
           Select all
         </button>
         <button className="link" onClick={() => setPicked(new Set())}>Clear</button>
+        <button className="btn" disabled={busy} onClick={reevaluate}>
+          {busy ? 'Working…' : '↻ Re-evaluate pending'}
+        </button>
         <button className="btn" disabled={busy || !picked.size} onClick={discard}>
           Discard {picked.size}
         </button>
@@ -213,6 +231,16 @@ function ReviewList({
                 <td className="desc">
                   {r.filename}
                   {r.encrypted && <> <span className="pill">🔒 decrypted</span></>}
+                  {' '}
+                  <a
+                    className="link"
+                    href={api.pendingPdfUrl(r.id)}
+                    target="_blank"
+                    rel="noreferrer"
+                    title="Open this statement PDF in a new tab"
+                  >
+                    View PDF ↗
+                  </a>
                 </td>
                 <td>{r.card ?? <span className="sub">unknown</span>}</td>
                 <td>{r.period_start && r.period_end ? `${r.period_start} → ${r.period_end}` : '—'}</td>

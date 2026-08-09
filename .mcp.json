@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "statement-analytics": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "sparser.mcp_server"],
+      "env": {
+        "SPARSER_DB": "statements.db"
+      }
+    }
+  }
+}

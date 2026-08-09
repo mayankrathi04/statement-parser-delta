@@ -154,6 +154,19 @@ svg { display: block; width: 100%; overflow: visible; }
 
 /* ---- tables ---- */
 .tbl-wrap { overflow-x: auto; }
+.tbl-scroll { max-height: 430px; overflow: auto; border-bottom: 1px solid var(--border); }
+.tbl-scroll thead th {
+  position: sticky; top: 0; z-index: 2; background: var(--surface);
+  box-shadow: 0 1px 0 var(--border);
+}
+.table-pager {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px;
+}
+.table-pager select {
+  margin-left: 4px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 7px; padding: 5px 8px;
+}
+.table-pager .btn { padding: 5px 9px; }
 table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
 th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }

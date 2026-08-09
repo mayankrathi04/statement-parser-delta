@@ -387,6 +387,56 @@ def run_scan_local(db_path: Path, pdfs: Iterable[Path], creds: dict) -> int:
     return rec.run_id
 
 
+def run_reevaluate(db_path: Path, file_ids: list[int], creds: dict) -> int:
+    """Reparse review rows without importing or duplicating pending entries.
+
+    The previous row remains in history as ``reevaluated`` and the fresh parse
+    takes its place in the review list.  If a PDF is missing or reparsing fails,
+    its previous pending row is retained so the user never loses the decision.
+    """
+    conn = store.connect(db_path)
+    try:
+        where = "WHERE status = 'pending'"
+        args: list[int] = []
+        if file_ids:
+            where += f" AND id IN ({','.join('?' * len(file_ids))})"
+            args = file_ids
+        rows = conn.execute(
+            f"SELECT id, path FROM ingest_files {where} ORDER BY id", args
+        ).fetchall()
+        sources = [(int(r["id"]), Path(r["path"])) for r in rows if r["path"]]
+    finally:
+        conn.close()
+
+    rec = Recorder(db_path, "reevaluate", f"{len(sources)} pending statement(s)")
+    refreshed = 0
+    try:
+        for source_id, pdf in sources:
+            if not pdf.exists():
+                log.warning("pending file #%s no longer exists: %s", source_id, pdf)
+                continue
+            ingest_file(rec, pdf, creds, force=False, commit=False)
+            replacement_id = rec.file_id
+            c2 = store.connect(db_path)
+            try:
+                replacement = c2.execute(
+                    "SELECT status FROM ingest_files WHERE id = ?", (replacement_id,)
+                ).fetchone()
+                if replacement and replacement["status"] == "pending":
+                    c2.execute(
+                        "UPDATE ingest_files SET status = 'reevaluated' WHERE id = ?",
+                        (source_id,),
+                    )
+                    c2.commit()
+                    refreshed += 1
+            finally:
+                c2.close()
+        rec.finish("done", f"{refreshed}/{len(sources)} pending statement(s) refreshed")
+    except Exception as exc:
+        rec.finish("failed", str(exc))
+    return rec.run_id
+
+
 def run_approve(db_path: Path, file_ids: list[int], creds: dict, force: bool = False) -> int:
     """Import only the statements the user ticked."""
     conn = store.connect(db_path)

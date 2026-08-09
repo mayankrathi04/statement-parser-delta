@@ -13,6 +13,8 @@ product family instead of one PDF.
 """
 from __future__ import annotations
 
+import calendar
+import datetime as dt
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -52,12 +54,45 @@ def load_templates(directory: Path = TEMPLATE_DIR) -> list[dict[str, Any]]:
     return [yaml.safe_load(p.read_text()) for p in sorted(directory.glob("*.yaml"))]
 
 
+def _template_statement_date(page1_text: str, template: dict) -> Optional[dt.date]:
+    """Read the statement date cheaply, before committing to an analyzer.
+
+    Issuers sometimes keep the same identifying text while changing the
+    accounting treatment or table layout.  Templates can therefore declare an
+    effective date range in addition to their content fingerprint.
+    """
+    pattern = template.get("statement_date_pattern")
+    if not pattern:
+        return None
+    match = re.search(pattern, page1_text, re.MULTILINE)
+    if not match:
+        return None
+    return parse_date(match.group(1), template.get("date_formats", ["%d/%m/%Y"]))
+
+
+def _template_effective(template: dict, statement_date: Optional[dt.date]) -> bool:
+    if statement_date is None:
+        return not (template.get("valid_from") or template.get("valid_through"))
+
+    def boundary(name: str) -> Optional[dt.date]:
+        value = template.get(name)
+        if not value:
+            return None
+        return value if isinstance(value, dt.date) else dt.date.fromisoformat(value)
+
+    valid_from = boundary("valid_from")
+    valid_through = boundary("valid_through")
+    return (valid_from is None or statement_date >= valid_from) and (
+        valid_through is None or statement_date <= valid_through
+    )
+
+
 def match_template(page1_text: str, templates: list[dict]) -> dict:
     for t in templates:
         fp = t.get("fingerprint", {})
         if all(s in page1_text for s in fp.get("all", [])) and (
             not fp.get("any") or any(s in page1_text for s in fp["any"])
-        ):
+        ) and _template_effective(t, _template_statement_date(page1_text, t)):
             return t
     raise NoTemplateMatch("no template fingerprint matched this document")
 
@@ -337,6 +372,8 @@ class Engine:
                     out["period_end"] = parse_date(parts[1], self.date_formats)
                 continue
             out[field] = self._coerce(raw, kind)
+            if out[field] and spec.get("compact"):
+                out[field] = re.sub(r"\s+", "", out[field])
         return out
 
     @property
@@ -411,6 +448,18 @@ class Engine:
         # billing period it is derived from is itself validated.
         if not head.get("statement_date") and head.get("period_end"):
             head["statement_date"] = head["period_end"]
+
+        # Legacy HDFC statements print the cycle-closing date but not a billing
+        # period.  Their monthly cycle begins on the following day of the prior
+        # month (15 Jul closes a 16 Jun -> 15 Jul cycle).
+        if self.t.get("period_from_statement_date") and head.get("statement_date"):
+            end = head["statement_date"]
+            previous_month = end.month - 1 or 12
+            previous_year = end.year - (1 if end.month == 1 else 0)
+            days_in_previous_month = calendar.monthrange(previous_year, previous_month)[1]
+            start_day = min(end.day + 1, days_in_previous_month)
+            head["period_start"] = dt.date(previous_year, previous_month, start_day)
+            head["period_end"] = end
 
         return Statement(
             template_id=self.t["id"],

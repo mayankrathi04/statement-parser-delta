@@ -218,8 +218,11 @@ export const api = {
   scanLocal: (body: Record<string, unknown>) =>
     post<{ status: string }>('/api/ingest/scan-local', body),
   pending: () => get<{ pending: Pending[] }>('/api/pending'),
+  pendingPdfUrl: (id: number) => `/api/pending/${id}/pdf`,
   discard: (file_ids: number[]) =>
     post<{ discarded: number }>('/api/pending/discard', { file_ids }),
+  reevaluatePending: (file_ids: number[] = []) =>
+    post<{ status: string; count: number | null }>('/api/pending/reevaluate', { file_ids }),
   approve: (file_ids: number[]) =>
     post<{ status: string; count: number }>('/api/ingest/approve', { file_ids }),
   importLocal: (body: Record<string, unknown>) =>

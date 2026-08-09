@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import logging
+import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from . import accounts, pipeline, store
 from .logging_config import configure_progress_logging
@@ -82,6 +84,10 @@ class FetchRequest(Credentials):
 class ApproveRequest(Credentials):
     file_ids: list[int] = Field(min_length=1)
     force: bool = False
+
+
+class ReevaluateRequest(Credentials):
+    file_ids: list[int] = Field(default_factory=list)
 
 
 class ImportRequest(Credentials):
@@ -460,6 +466,63 @@ def pending():
         conn.close()
 
 
+@app.get("/api/pending/{file_id}/pdf")
+def pending_pdf(file_id: int):
+    """Open the PDF attached to a pending review row in the browser.
+
+    The database supplies the path—callers cannot request an arbitrary local
+    file. Encrypted statements are unlocked into a short-lived temporary copy
+    using the same saved card passwords/profile conventions as ingestion.
+    """
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT filename, path FROM ingest_files WHERE id = ? AND status = 'pending'",
+            (file_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "no such pending statement")
+        source = Path(row["path"])
+        if not source.is_file():
+            raise HTTPException(404, "statement PDF is no longer on disk")
+
+        from .decrypt import DecryptError, candidate_passwords, decrypt_to, is_encrypted
+
+        if not is_encrypted(source):
+            return FileResponse(
+                source,
+                media_type="application/pdf",
+                filename=row["filename"],
+                content_disposition_type="inline",
+            )
+
+        known = accounts.all_card_passwords(conn)
+        profile = accounts.get_profile(conn)
+        passwords = list(dict.fromkeys(
+            list(known.values())
+            + candidate_passwords(profile.get("full_name"), profile.get("dob"))
+        ))
+    finally:
+        conn.close()
+
+    handle = tempfile.NamedTemporaryFile(prefix="sparser-view-", suffix=".pdf", delete=False)
+    temporary = Path(handle.name)
+    handle.close()
+    try:
+        decrypt_to(source, temporary, passwords)
+    except DecryptError as exc:
+        temporary.unlink(missing_ok=True)
+        raise HTTPException(422, "saved passwords could not unlock this PDF") from exc
+
+    return FileResponse(
+        temporary,
+        media_type="application/pdf",
+        filename=row["filename"],
+        content_disposition_type="inline",
+        background=BackgroundTask(temporary.unlink, missing_ok=True),
+    )
+
+
 @app.post("/api/pending/discard")
 def discard_pending(body: dict):
     """Dismiss scanned statements without importing them."""
@@ -469,6 +532,23 @@ def discard_pending(body: dict):
         return {"discarded": pipeline.discard(conn, ids)}
     finally:
         conn.close()
+
+
+@app.post("/api/pending/reevaluate")
+def reevaluate_pending(req: ReevaluateRequest):
+    """Reparse pending PDFs with the currently installed analyzer versions."""
+    if not _lock.acquire(blocking=False):
+        raise HTTPException(409, "an ingest run is already in progress")
+    creds, ids = req.as_dict(), req.file_ids
+
+    def job():
+        try:
+            pipeline.run_reevaluate(DB_PATH, ids, creds)
+        finally:
+            _lock.release()
+
+    _spawn(job)
+    return {"status": "started", "count": len(ids) if ids else None}
 
 
 @app.post("/api/ingest/approve")
