@@ -1,0 +1,106 @@
+id: hdfc_cc_v1
+issuer: HDFC Bank
+doc_type: credit_card
+currency: INR
+
+# Matched against page-1 text. `all` must be present, `any` needs one hit.
+fingerprint:
+  all:
+    - "HDFC Bank Credit Cards GSTIN"
+  any:
+    - "Credit Card Statement"
+
+# Broken ToUnicode CMap in the statement font: the rupee glyph decodes as 'C'.
+glyph_fixes:
+  "C": "₹"
+
+layout:
+  y_tolerance: 2.0
+
+sections:
+  starts:
+    "Domestic Transactions": domestic
+    "International Transactions": international
+  # Anything at or below these ends the block. Without them the "Eligible for
+  # EMI" box, the NeuCoins note and the rewards summary leak in as phantom rows.
+  ends:
+    - "Transaction time captured"
+    - "Eligible for EMI"
+    - "Rewards Program Points Summary"
+    - "Bonus NeuCoins Summary"
+    - "Important Information"
+    - "Useful Links"
+    - "Note:"
+    - "Page "
+
+table:
+  # A statement carries the same table at several x-origins: the page-1 block is
+  # inset ~144pt relative to the page-2 block. Bands are therefore derived from
+  # each block's own header row rather than fixed in this file.
+  header_tokens: ["DATE", "TRANSACTION"]
+  # Header words cluster into these roles, left to right. The third label varies
+  # by card product ("REWARDS" on Regalia, "Base NeuCoins*" on Tata Neu), so it
+  # is located positionally, never by text.
+  header_clusters: [date, description, "rewards?", amount, pi]
+  cluster_gap: 8
+  # Bands as offsets from header-cluster edges. The EMI flag and foreign-currency
+  # columns have no header of their own, so they are carved out by offset.
+  bands:
+    date:        ["date.x0 - 8",          "description.x0 - 30"]
+    emi:         ["description.x0 - 30",  "description.x0 - 4"]
+    description: ["description.x0 - 4",   "rewards.x0 - 6 || amount.x0 - 30"]
+    fcy:         ["rewards.x0 - 6",       "rewards.x0 - 6"]
+    rewards:     ["rewards.x0 - 6",       "rewards.x1 + 8"]
+    amount:      ["rewards.x1 + 8 || amount.x0 - 30", "pi.x0 - 4"]
+    pi:          ["pi.x0 - 4",            "pi.x1 + 8"]
+  bands_by_section:
+    # Only international rows carry a foreign-currency leg; on domestic rows the
+    # description is free to run all the way up to the rewards column.
+    international:
+      description: ["description.x0 - 4", "rewards.x0 - 100 || amount.x0 - 120"]
+      fcy:         ["rewards.x0 - 100 || amount.x0 - 120", "rewards.x0 - 6 || amount.x0 - 30"]
+
+row:
+  date_formats: ["%d/%m/%Y", "%d/%m/%y"]
+  # A row starts only where the date column holds a date; every other line is a
+  # wrapped description or a cardholder sub-header.
+  date_pattern: '^\s*(\d{2}/\d{2}/\d{4})'
+  cardholder_pattern: '^[A-Z][A-Z. ]{4,40}$'
+  emi_token: "EMI"
+  fcy_pattern: '([A-Z]{3})\s+([\d,]+\.?\d*)'
+  # Descriptions wrap both above and below their own dated line (the amount is
+  # vertically centred against a 3-line description), so orphans attach to the
+  # nearest dated row in either direction. Beyond this gap it is not a wrap.
+  max_orphan_gap: 20.0
+  drop_patterns:
+    - '^Page \d+ of \d+$'
+    - '^\*'
+
+header:
+  product:        {regex: '^(.*?)\s*Credit Card Statement\s*$', page: 0}
+  account_holder: {left_of: "Credit Card No."}
+  account_masked: {right_of: "Credit Card No."}
+  statement_date: {right_of: "Statement Date", kind: date}
+  billing_period: {right_of: "Billing Period", kind: period}
+
+# Boxed summary panel: labels on one row, values on the row beneath.
+summary:
+  previous_dues:    {below: "PREVIOUS STATEMENT DUES", kind: amount}
+  payments_credits: {below: "RECEIVED", kind: amount}
+  purchases_debits: {below: "(Current Billing Cycle)", kind: amount}
+  finance_charges:  {below: "FINANCE CHARGES", kind: amount}
+  total_dues:       {below: "TOTAL AMOUNT DUE", kind: amount}
+  credit_limit:     {below: "(Including Cash)", kind: amount}
+  available_credit: {below: "AVAILABLE CREDIT LIMIT", kind: amount}
+  available_cash:   {below: "AVAILABLE CASH LIMIT", kind: amount}
+  minimum_due:      {below: "MINIMUM DUE", kind: amount}
+  due_date:         {below: "DUE DATE", kind: date}
+
+date_formats: ["%d %b, %Y", "%d %B, %Y", "%d/%m/%Y"]
+
+validate:
+  - cc_summary_reconcile
+  - debits_match_purchases
+  - credits_match_payments
+  - transactions_reconcile_to_total
+  - transactions_within_period

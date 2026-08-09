@@ -1,0 +1,84 @@
+id: icici_cc_v1
+issuer: ICICI Bank
+doc_type: credit_card
+currency: INR
+
+fingerprint:
+  all:
+    - "ICICI Bank"
+  any:
+    - "CREDIT CARD STATEMENT"
+
+# Another broken ToUnicode CMap: here the rupee glyph decodes as a backtick.
+glyph_fixes:
+  "`": "₹"
+
+layout:
+  y_tolerance: 2.0
+
+sections:
+  # Intentionally empty: the column header opens each block (header_starts_block).
+  # "SPENDS OVERVIEW" is a caption that sometimes shares the header's baseline and
+  # sometimes sits on its own line *below* it; treating it as a section start ends
+  # the block before a single row is read.
+  starts: {}
+  ends:
+    - "MOST IMPORTANT TERMS"
+    - "GREAT OFFERS"
+    - "Page "
+
+table:
+  header_starts_block: true
+  default_section: domestic
+  header_tokens: ["Date", "SerNo.", "Transaction Details"]
+  # "SPENDS OVERVIEW" is a sidebar caption sharing the header's baseline; align
+  # the roles to the rightmost clusters so it is ignored.
+  header_align: right
+  header_clusters: [date, serno, description, rewards, intl, amount]
+  cluster_gap: 8
+  bands:
+    date:        ["date.x0 - 8",         "serno.x0 - 12"]
+    serno:       ["serno.x0 - 12",       "description.x0 - 8"]
+    description: ["description.x0 - 8",  "rewards.x0 - 10"]
+    rewards:     ["rewards.x0 - 10",     "intl.x0 - 8"]
+    intl:        ["intl.x0 - 8",         "amount.x0 - 12"]
+    amount:      ["amount.x0 - 12",      "amount.x1 + 20"]
+
+row:
+  date_formats: ["%d/%m/%Y"]
+  date_pattern: '^\s*(\d{2}/\d{2}/\d{4})'
+  cardholder_pattern: '^(?!.*)$'
+  emi_token: "__none__"
+  fcy_pattern: '(?!x)x'
+  max_orphan_gap: 16.0
+  drop_patterns:
+    - '^Page \d+ of \d+$'
+
+header:
+  account_masked: {regex: '^(\d{4}X{8}\d{4})$'}
+  statement_date: {below: "STATEMENT DATE", kind: date}
+  # Printed as prose on a later page, not in the summary panel.
+  billing_period: {right_of: "Statement period :", kind: period, any_page: true}
+
+period_separator: '\s+to\s+'
+
+summary:
+  total_dues:       {below: "Total Amount due", kind: signed_amount}
+  minimum_due:      {below: "Minimum Amount due"}
+  previous_dues:    {below: "Previous Balance", dx: 75, kind: signed_amount}
+  purchases_debits: {sum: [{below: "Purchases / Charges", dx: 75},
+                           {below: "Cash Advances", dx: 75}]}
+  payments_credits: {below: "Payments / Credits", dx: 75}
+  credit_limit:     {below: "Credit Limit (Including cash)"}
+  available_credit: {below: "Available Credit (Including cash)"}
+  available_cash:   {below: "Available Cash"}
+  due_date:         {below: "PAYMENT DUE DATE", kind: date}
+
+date_formats: ["%B %d, %Y", "%d/%m/%Y"]
+
+validate:
+  - cc_summary_reconcile
+  - debits_match_purchases
+  - credits_match_payments
+  - transactions_reconcile_to_total
+  - transactions_within_period

@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+out/
+build/
+dist/
+*.egg-info/
+
+# Real statements are financial PII. Keep them out of version control; the
+# golden corpus is generated locally from whatever sits in samples/.
+samples/*.pdf
+
+# Local database and downloaded statements are financial PII.
+statements.db
+statements.db-wal
+statements.db-shm
+inbox/
+
+# Frontend
+webapp/node_modules/
+webapp/dist/
+sparser/web/dist/
+tests/
