@@ -78,6 +78,10 @@ class FetchRequest(Credentials):
     month: Optional[str] = Field(
         default=None, description='Specific billing month as "YYYY-MM"; overrides months'
     )
+    month_from: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    month_to: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    card_ids: list[int] = Field(default_factory=list)
+    connection_ids: list[int] = Field(default_factory=list)
     force: bool = False
 
 
@@ -207,6 +211,11 @@ class CardPasswordIn(BaseModel):
     password: str = Field(min_length=1)
 
 
+class CardMailRulesIn(BaseModel):
+    sender_ids: list[str] = Field(default_factory=list)
+    subject_patterns: list[str] = Field(default_factory=list)
+
+
 @app.get("/api/cards")
 def list_cards():
     """Cards with whether a decryption password is stored — never the value."""
@@ -271,6 +280,24 @@ def delete_card_password(card_id: int):
             raise HTTPException(404, "no such card")
         accounts.clear_card_password(conn, row["masked_number"])
         return {"status": "removed"}
+    finally:
+        conn.close()
+
+
+@app.put("/api/cards/{card_id}/mail-rules")
+def set_card_mail_rules(card_id: int, body: CardMailRulesIn):
+    def cleaned(values: list[str]) -> list[str]:
+        return list(dict.fromkeys(v.strip().lower() for v in values if v.strip()))
+
+    senders = cleaned(body.sender_ids)
+    subjects = cleaned(body.subject_patterns)
+    if len(senders) > 30 or len(subjects) > 30:
+        raise HTTPException(422, "a card supports at most 30 sender and 30 subject rules")
+    conn = db()
+    try:
+        if not store.set_card_mail_rules(conn, card_id, senders, subjects):
+            raise HTTPException(404, "no such card")
+        return {"status": "saved", "sender_ids": senders, "subject_patterns": subjects}
     finally:
         conn.close()
 
@@ -422,6 +449,13 @@ def ingest_scan(req: FetchRequest):
             )
     finally:
         conn.close()
+    if bool(req.month_from) != bool(req.month_to):
+        raise HTTPException(422, "month_from and month_to must be supplied together")
+    if req.month_from and req.month_to:
+        try:
+            pipeline.month_range_window(req.month_from, req.month_to)
+        except (ValueError, TypeError):
+            raise HTTPException(422, "month_from must be a valid month not after month_to")
     if not _lock.acquire(blocking=False):
         raise HTTPException(409, "an ingest run is already in progress")
 
@@ -430,12 +464,21 @@ def ingest_scan(req: FetchRequest):
 
     def job():
         try:
-            pipeline.run_scan(DB_PATH, INBOX, creds, months=months, month=month)
+            pipeline.run_scan(
+                DB_PATH, INBOX, creds, months=months, month=month,
+                month_from=req.month_from, month_to=req.month_to, card_ids=req.card_ids,
+                connection_ids=req.connection_ids,
+            )
         finally:
             _lock.release()
 
     _spawn(job)
-    return {"status": "started", "month": month, "months": months}
+    return {
+        "status": "started", "month": month, "months": months,
+        "month_from": req.month_from, "month_to": req.month_to,
+        "card_ids": req.card_ids,
+        "connection_ids": req.connection_ids,
+    }
 
 
 @app.post("/api/ingest/scan-local")

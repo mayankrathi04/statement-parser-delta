@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import email
+import hashlib
 import imaplib
 import logging
 import os
@@ -60,17 +61,23 @@ def _account_label(address: str) -> str:
 
 
 def _gmail_search_query(
-    senders: Iterable[str], since: dt.date, before: Optional[dt.date]
+    senders: Iterable[str], since: dt.date, before: Optional[dt.date],
+    subject_searches: Iterable[str] = SUBJECT_SEARCHES,
 ) -> str:
     """One Gmail-native query replacing many sequential IMAP SEARCH calls."""
-    terms = [*(f"from:{sender}" for sender in senders)]
-    terms += [f'subject:"{phrase}"' for phrase in SUBJECT_SEARCHES]
+    sender_terms = [f"from:{sender}" for sender in senders]
+    subject_terms = [f'subject:"{phrase}"' for phrase in subject_searches]
     dates = f"after:{since:%Y/%m/%d}"
     if before:
         dates += f" before:{before:%Y/%m/%d}"
     # Gmail's braces mean OR. Escape inner phrase quotes because the complete
     # X-GM-RAW value itself is sent as one quoted IMAP argument.
-    raw = f"{dates} {{{' '.join(terms)}}}"
+    groups = []
+    if sender_terms:
+        groups.append("{" + " ".join(sender_terms) + "}")
+    if subject_terms:
+        groups.append("{" + " ".join(subject_terms) + "}")
+    raw = f"{dates} {' '.join(groups)} has:attachment filename:pdf"
     return '"' + raw.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
@@ -168,6 +175,41 @@ def _safe_name(account: str, subject: str, filename: str, when: Optional[dt.date
     return f"{stamp}_{user}_{stem}.pdf"
 
 
+def _download_path(
+    dest: Path,
+    account: str,
+    subject: str,
+    filename: str,
+    when: Optional[dt.datetime],
+    uid: bytes,
+    part_no: int,
+    payload: bytes,
+) -> tuple[Path, bool]:
+    """Choose a stable path without confusing same-named bank attachments.
+
+    Axis, among others, calls every attachment ``Credit_Card_Statement.pdf``.
+    Keep legacy paths valid, but when that name already contains different bytes,
+    use the immutable mailbox UID and attachment number as a collision suffix.
+    Comparing content makes repeat scans idempotent for both naming schemes.
+    """
+    legacy = dest / _safe_name(account, subject, filename, when)
+    if not legacy.exists() or legacy.read_bytes() == payload:
+        return legacy, legacy.exists()
+
+    uid_text = re.sub(r"[^A-Za-z0-9_-]+", "_", uid.decode("ascii", "ignore")) or "message"
+    collided = legacy.with_name(f"{legacy.stem}_uid{uid_text}_{part_no}{legacy.suffix}")
+    if collided.exists():
+        if collided.read_bytes() == payload:
+            return collided, True
+        # Defensive only: a UID/part tuple should be immutable, but never overwrite
+        # a local PDF if a provider violates that assumption.
+        digest = hashlib.sha256(payload).hexdigest()[:12]
+        collided = legacy.with_name(
+            f"{legacy.stem}_uid{uid_text}_{part_no}_{digest}{legacy.suffix}"
+        )
+    return collided, collided.exists() and collided.read_bytes() == payload
+
+
 def fetch_account(
     account: Account,
     dest: Path,
@@ -177,6 +219,8 @@ def fetch_account(
     folder: str = '"[Gmail]/All Mail"',
     senders: Iterable[str] = STATEMENT_SENDERS,
     verbose: bool = True,
+    include_existing: bool = False,
+    subject_searches: Iterable[str] = SUBJECT_SEARCHES,
 ) -> list[Path]:
     """Download credit-card statement PDFs from one mailbox.
 
@@ -211,10 +255,11 @@ def fetch_account(
 
         uids: set[bytes] = set()
         sender_list = list(senders)
+        subject_list = list(subject_searches)
         log.info("%s Gmail combined search 1/1", label)
         try:
             status, data = conn.search(
-                None, "X-GM-RAW", _gmail_search_query(sender_list, window, before)
+                None, "X-GM-RAW", _gmail_search_query(sender_list, window, before, subject_list)
             )
         except imaplib.IMAP4.error:
             status, data = "NO", []
@@ -223,7 +268,7 @@ def fetch_account(
                 uids.update(data[0].split())
         else:
             # Kept for non-Gmail-compatible servers and future provider support.
-            query_total = len(sender_list) + len(SUBJECT_SEARCHES)
+            query_total = len(sender_list) + len(subject_list)
             log.warning(
                 "%s combined search unsupported; falling back to %d standard searches",
                 label, query_total,
@@ -233,14 +278,14 @@ def fetch_account(
                 status, data = conn.search(None, "FROM", f'"{sender}"', *date_clause)
                 if status == "OK" and data and data[0]:
                     uids.update(data[0].split())
-            for offset, phrase in enumerate(SUBJECT_SEARCHES, len(sender_list) + 1):
+            for offset, phrase in enumerate(subject_list, len(sender_list) + 1):
                 log.info("%s fallback search %d/%d", label, offset, query_total)
                 status, data = conn.search(None, "SUBJECT", f'"{phrase}"', *date_clause)
                 if status == "OK" and data and data[0]:
                     uids.update(data[0].split())
 
         log.info("%s found %d candidate message(s); checking headers", label, len(uids))
-        rejected = existing = 0
+        rejected = existing = downloaded = 0
 
         for uid in sorted(uids):
             status, data = conn.fetch(
@@ -251,7 +296,13 @@ def fetch_account(
                 continue
             subject = _decode(header.get("Subject"))
             sender = _decode(header.get("From"))
+            custom_match = (
+                any(rule.lower() in sender.lower() for rule in sender_list)
+                and any(rule.lower() in subject.lower() for rule in subject_list)
+            )
             accepted, reason = classify_mail(subject, sender=sender)
+            if custom_match:
+                accepted, reason = True, "matched configured card mail rules"
             if not accepted:
                 rejected += 1
                 if verbose:
@@ -268,28 +319,35 @@ def fetch_account(
             except Exception:
                 pass
 
-            for filename, payload in _pdf_parts(msg):
+            for part_no, (filename, payload) in enumerate(_pdf_parts(msg), 1):
                 # Re-check with the filename. It can strengthen an ambiguous
                 # issuer subject, while the PDF-text gate in pipeline.py remains
                 # the final authority on card statement vs bank account.
                 accepted, reason = classify_mail(subject, filename, sender)
+                if custom_match:
+                    accepted, reason = True, "matched configured card mail rules"
                 if not accepted:
                     rejected += 1
                     if verbose:
                         print(f"  skipped {filename[:60]}  ({reason})")
                     continue
-                out = dest / _safe_name(account.address, subject, filename, when)
-                if out.exists():
+                out, already_present = _download_path(
+                    dest, account.address, subject, filename, when, uid, part_no, payload
+                )
+                if already_present:
                     existing += 1
+                    if include_existing and out not in saved:
+                        saved.append(out)
                     continue
                 out.write_bytes(payload)
                 saved.append(out)
+                downloaded += 1
                 if verbose:
                     print(f"  saved {out.name}  <- {subject[:60]}")
                 log.info("%s downloaded %s (%d bytes)", label, out.name, len(payload))
         log.info(
             "%s mailbox scan complete: %d downloaded, %d already present, %d rejected",
-            label, len(saved), existing, rejected,
+            label, downloaded, existing, rejected,
         )
         return saved
     except Exception:

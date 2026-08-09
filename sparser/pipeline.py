@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import time
 import traceback
 from pathlib import Path
@@ -119,6 +120,7 @@ def ingest_file(
     force: bool,
     downloaded: bool = False,
     commit: bool = True,
+    allowed_card_masks: Optional[set[str]] = None,
 ) -> bool:
     """Run one PDF through every stage, recording each.
 
@@ -214,6 +216,20 @@ def ingest_file(
         rec.step("extract", "ok" if stmt.transactions else "failed",
                  f"{len(stmt.transactions)} transactions, period "
                  f"{stmt.period_start} → {stmt.period_end}", parse_ms)
+
+        if allowed_card_masks is not None and _mask_key(stmt.account_masked) not in allowed_card_masks:
+            detail = f"{stmt.account_masked or 'unknown card'} was not selected for this scan"
+            rec.step("validate", "skipped", detail)
+            rec.step("store", "skipped", detail)
+            rec.end_file(
+                "skipped", issuer=stmt.issuer, product=stmt.product,
+                card=f"{stmt.issuer} {stmt.product or ''}".strip(),
+                template_id=stmt.template_id, encrypted=int(encrypted),
+                txn_count=len(stmt.transactions), confidence=stmt.confidence,
+                path=str(pdf), statement_date=str(stmt.statement_date or ""),
+                period_start=str(stmt.period_start or ""), period_end=str(stmt.period_end or ""),
+            )
+            return False
 
         # --- validate ------------------------------------------------------
         errs = [c for c in stmt.checks if not c.passed and c.severity == "error"]
@@ -317,22 +333,67 @@ def month_window(month: str) -> tuple[dt.date, dt.date]:
     return start - dt.timedelta(days=7), end + dt.timedelta(days=10)
 
 
+def month_range_window(month_from: str, month_to: str) -> tuple[dt.date, dt.date]:
+    since, _ = month_window(month_from)
+    _, before = month_window(month_to)
+    if since >= before:
+        raise ValueError("month_from must not be after month_to")
+    return since, before
+
+
+def _mask_key(mask: Optional[str]) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", mask or "").upper()
+
+
 def run_scan(
     db_path: Path,
     dest: Path,
     creds: dict,
     months: int = 1,
     month: Optional[str] = None,
+    month_from: Optional[str] = None,
+    month_to: Optional[str] = None,
+    card_ids: Optional[list[int]] = None,
+    connection_ids: Optional[list[int]] = None,
 ) -> int:
     """Download and parse, but store nothing — builds the review list."""
     from . import mailbox
 
-    label = f"month {month}" if month else f"last {months} month(s)"
+    if month_from and month_to:
+        label = f"months {month_from} → {month_to}"
+    else:
+        label = f"month {month}" if month else f"last {months} month(s)"
     rec = Recorder(db_path, "scan", label)
     try:
         conn = store.connect(db_path)
         try:
             accts = mailbox.accounts_from_store(conn)
+            if connection_ids:
+                marks = ",".join("?" for _ in connection_ids)
+                selected_addresses = {
+                    row["address"] for row in conn.execute(
+                        f"SELECT address FROM mailboxes WHERE id IN ({marks})", connection_ids
+                    ).fetchall()
+                }
+                accts = [acct for acct in accts if acct.address in selected_addresses]
+            allowed_masks = None
+            scan_senders: set[str] = set()
+            scan_subjects: set[str] = set()
+            if card_ids:
+                marks = ",".join("?" for _ in card_ids)
+                rows = conn.execute(
+                    f"SELECT masked_number FROM cards WHERE id IN ({marks})", card_ids
+                ).fetchall()
+                allowed_masks = {_mask_key(row["masked_number"]) for row in rows}
+                rule_rows = conn.execute(
+                    f"SELECT sender_ids_json, subject_patterns_json FROM cards WHERE id IN ({marks})",
+                    card_ids,
+                ).fetchall()
+                for row in rule_rows:
+                    card_senders = json.loads(row["sender_ids_json"] or "[]")
+                    card_subjects = json.loads(row["subject_patterns_json"] or "[]")
+                    scan_senders.update(card_senders or mailbox.STATEMENT_SENDERS)
+                    scan_subjects.update(card_subjects or mailbox.SUBJECT_SEARCHES)
         finally:
             conn.close()
         if not accts:
@@ -342,7 +403,9 @@ def run_scan(
             rec.finish("failed", "no mailbox credentials")
             return rec.run_id
 
-        if month:
+        if month_from and month_to:
+            since, before = month_range_window(month_from, month_to)
+        elif month:
             since, before = month_window(month)
         else:
             since, before = dt.date.today() - dt.timedelta(days=31 * months), None
@@ -353,8 +416,12 @@ def run_scan(
         for acct in accts:
             conn = store.connect(db_path)
             try:
-                got = mailbox.fetch_account(acct, Path(dest), since=since, before=before,
-                                            verbose=False)
+                got = mailbox.fetch_account(
+                    acct, Path(dest), since=since, before=before, verbose=False,
+                    include_existing=True,
+                    senders=scan_senders or mailbox.STATEMENT_SENDERS,
+                    subject_searches=scan_subjects or mailbox.SUBJECT_SEARCHES,
+                )
                 found += got
                 acct_store.mark(conn, acct.address, "connected",
                                 f"{len(got)} attachment(s) for {label}", synced=True)
@@ -366,9 +433,21 @@ def run_scan(
             finally:
                 conn.close()
 
+        found = list(dict.fromkeys(found))
         for pdf in found:
-            ingest_file(rec, pdf, creds, force=False, downloaded=True, commit=False)
-        rec.finish("done", f"{len(found)} statement(s) found for {label} — awaiting approval")
+            ingest_file(
+                rec, pdf, creds, force=False, downloaded=True, commit=False,
+                allowed_card_masks=allowed_masks,
+            )
+        pending_count = rec.conn.execute(
+            "SELECT COUNT(*) FROM ingest_files WHERE run_id = ? AND status = 'pending'",
+            (rec.run_id,),
+        ).fetchone()[0]
+        rec.finish(
+            "done",
+            f"{pending_count} selected statement(s) found for {label} — awaiting approval "
+            f"({len(found)} matching local attachment(s) examined)",
+        )
     except Exception as exc:
         rec.finish("failed", str(exc))
     return rec.run_id

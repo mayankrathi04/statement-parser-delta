@@ -49,6 +49,8 @@ export type CardRow = Card & {
   password_set: boolean
   password_source: 'manual' | 'learned' | null
   password_updated_at: string | null
+  sender_ids: string[]
+  subject_patterns: string[]
 }
 
 export type Slice = { label: string; value: number; n: number; card_id?: number }
@@ -252,4 +254,10 @@ export const api = {
     }),
   clearCardPassword: (id: number) =>
     request<{ status: string }>(`/api/cards/${id}/password`, { method: 'DELETE' }),
+  setCardMailRules: (id: number, sender_ids: string[], subject_patterns: string[]) =>
+    request<{ status: string }>(`/api/cards/${id}/mail-rules`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender_ids, subject_patterns }),
+    }),
 }

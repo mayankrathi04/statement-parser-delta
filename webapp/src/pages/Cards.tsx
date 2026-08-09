@@ -89,6 +89,67 @@ function PasswordCell({ card, onSaved }: { card: CardRow; onSaved: () => void })
   )
 }
 
+function MailRules({ card, onSaved }: { card: CardRow; onSaved: () => void }) {
+  const [senders, setSenders] = useState(card.sender_ids.join('\n'))
+  const [subjects, setSubjects] = useState(card.subject_patterns.join('\n'))
+  const [busy, setBusy] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const lines = (value: string) => value.split(/[\n,]/).map((v) => v.trim()).filter(Boolean)
+  const save = async () => {
+    setBusy(true)
+    setSaved(false)
+    setErr(null)
+    try {
+      await api.setCardMailRules(card.id, lines(senders), lines(subjects))
+      setSaved(true)
+      onSaved()
+    } catch (e) {
+      setErr(String((e as Error).message))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div className="tile-l" style={{ marginBottom: 8 }}>Optional mailbox scan rules</div>
+      <p className="hint" style={{ marginBottom: 10 }}>
+        One sender address/domain and subject phrase per line. When this card is selected in the
+        Pipeline, Gmail uses these rules to narrow the search before downloading messages.
+      </p>
+      <div className="grid2" style={{ marginBottom: 10 }}>
+        <label>
+          <span className="sub">Supported sender IDs</span>
+          <textarea
+            className="input"
+            style={{ width: '100%', minHeight: 82, marginTop: 5 }}
+            placeholder={'statements@axisbank.com\naxisbank.com'}
+            value={senders}
+            onChange={(e) => { setSenders(e.target.value); setSaved(false) }}
+          />
+        </label>
+        <label>
+          <span className="sub">Possible subjects</span>
+          <textarea
+            className="input"
+            style={{ width: '100%', minHeight: 82, marginTop: 5 }}
+            placeholder={'Flipkart Axis Bank Credit Card Statement\nYour monthly card statement'}
+            value={subjects}
+            onChange={(e) => { setSubjects(e.target.value); setSaved(false) }}
+          />
+        </label>
+      </div>
+      <button className="btn primary" disabled={busy} onClick={save}>
+        {busy ? 'Saving…' : 'Save mail rules'}
+      </button>
+      {saved && <span className="sub" style={{ marginLeft: 10 }}>saved</span>}
+      {err && <span style={{ color: 'var(--crit)', marginLeft: 10 }}>{err}</span>}
+    </div>
+  )
+}
+
 /** The name and date of birth every issuer password convention is built from.
  *  Stored once, encrypted, so no run needs it passed in. */
 function ProfileCard({ onSaved }: { onSaved: () => void }) {
@@ -263,6 +324,7 @@ export default function Cards() {
                     {open[c.id] && (
                       <tr>
                         <td colSpan={6} style={{ background: 'var(--surface-2)' }}>
+                          <MailRules card={c} onSaved={load} />
                           <div className="tile-l" style={{ marginBottom: 8 }}>
                             Statements already parsed and saved — newest first.
                             {' '}Months not listed have never been imported.

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, type Bootstrap, type IngestFile, type Pending, type Run, type Step } from '../api'
+import { api, type Bootstrap, type IngestFile, type Mailbox, type Pending, type Run, type Step } from '../api'
+import CardSelect from '../components/CardSelect'
 import { pct } from '../lib/format'
 
 const STATUS_COLOUR: Record<string, string> = {
@@ -275,6 +276,25 @@ export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; 
   const [msg, setMsg] = useState<string | null>(null)
   const [paths, setPaths] = useState('samples')
   const [month, setMonth] = useState(() => new Date().toISOString().slice(0, 7))
+  const [monthFrom, setMonthFrom] = useState(() => new Date().toISOString().slice(0, 7))
+  const [monthTo, setMonthTo] = useState(() => new Date().toISOString().slice(0, 7))
+  const [fetchCards, setFetchCards] = useState<Set<number>>(new Set())
+  const [connections, setConnections] = useState<Mailbox[]>([])
+  const [fetchConnections, setFetchConnections] = useState<Set<number>>(new Set())
+
+  useEffect(() => {
+    if (boot?.cards.length) {
+      setFetchCards((current) => current.size ? current : new Set(boot.cards.map((card) => card.id)))
+    }
+  }, [boot])
+
+  useEffect(() => {
+    api.mailboxes().then(({ mailboxes }) => {
+      const usable = mailboxes.filter((box) => box.secret_ok)
+      setConnections(usable)
+      setFetchConnections(new Set(usable.map((box) => box.id)))
+    }).catch(() => undefined)
+  }, [boot?.mailboxes_configured])
 
   const loadRuns = useCallback(async () => {
     const r = await api.runs().catch(() => null)
@@ -320,24 +340,40 @@ export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; 
     }
   }
 
+  const scanOptions = (extra: Record<string, unknown>) => ({
+    ...extra,
+    card_ids: boot && fetchCards.size < boot.cards.length ? [...fetchCards] : [],
+    connection_ids: fetchConnections.size < connections.length ? [...fetchConnections] : [],
+  })
+
+  const noFetchCards = Boolean(boot?.cards.length && fetchCards.size === 0)
+  const noFetchConnections = Boolean(connections.length && fetchConnections.size === 0)
+  const scanDisabled = busy || noFetchCards || noFetchConnections
+
+  const toggleConnection = (id: number) => {
+    const next = new Set(fetchConnections)
+    next.has(id) ? next.delete(id) : next.add(id)
+    setFetchConnections(next)
+  }
+
   return (
     <>
       <div className="filters">
-        <button className="btn primary" disabled={busy}
-          onClick={() => start(() => api.scanMail({ months: 1 }))}>
+        <button className="btn primary" disabled={scanDisabled}
+          onClick={() => start(() => api.scanMail(scanOptions({ months: 1 })))}>
           {busy ? 'Working…' : '↧ Scan this month'}
         </button>
 
         <span className="dates">
           <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
-          <button className="btn" disabled={busy || !month}
-            onClick={() => start(() => api.scanMail({ month }))}>
+          <button className="btn" disabled={scanDisabled || !month}
+            onClick={() => start(() => api.scanMail(scanOptions({ month })))}>
             Scan that month
           </button>
         </span>
 
-        <button className="btn" disabled={busy}
-          onClick={() => start(() => api.scanMail({ months: 12 }))}>
+        <button className="btn" disabled={scanDisabled}
+          onClick={() => start(() => api.scanMail(scanOptions({ months: 12 })))}>
           Scan last 12 months
         </button>
 
@@ -353,6 +389,59 @@ export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; 
           onClick={() => start(() => api.scanLocal({ paths: paths.split(',').map((s) => s.trim()) }))}>
           Scan from disk
         </button>
+      </div>
+
+      <div className="filters" style={{ marginTop: -8 }}>
+        <span className="sub">Fetch only</span>
+        {boot && (
+          <CardSelect
+            cards={boot.cards}
+            selected={fetchCards}
+            colourOf={(id) => `var(--s${(boot.cards.findIndex((card) => card.id === id) % 8) + 1})`}
+            onChange={setFetchCards}
+          />
+        )}
+        {connections.length > 0 && (
+          <details className="ms">
+            <summary className="ms-btn" style={{ cursor: 'pointer' }}>
+              {fetchConnections.size === connections.length
+                ? `All connections (${connections.length})`
+                : `${fetchConnections.size} of ${connections.length} connections`}
+            </summary>
+            <div className="ms-panel">
+              {connections.map((box) => (
+                <label className="ms-row" key={box.id}>
+                  <input
+                    type="checkbox"
+                    checked={fetchConnections.has(box.id)}
+                    onChange={() => toggleConnection(box.id)}
+                  />
+                  <span>{box.address}</span>
+                </label>
+              ))}
+              <div className="ms-foot">
+                <button className="link" onClick={() => setFetchConnections(new Set(connections.map((box) => box.id)))}>
+                  Select all
+                </button>
+                <button className="link" onClick={() => setFetchConnections(new Set())}>Clear</button>
+              </div>
+            </div>
+          </details>
+        )}
+        <span className="dates">
+          <input type="month" value={monthFrom} onChange={(e) => setMonthFrom(e.target.value)} />
+          <span className="sub">to</span>
+          <input type="month" value={monthTo} onChange={(e) => setMonthTo(e.target.value)} />
+          <button
+            className="btn"
+            disabled={scanDisabled || !monthFrom || !monthTo || monthFrom > monthTo}
+            onClick={() => start(() => api.scanMail(scanOptions({ month_from: monthFrom, month_to: monthTo })))}
+          >
+            Scan range
+          </button>
+        </span>
+        {noFetchCards && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one card.</span>}
+        {noFetchConnections && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one connection.</span>}
       </div>
 
       {msg && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{msg}</div>}

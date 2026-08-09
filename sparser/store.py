@@ -134,6 +134,10 @@ def to_rupees(paise: Optional[int]) -> float:
 # Columns added after the first release. SQLite has no "ADD COLUMN IF NOT EXISTS",
 # so they are applied against the live table list on every connect.
 _MIGRATIONS = {
+    "cards": {
+        "sender_ids_json": "TEXT DEFAULT '[]'",
+        "subject_patterns_json": "TEXT DEFAULT '[]'",
+    },
     "ingest_files": {
         "path": "TEXT",
         "statement_date": "TEXT",
@@ -285,13 +289,31 @@ def _d(value) -> Optional[str]:
 def cards(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """SELECT c.id, c.issuer, c.product, c.masked_number, c.last4, c.display_name,
+                  c.sender_ids_json, c.subject_patterns_json,
                   COUNT(t.id) AS txn_count,
                   MIN(t.txn_date) AS first_txn,
                   MAX(t.txn_date) AS last_txn
            FROM cards c LEFT JOIN transactions t ON t.card_id = c.id
            GROUP BY c.id ORDER BY c.display_name"""
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["sender_ids"] = json.loads(item.pop("sender_ids_json") or "[]")
+        item["subject_patterns"] = json.loads(item.pop("subject_patterns_json") or "[]")
+        out.append(item)
+    return out
+
+
+def set_card_mail_rules(
+    conn: sqlite3.Connection, card_id: int, sender_ids: list[str], subject_patterns: list[str]
+) -> bool:
+    cur = conn.execute(
+        "UPDATE cards SET sender_ids_json = ?, subject_patterns_json = ? WHERE id = ?",
+        (json.dumps(sender_ids), json.dumps(subject_patterns), card_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def date_bounds(conn: sqlite3.Connection) -> dict:
