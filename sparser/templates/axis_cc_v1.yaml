@@ -30,6 +30,8 @@ sections:
 
 table:
   header_tokens: ["DATE", "TRANSACTION DETAILS", "AMOUNT"]
+  header_starts_block: true
+  default_section: domestic
   header_clusters: [date, description, category, amount, "cashback?"]
   cluster_gap: 8
   # Headers are centred over their columns while the data is left-aligned, so
@@ -52,6 +54,9 @@ row:
   max_orphan_gap: 14.0
   drop_patterns:
     - '^Card No:'
+    # These are already included in the summary's finance_charges figure. If
+    # retained as purchases they are counted twice during reconciliation.
+    - '^\d{2}/\d{2}/\d{4}\s+(?:ANNUAL FEE|GST|EMI INTEREST|EMI PROCESSING FEE)\b'
     - '^\*+ End of Statement'
     - '^Page \d+ of \d+$'
 

@@ -113,39 +113,41 @@ function MailRules({ card, onSaved }: { card: CardRow; onSaved: () => void }) {
   }
 
   return (
-    <div style={{ marginBottom: 18 }}>
+    <div className="mail-rules">
       <div className="tile-l" style={{ marginBottom: 8 }}>Optional mailbox scan rules</div>
       <p className="hint" style={{ marginBottom: 10 }}>
         One sender address/domain and subject phrase per line. When this card is selected in the
         Pipeline, Gmail uses these rules to narrow the search before downloading messages.
       </p>
-      <div className="grid2" style={{ marginBottom: 10 }}>
-        <label>
+      <div className="mail-rules-grid">
+        <label className="mail-rule-field">
           <span className="sub">Supported sender IDs</span>
           <textarea
-            className="input"
-            style={{ width: '100%', minHeight: 82, marginTop: 5 }}
+            className="input mail-rule-input"
+            rows={4}
             placeholder={'statements@axisbank.com\naxisbank.com'}
             value={senders}
             onChange={(e) => { setSenders(e.target.value); setSaved(false) }}
           />
         </label>
-        <label>
+        <label className="mail-rule-field">
           <span className="sub">Possible subjects</span>
           <textarea
-            className="input"
-            style={{ width: '100%', minHeight: 82, marginTop: 5 }}
+            className="input mail-rule-input"
+            rows={4}
             placeholder={'Flipkart Axis Bank Credit Card Statement\nYour monthly card statement'}
             value={subjects}
             onChange={(e) => { setSubjects(e.target.value); setSaved(false) }}
           />
         </label>
       </div>
-      <button className="btn primary" disabled={busy} onClick={save}>
-        {busy ? 'Saving…' : 'Save mail rules'}
-      </button>
-      {saved && <span className="sub" style={{ marginLeft: 10 }}>saved</span>}
-      {err && <span style={{ color: 'var(--crit)', marginLeft: 10 }}>{err}</span>}
+      <div className="mail-rule-actions">
+        <button className="btn primary" disabled={busy} onClick={save}>
+          {busy ? 'Saving…' : 'Save mail rules'}
+        </button>
+        {saved && <span className="sub">saved</span>}
+        {err && <span className="mail-rule-error">{err}</span>}
+      </div>
     </div>
   )
 }

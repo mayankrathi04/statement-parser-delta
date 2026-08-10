@@ -345,6 +345,59 @@ def _mask_key(mask: Optional[str]) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", mask or "").upper()
 
 
+def _scan_card_rule_groups(
+    conn,
+    card_ids: Optional[list[int]],
+    default_senders: Iterable[str],
+    default_subjects: Iterable[str],
+) -> tuple[Optional[set[str]], list[tuple[set[str], set[str]]]]:
+    """Resolve strict and fallback sender/subject unions for selected cards.
+
+    An empty ``card_ids`` list means every saved card.  Fully configured cards
+    share one strict query. Cards missing either field share a separate fallback
+    query, so their defaults cannot broaden the strict query.
+    """
+    params: list[int] = []
+    where = ""
+    if card_ids:
+        where = f" WHERE id IN ({','.join('?' for _ in card_ids)})"
+        params = card_ids
+
+    rows = conn.execute(
+        "SELECT masked_number, sender_ids_json, subject_patterns_json FROM cards" + where,
+        params,
+    ).fetchall()
+    allowed_masks = (
+        {_mask_key(row["masked_number"]) for row in rows}
+        if card_ids
+        else None
+    )
+    default_sender_set = set(default_senders)
+    default_subject_set = set(default_subjects)
+    strict_senders: set[str] = set()
+    strict_subjects: set[str] = set()
+    fallback_senders: set[str] = set()
+    fallback_subjects: set[str] = set()
+    for row in rows:
+        card_senders = set(json.loads(row["sender_ids_json"] or "[]"))
+        card_subjects = set(json.loads(row["subject_patterns_json"] or "[]"))
+        if card_senders and card_subjects:
+            strict_senders.update(card_senders)
+            strict_subjects.update(card_subjects)
+        else:
+            fallback_senders.update(card_senders or default_sender_set)
+            fallback_subjects.update(card_subjects or default_subject_set)
+
+    groups: list[tuple[set[str], set[str]]] = []
+    if strict_senders and strict_subjects:
+        groups.append((strict_senders, strict_subjects))
+    if fallback_senders and fallback_subjects:
+        groups.append((fallback_senders, fallback_subjects))
+    if not groups:
+        groups.append((default_sender_set, default_subject_set))
+    return allowed_masks, groups
+
+
 def run_scan(
     db_path: Path,
     dest: Path,
@@ -376,24 +429,9 @@ def run_scan(
                     ).fetchall()
                 }
                 accts = [acct for acct in accts if acct.address in selected_addresses]
-            allowed_masks = None
-            scan_senders: set[str] = set()
-            scan_subjects: set[str] = set()
-            if card_ids:
-                marks = ",".join("?" for _ in card_ids)
-                rows = conn.execute(
-                    f"SELECT masked_number FROM cards WHERE id IN ({marks})", card_ids
-                ).fetchall()
-                allowed_masks = {_mask_key(row["masked_number"]) for row in rows}
-                rule_rows = conn.execute(
-                    f"SELECT sender_ids_json, subject_patterns_json FROM cards WHERE id IN ({marks})",
-                    card_ids,
-                ).fetchall()
-                for row in rule_rows:
-                    card_senders = json.loads(row["sender_ids_json"] or "[]")
-                    card_subjects = json.loads(row["subject_patterns_json"] or "[]")
-                    scan_senders.update(card_senders or mailbox.STATEMENT_SENDERS)
-                    scan_subjects.update(card_subjects or mailbox.SUBJECT_SEARCHES)
+            allowed_masks, scan_rule_groups = _scan_card_rule_groups(
+                conn, card_ids, mailbox.STATEMENT_SENDERS, mailbox.SUBJECT_SEARCHES
+            )
         finally:
             conn.close()
         if not accts:
@@ -416,15 +454,17 @@ def run_scan(
         for acct in accts:
             conn = store.connect(db_path)
             try:
-                got = mailbox.fetch_account(
-                    acct, Path(dest), since=since, before=before, verbose=False,
-                    include_existing=True,
-                    senders=scan_senders or mailbox.STATEMENT_SENDERS,
-                    subject_searches=scan_subjects or mailbox.SUBJECT_SEARCHES,
-                )
-                found += got
+                account_found: list[Path] = []
+                for scan_senders, scan_subjects in scan_rule_groups:
+                    account_found += mailbox.fetch_account(
+                        acct, Path(dest), since=since, before=before, verbose=False,
+                        include_existing=True,
+                        senders=scan_senders,
+                        subject_searches=scan_subjects,
+                    )
+                found += account_found
                 acct_store.mark(conn, acct.address, "connected",
-                                f"{len(got)} attachment(s) for {label}", synced=True)
+                                f"{len(set(account_found))} attachment(s) for {label}", synced=True)
             except Exception as exc:
                 acct_store.mark(conn, acct.address, "failed", str(exc)[:200])
                 rec.begin_file(f"({acct.address})")

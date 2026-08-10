@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .emi import EmiEvidence, classify_emi_rows
 from .enrich import categorize, merchant_name
 from .schema import Statement, TxnType
 
@@ -74,11 +76,18 @@ CREATE TABLE IF NOT EXISTS transactions (
     signed        INTEGER NOT NULL,   -- paise, debit positive
     section       TEXT,
     is_emi        INTEGER DEFAULT 0,
+    spend_effect  INTEGER NOT NULL DEFAULT 0,
+    payment_effect INTEGER NOT NULL DEFAULT 0,
     reward_points INTEGER,
     fcy_currency  TEXT,
     fcy_amount    INTEGER,
     page          INTEGER,
     raw           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_metadata (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 -- Ingest history: every PDF's journey through the pipeline is kept, so the
@@ -145,7 +154,89 @@ _MIGRATIONS = {
         "period_end": "TEXT",
         "duplicate_of": "INTEGER",
     },
+    "transactions": {
+        "spend_effect": "INTEGER NOT NULL DEFAULT 0",
+        "payment_effect": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
+
+
+_PAYMENT_CREDIT = re.compile(
+    r"(?:\bBBPS\b.*\bPAYMENT\b|\bBPPY\s+CC\s+PAYMENT\b|"
+    r"\bPAYMENT\b.*\b(?:RECEIVED|BBPS)\b|\bCREDIT\s+CARD\s+PAYMENT|"
+    r"\b(?:TELE|NETBANKING|NEFT|IMPS)\s+TRANSFER\b|\bIMPS\s+PMT\b)",
+    re.I,
+)
+
+
+def _is_card_payment(description: str) -> bool:
+    return bool(_PAYMENT_CREDIT.search(description or ""))
+
+
+def _refresh_emi_flags(conn: sqlite3.Connection, card_id: Optional[int] = None) -> None:
+    """Rebuild EMI flags and purchase-based ledger effects from full history."""
+    where = "WHERE card_id = ?" if card_id is not None else ""
+    args = (card_id,) if card_id is not None else ()
+    rows = conn.execute(
+        f"""SELECT id, card_id, txn_date, description, amount, direction
+            FROM transactions {where} ORDER BY card_id, txn_date, id""",
+        args,
+    ).fetchall()
+
+    by_card: dict[int, list[EmiEvidence]] = {}
+    for row in rows:
+        by_card.setdefault(row["card_id"], []).append(
+            EmiEvidence(
+                key=row["id"],
+                date=dt.date.fromisoformat(row["txn_date"]),
+                description=row["description"],
+                amount=row["amount"],
+                direction=row["direction"],
+            )
+        )
+
+    if card_id is None:
+        conn.execute("UPDATE transactions SET is_emi = 0")
+    else:
+        conn.execute("UPDATE transactions SET is_emi = 0 WHERE card_id = ?", (card_id,))
+
+    classifications = {
+        card: classify_emi_rows(evidence) for card, evidence in by_card.items()
+    }
+    converted = {
+        key for classification in classifications.values()
+        for key in classification.active_purchases
+    }
+    conn.executemany(
+        "UPDATE transactions SET is_emi = 1 WHERE id = ?",
+        [(key,) for key in converted],
+    )
+
+    excluded = {
+        key for classification in classifications.values()
+        for key in classification.excluded_from_spend
+    }
+    effects = []
+    for row in rows:
+        payment = (
+            row["amount"]
+            if row["direction"] == "credit" and _is_card_payment(row["description"])
+            else 0
+        )
+        if row["id"] in excluded:
+            spend = 0
+            payment = 0
+        elif row["direction"] == "debit":
+            spend = row["amount"]
+        elif payment:
+            spend = 0
+        else:
+            spend = -row["amount"]
+        effects.append((spend, payment, row["id"]))
+    conn.executemany(
+        "UPDATE transactions SET spend_effect = ?, payment_effect = ? WHERE id = ?",
+        effects,
+    )
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -171,6 +262,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         """CREATE UNIQUE INDEX IF NOT EXISTS ux_statement_cycle
            ON statements (card_id, period_start, period_end)"""
     )
+
+    emi_version = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = 'emi_classification_version'"
+    ).fetchone()
+    if not emi_version or emi_version["value"] != "5":
+        _refresh_emi_flags(conn)
+        conn.execute(
+            """INSERT INTO app_metadata (key, value) VALUES ('emi_classification_version', '5')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value"""
+        )
     conn.commit()
 
 
@@ -276,6 +377,9 @@ def import_statement(conn: sqlite3.Connection, stmt: Statement) -> tuple[int, in
             for t in stmt.transactions
         ],
     )
+    # Re-evaluate the complete card history: a conversion or cancellation may
+    # arrive in a later statement than the original purchase.
+    _refresh_emi_flags(conn, card_id)
     conn.commit()
     return stmt_id, len(stmt.transactions), replaced
 
@@ -321,16 +425,18 @@ def date_bounds(conn: sqlite3.Connection) -> dict:
     return {"min": row["a"], "max": row["b"]}
 
 
-def _filters(card_ids, date_from, date_to, extra_sql="", params=None):
+def _filters(
+    card_ids, date_from, date_to, extra_sql="", params=None, date_column="t.txn_date"
+):
     where, args = ["1=1"], list(params or [])
     if card_ids:
         where.append(f"t.card_id IN ({','.join('?' * len(card_ids))})")
         args += list(card_ids)
     if date_from:
-        where.append("t.txn_date >= ?")
+        where.append(f"{date_column} >= ?")
         args.append(date_from)
     if date_to:
-        where.append("t.txn_date <= ?")
+        where.append(f"{date_column} <= ?")
         args.append(date_to)
     if extra_sql:
         where.append(extra_sql)
@@ -348,8 +454,12 @@ def transactions(
     rows = conn.execute(
         f"""SELECT t.id, t.txn_date, t.txn_time, t.description, t.merchant, t.category,
                    t.amount, t.direction, t.signed, t.is_emi, t.reward_points,
-                   t.fcy_currency, t.fcy_amount, c.display_name AS card, t.card_id
+                   t.fcy_currency, t.fcy_amount, c.display_name AS card, t.card_id,
+                   s.statement_date, s.period_start AS statement_period_start,
+                   s.period_end AS statement_period_end,
+                   substr(COALESCE(s.period_end, s.statement_date),1,7) AS statement_month
             FROM transactions t JOIN cards c ON c.id = t.card_id
+            JOIN statements s ON s.id = t.statement_id
             WHERE {clause}
             ORDER BY t.txn_date DESC, t.id DESC LIMIT ?""",
         args + [limit],
@@ -374,54 +484,90 @@ def analytics(
     """Every aggregate the dashboard needs, in exact integer paise."""
     ids = list(card_ids)
     clause, args = _filters(ids, date_from, date_to)
+    purchase_clause, purchase_args = _filters(
+        ids, date_from, date_to, extra_sql="t.spend_effect > 0"
+    )
+    refund_clause, refund_args = _filters(
+        ids, date_from, date_to, extra_sql="t.spend_effect < 0",
+        date_column="COALESCE(s.period_end,t.txn_date)",
+    )
+    spend_clause = f"(({purchase_clause}) OR ({refund_clause}))"
+    spend_args = purchase_args + refund_args
+    payment_clause, payment_args = _filters(
+        ids, date_from, date_to, extra_sql="t.payment_effect != 0",
+        date_column="COALESCE(s.period_end,t.txn_date)",
+    )
 
-    totals = conn.execute(
+    spend_totals = conn.execute(
         f"""SELECT
-              COALESCE(SUM(CASE WHEN direction='debit'  THEN amount END),0) AS spend,
-              COALESCE(SUM(CASE WHEN direction='credit' THEN amount END),0) AS payments,
-              COUNT(*) AS txn_count,
-              COALESCE(SUM(CASE WHEN direction='debit'  THEN 1 END),0) AS debit_count,
-              COALESCE(MAX(CASE WHEN direction='debit'  THEN amount END),0) AS largest
-            FROM transactions t WHERE {clause}""",
-        args,
+              COALESCE(SUM(spend_effect),0) AS spend,
+              COALESCE(SUM(CASE WHEN spend_effect > 0 THEN 1 ELSE 0 END),0) AS purchase_count,
+              COALESCE(MAX(spend_effect),0) AS largest
+            FROM transactions t JOIN statements s ON s.id=t.statement_id
+            WHERE {spend_clause}""",
+        spend_args,
     ).fetchone()
+    payment_totals = conn.execute(
+        f"""SELECT COALESCE(SUM(t.payment_effect),0) AS payments
+            FROM transactions t JOIN statements s ON s.id=t.statement_id
+            WHERE {payment_clause}""",
+        payment_args,
+    ).fetchone()
+    txn_count = conn.execute(
+        f"SELECT COUNT(*) FROM transactions t WHERE {clause}", args
+    ).fetchone()[0]
 
-    spend, debit_count = totals["spend"], totals["debit_count"]
+    spend, purchase_count = spend_totals["spend"], spend_totals["purchase_count"]
 
     monthly = conn.execute(
-        f"""SELECT substr(t.txn_date,1,7) AS month,
-                   COALESCE(SUM(CASE WHEN direction='debit'  THEN amount END),0) AS spend,
-                   COALESCE(SUM(CASE WHEN direction='credit' THEN amount END),0) AS payments
-            FROM transactions t WHERE {clause}
+        f"""SELECT month, SUM(spend) AS spend, SUM(payments) AS payments FROM (
+              SELECT substr(t.txn_date,1,7) AS month,
+                     SUM(t.spend_effect) AS spend, 0 AS payments
+              FROM transactions t WHERE {purchase_clause} GROUP BY month
+              UNION ALL
+              SELECT substr(COALESCE(s.period_end,t.txn_date),1,7) AS month,
+                     SUM(t.spend_effect) AS spend, 0 AS payments
+              FROM transactions t JOIN statements s ON s.id=t.statement_id
+              WHERE {refund_clause} GROUP BY month
+              UNION ALL
+              SELECT substr(COALESCE(s.period_end,t.txn_date),1,7) AS month,
+                     0 AS spend, SUM(t.payment_effect) AS payments
+              FROM transactions t JOIN statements s ON s.id=t.statement_id
+              WHERE {payment_clause} GROUP BY month
+            )
             GROUP BY month ORDER BY month""",
-        args,
+        purchase_args + refund_args + payment_args,
     ).fetchall()
 
     by_category = conn.execute(
-        f"""SELECT category, SUM(amount) AS total, COUNT(*) AS n
-            FROM transactions t WHERE {clause} AND direction='debit'
+        f"""SELECT category, SUM(spend_effect) AS total, COUNT(*) AS n
+            FROM transactions t JOIN statements s ON s.id=t.statement_id
+            WHERE {spend_clause}
             GROUP BY category ORDER BY total DESC""",
-        args,
+        spend_args,
     ).fetchall()
 
     by_card = conn.execute(
-        f"""SELECT c.id AS card_id, c.display_name AS card, SUM(t.amount) AS total, COUNT(*) AS n
+        f"""SELECT c.id AS card_id, c.display_name AS card,
+                   SUM(t.spend_effect) AS total, COUNT(*) AS n
             FROM transactions t JOIN cards c ON c.id = t.card_id
-            WHERE {clause} AND t.direction='debit'
+            JOIN statements s ON s.id=t.statement_id
+            WHERE {spend_clause}
             GROUP BY c.id ORDER BY total DESC""",
-        args,
+        spend_args,
     ).fetchall()
 
     merchants = conn.execute(
-        f"""SELECT merchant, SUM(amount) AS total, COUNT(*) AS n
-            FROM transactions t WHERE {clause} AND direction='debit'
+        f"""SELECT merchant, SUM(spend_effect) AS total, COUNT(*) AS n
+            FROM transactions t JOIN statements s ON s.id=t.statement_id
+            WHERE {spend_clause}
             GROUP BY merchant ORDER BY total DESC LIMIT 12""",
-        args,
+        spend_args,
     ).fetchall()
 
-    # Reward points, EMIs and foreign-currency legs are parsed per row but mean
-    # nothing inside a spend total — they are separate ledgers and are reported
-    # as such rather than folded into the rupee figures.
+    # Reward points, converted purchases and foreign-currency legs are reported
+    # separately. EMI principal bookkeeping has zero spend_effect, while the
+    # original converted purchase remains counted exactly once.
     rewards_by_card = conn.execute(
         f"""SELECT c.id AS card_id, c.display_name AS card,
                    COALESCE(SUM(t.reward_points),0) AS pts, COUNT(t.reward_points) AS n
@@ -489,11 +635,11 @@ def analytics(
         },
         "totals": {
             "spend": to_rupees(spend),
-            "payments": to_rupees(totals["payments"]),
-            "net": to_rupees(spend - totals["payments"]),
-            "txn_count": totals["txn_count"],
-            "avg_txn": to_rupees(spend // debit_count) if debit_count else 0.0,
-            "largest": to_rupees(totals["largest"]),
+            "payments": to_rupees(payment_totals["payments"]),
+            "net": to_rupees(spend - payment_totals["payments"]),
+            "txn_count": txn_count,
+            "avg_txn": to_rupees(spend // purchase_count) if purchase_count else 0.0,
+            "largest": to_rupees(spend_totals["largest"]),
             "months": len(monthly),
             "avg_month": to_rupees(spend // len(monthly)) if monthly else 0.0,
         },

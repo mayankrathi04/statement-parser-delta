@@ -24,9 +24,11 @@ import pdfplumber
 import yaml
 
 from . import geometry as geo
+from .emi import EmiEvidence, converted_purchase_keys
 from .normalize import (
     is_currency_amount,
     is_decimal_amount,
+    is_credit_amount_in_row,
     is_credit_marker,
     parse_signed_amount,
     parse_amount,
@@ -229,6 +231,19 @@ class Engine:
             block, i = self._collect_block(lines, hdr + 1, secs["ends"])
             txns += self._rows_from_block(block, bands, section)
 
+        evidence = [
+            EmiEvidence(
+                key=index,
+                date=txn.date,
+                description=txn.description,
+                amount=txn.amount,
+                direction=txn.type.value,
+            )
+            for index, txn in enumerate(txns)
+        ]
+        converted = converted_purchase_keys(evidence)
+        for index, txn in enumerate(txns):
+            txn.is_emi = index in converted
         return txns
 
     def _collect_block(
@@ -316,11 +331,19 @@ class Engine:
                     time=parse_time(c["date"]),
                     description=desc,
                     amount=amount,
-                    type=TxnType.CREDIT if is_credit_marker(c["amount"]) else TxnType.DEBIT,
+                    type=(
+                        TxnType.CREDIT
+                        if is_credit_marker(c["amount"])
+                        or is_credit_amount_in_row(ln.text, amount)
+                        else TxnType.DEBIT
+                    ),
                     section=section,
                     category=squash(c.get("category", "")) or None,
                     cardholder=cardholder,
-                    is_emi=rowcfg["emi_token"] in c.get("emi", ""),
+                    # HDFC prints "EMI" here for purchases that are merely
+                    # eligible.  Actual conversions are established from the
+                    # matching credit after the complete table is parsed.
+                    is_emi=False,
                     reward_points=parse_int(c.get("rewards", "")),
                     fcy_currency=fcy_cur,
                     fcy_amount=fcy_amt,

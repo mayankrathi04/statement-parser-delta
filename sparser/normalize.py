@@ -94,6 +94,21 @@ def is_credit_marker(text: str) -> bool:
     return t.startswith("+") or bool(re.search(r"Cr\.?$", text.strip(), re.I))
 
 
+def is_credit_amount_in_row(text: str, amount: Decimal) -> bool:
+    """Recover a Dr/Cr marker clipped out of an amount geometry band.
+
+    Axis rows can contain a second marked number for cashback/reward points, so
+    checking for any ``Cr`` in the row would invert ordinary purchases. Match the
+    marker only to the first printed number whose value equals this transaction's
+    already-parsed amount.
+    """
+    marked = re.compile(r"([\d,]+(?:\.\d{1,2})?)\s*(Cr|Dr)\.?\b", re.I)
+    for token, marker in marked.findall(text or ""):
+        if parse_amount(token) == amount:
+            return marker.lower() == "cr"
+    return False
+
+
 def parse_date(text: str, fmts: list[str]) -> Optional[dt.date]:
     """Strict, format-pinned parsing. Never let a guesser swap day and month."""
     t = text.strip().strip(",|")

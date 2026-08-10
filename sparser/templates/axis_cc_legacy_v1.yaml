@@ -17,6 +17,8 @@ sections:
   ends: ["End of Statement", "CASHBACK DETAILS", "IMPORTANT MESSAGE", "Page "]
 table:
   header_tokens: ["DATE", "TRANSACTION DETAILS", "AMOUNT"]
+  header_starts_block: true
+  default_section: domestic
   header_clusters: [date, description, category, amount, "cashback?"]
   cluster_gap: 8
   bands:
@@ -36,7 +38,7 @@ row:
     - '^Card No:'
     # Legacy summaries classify card fees, tax, and EMI interest as finance
     # charges. Keeping them in purchase rows would count them twice.
-    - '^\d{2}/\d{2}/\d{4}\s+(?:ANNUAL FEE|GST|EMI INTEREST)\b'
+    - '^\d{2}/\d{2}/\d{4}\s+(?:ANNUAL FEE|GST|EMI INTEREST|EMI PROCESSING FEE)\b'
     - '^\*+ End of Statement'
     - '^Page \d+ of \d+$'
 header:
@@ -57,4 +59,4 @@ summary:
   available_cash: {below: "Available Cash Limit"}
   due_date: {below: "Payment Due Date", kind: date}
 date_formats: ["%d/%m/%Y"]
-validate: [cc_summary_reconcile, debits_match_purchases, credits_match_payments, transactions_reconcile_to_total, transactions_within_period]
+validate: [axis_legacy_summary_consistency, debits_match_purchases, transactions_reconcile_to_total, transactions_within_period]

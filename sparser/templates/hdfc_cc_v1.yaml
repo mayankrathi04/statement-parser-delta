@@ -66,7 +66,8 @@ row:
   # wrapped description or a cardholder sub-header.
   date_pattern: '^\s*(\d{2}/\d{2}/\d{4})'
   cardholder_pattern: '^[A-Z][A-Z. ]{4,40}$'
-  emi_token: "EMI"
+  # This column advertises eligibility; it is not evidence of conversion.
+  emi_eligible_token: "EMI"
   fcy_pattern: '([A-Z]{3})\s+([\d,]+\.?\d*)'
   # Descriptions wrap both above and below their own dated line (the amount is
   # vertically centred against a 3-line description), so orphans attach to the

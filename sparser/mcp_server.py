@@ -111,16 +111,16 @@ def get_overview(
     with _connect() as conn:
         totals = conn.execute(
             f"""SELECT COUNT(*) AS transactions,
-                       COALESCE(SUM(CASE WHEN direction='debit' THEN amount END),0) AS spend,
-                       COALESCE(SUM(CASE WHEN direction='credit' THEN amount END),0) AS payments,
-                       COALESCE(MAX(CASE WHEN direction='debit' THEN amount END),0) AS largest
+                       COALESCE(SUM(spend_effect),0) AS spend,
+                       COALESCE(SUM(payment_effect),0) AS payments,
+                       COALESCE(MAX(spend_effect),0) AS largest
                 FROM transactions t WHERE {clause}""",
             args,
         ).fetchone()
         monthly = conn.execute(
             f"""SELECT substr(txn_date,1,7) AS month,
-                       COALESCE(SUM(CASE WHEN direction='debit' THEN amount END),0) AS spend,
-                       COALESCE(SUM(CASE WHEN direction='credit' THEN amount END),0) AS payments,
+                       COALESCE(SUM(spend_effect),0) AS spend,
+                       COALESCE(SUM(payment_effect),0) AS payments,
                        COUNT(*) AS transactions
                 FROM transactions t WHERE {clause}
                 GROUP BY month ORDER BY month""",
@@ -260,7 +260,7 @@ def spending_breakdown(
     date_to: Optional[str] = None,
     limit: int = 50,
 ) -> dict:
-    """Group debit spending by month, category, merchant, or card."""
+    """Group purchase-based net spending by month, category, merchant, or card."""
     expressions = {
         "month": "substr(t.txn_date,1,7)",
         "category": "COALESCE(t.category,'Uncategorised')",
@@ -268,17 +268,19 @@ def spending_breakdown(
         "card": "c.display_name",
     }
     expression = expressions[group_by]
-    clause, args = _where(card_ids, date_from, date_to, direction="debit")
+    clause, args = _where(card_ids, date_from, date_to)
+    clause += " AND t.spend_effect != 0"
     limit = max(1, min(limit, 200))
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT {expression} AS label, SUM(t.amount) AS amount, COUNT(*) AS transactions
+            f"""SELECT {expression} AS label, SUM(t.spend_effect) AS amount,
+                       COUNT(*) AS transactions
                 FROM transactions t JOIN cards c ON c.id=t.card_id
                 WHERE {clause} GROUP BY label ORDER BY amount DESC LIMIT ?""",
             args + [limit],
         ).fetchall()
         total = conn.execute(
-            f"SELECT COALESCE(SUM(t.amount),0) FROM transactions t WHERE {clause}", args
+            f"SELECT COALESCE(SUM(t.spend_effect),0) FROM transactions t WHERE {clause}", args
         ).fetchone()[0]
     total_rupees = to_rupees(total)
     groups = []
@@ -299,13 +301,16 @@ def compare_periods(
 ) -> dict:
     """Compare spend and category mix between two explicit date periods."""
     def period(start: str, end: str) -> dict:
-        clause, args = _where(card_ids, start, end, direction="debit")
+        clause, args = _where(card_ids, start, end)
+        clause += " AND t.spend_effect != 0"
         with _connect() as conn:
             total = conn.execute(
-                f"SELECT COALESCE(SUM(amount),0), COUNT(*) FROM transactions t WHERE {clause}", args
+                f"""SELECT COALESCE(SUM(spend_effect),0), COUNT(*)
+                    FROM transactions t WHERE {clause}""", args
             ).fetchone()
             categories = conn.execute(
-                f"""SELECT COALESCE(category,'Uncategorised') label, SUM(amount) amount
+                f"""SELECT COALESCE(category,'Uncategorised') label,
+                           SUM(spend_effect) amount
                     FROM transactions t WHERE {clause} GROUP BY label ORDER BY amount DESC""",
                 args,
             ).fetchall()
@@ -349,12 +354,14 @@ def find_recurring_merchants(
     """Find debit merchants appearing across multiple distinct months."""
     minimum_months = max(2, minimum_months)
     limit = max(1, min(limit, 200))
-    clause, args = _where(card_ids, date_from, date_to, direction="debit")
+    clause, args = _where(card_ids, date_from, date_to)
+    clause += " AND t.spend_effect > 0"
     with _connect() as conn:
         rows = conn.execute(
             f"""SELECT COALESCE(t.merchant,t.description) AS merchant,
                        COUNT(*) AS transactions, COUNT(DISTINCT substr(txn_date,1,7)) AS months,
-                       SUM(amount) AS total, MIN(amount) AS minimum, MAX(amount) AS maximum,
+                       SUM(spend_effect) AS total, MIN(spend_effect) AS minimum,
+                       MAX(spend_effect) AS maximum,
                        MIN(txn_date) AS first_date, MAX(txn_date) AS last_date
                 FROM transactions t WHERE {clause}
                 GROUP BY merchant HAVING months >= ?
@@ -375,10 +382,12 @@ def find_unusual_transactions(
     limit: int = 30,
 ) -> dict:
     """Rank unusually large debits using robust median absolute deviation."""
-    clause, args = _where(card_ids, date_from, date_to, direction="debit")
+    clause, args = _where(card_ids, date_from, date_to)
+    clause += " AND t.spend_effect > 0"
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT t.id, t.txn_date, t.description, t.merchant, t.category, t.amount,
+            f"""SELECT t.id, t.txn_date, t.description, t.merchant, t.category,
+                       t.spend_effect AS amount,
                        c.display_name card FROM transactions t JOIN cards c ON c.id=t.card_id
                 WHERE {clause}""",
             args,
@@ -444,7 +453,9 @@ def schema_resource() -> str:
     return (
         "Cards own statements and transactions. Dates are ISO YYYY-MM-DD. "
         "Tool outputs express card amounts in INR rupees; the SQLite database stores paise. "
-        "direction=debit means spending and direction=credit means payments/refunds. "
+        "spend uses purchase-based spend_effect: purchases and fees are positive, genuine "
+        "refunds are negative, and EMI principal/bookkeeping is zero. payment_effect contains "
+        "only actual card payments. direction remains the raw statement-side debit/credit. "
         "Reward points and original foreign-currency amounts are separate units. "
         "Statements with confidence=1 passed every arithmetic reconciliation check."
     )

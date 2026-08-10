@@ -47,3 +47,46 @@ def test_read_only_mcp_analytics(tmp_path, monkeypatch):
     assert mcp_server.special_ledger("emi")["transactions"] == 0
     assert len(mcp_server.find_recurring_merchants(minimum_months=2)["merchants"]) == 1
     assert mcp_server.statement_health()["fully_reconciled"] == 3
+
+
+def test_emi_ledger_uses_conversion_evidence_not_eligibility_marker(tmp_path):
+    db_path = tmp_path / "emi.db"
+    conn = store.connect(db_path)
+    statement = Statement(
+        template_id="hdfc_cc_v1",
+        issuer="HDFC Bank",
+        product="Test Card",
+        account_masked="XXXX0011",
+        doc_type=DocType.CREDIT_CARD,
+        statement_date=dt.date(2025, 8, 15),
+        period_start=dt.date(2025, 7, 16),
+        period_end=dt.date(2025, 8, 15),
+        transactions=[
+            Transaction(
+                date=dt.date(2025, 8, 2), description="ELIGIBLE ONLY PURCHASE",
+                amount=Decimal("2500"), type=TxnType.DEBIT, is_emi=True,
+            ),
+            Transaction(
+                date=dt.date(2025, 8, 3), description="GADGET WORLD",
+                amount=Decimal("150000"), type=TxnType.DEBIT,
+            ),
+            Transaction(
+                date=dt.date(2025, 8, 6),
+                description="AGGREGATOR EMI - OFFUS CREDIT",
+                amount=Decimal("150000"), type=TxnType.CREDIT,
+            ),
+            Transaction(
+                date=dt.date(2025, 8, 15),
+                description="Principal Amount Amortization - <1/3>GADGET WORLD",
+                amount=Decimal("90000"), type=TxnType.DEBIT,
+            ),
+        ],
+    )
+    store.import_statement(conn, statement)
+
+    ledger = store.analytics(conn)["emi"]
+    assert ledger["count"] == 1
+    assert ledger["total"] == 150000.0
+    assert ledger["rows"][0]["description"] == "GADGET WORLD"
+    assert store.analytics(conn)["totals"]["spend"] == 152500.0
+    conn.close()

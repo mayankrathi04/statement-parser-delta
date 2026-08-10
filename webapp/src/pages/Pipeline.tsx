@@ -9,6 +9,7 @@ const STATUS_COLOUR: Record<string, string> = {
   approved: 'var(--good)',
   running: 'var(--warn)',
   pending: 'var(--warn)',
+  warning: 'var(--warn)',
   skipped: 'var(--muted)',
   failed: 'var(--crit)',
   done: 'var(--good)',
@@ -43,7 +44,8 @@ function StepRow({ step }: { step: Step }) {
 
 function FileCard({ file }: { file: IngestFile }) {
   const [open, setOpen] = useState(file.status !== 'ok')
-  const errors = file.checks.filter((c) => !c.passed && c.severity === 'error')
+  const warnings = file.checks.filter((c) => !c.passed && c.severity === 'warning')
+  const passed = file.checks.filter((c) => c.passed).length
 
   return (
     <div className="card" style={{ marginBottom: 10 }}>
@@ -75,11 +77,12 @@ function FileCard({ file }: { file: IngestFile }) {
           {file.checks.length > 0 && (
             <div style={{ marginTop: 12 }}>
               <div className="tile-l" style={{ marginBottom: 6 }}>
-                Validation — {file.checks.length - errors.length}/{file.checks.length} passed
+                Validation — {passed}/{file.checks.length} passed
+                {warnings.length > 0 && ` · ${warnings.length} warning${warnings.length === 1 ? '' : 's'}`}
               </div>
               {file.checks.map((c) => (
                 <div className="step-row" key={c.name}>
-                  <Dot status={c.passed ? 'ok' : c.severity === 'error' ? 'failed' : 'skipped'} />
+                  <Dot status={c.passed ? 'ok' : c.severity === 'error' ? 'failed' : 'warning'} />
                   <span className="step-name">{c.passed ? 'pass' : c.severity}</span>
                   <span className="step-detail">
                     <b style={{ color: 'var(--ink-2)' }}>{c.name}</b> — {c.detail}

@@ -60,7 +60,7 @@ body {
   font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
 }
-button, input, select { font: inherit; color: inherit; }
+button, input, select, textarea { font: inherit; color: inherit; }
 a { color: var(--s1); }
 
 .wrap { max-width: 1280px; margin: 0 auto; padding: 0 20px 80px; }
@@ -222,4 +222,19 @@ code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-
 .input {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 11px; font-size: 13.5px; min-width: 220px;
+}
+.mail-rules { min-width: 0; max-width: 100%; margin-bottom: 18px; }
+.mail-rules-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px; margin-bottom: 10px;
+}
+.mail-rule-field { display: flex; min-width: 0; flex-direction: column; }
+.mail-rule-input {
+  display: block; width: 100%; min-width: 0; max-width: 100%;
+  min-height: 96px; margin-top: 5px; resize: vertical; line-height: 1.4;
+}
+.mail-rule-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.mail-rule-error { min-width: 0; color: var(--crit); overflow-wrap: anywhere; }
+@media (max-width: 900px) {
+  .mail-rules-grid { grid-template-columns: minmax(0, 1fr); }
 }

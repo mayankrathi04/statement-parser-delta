@@ -27,3 +27,6 @@ tests/*
 !tests/test_mcp_server.py
 !tests/test_mailbox_collision.py
 !tests/test_pipeline_filters.py
+
+graphify-out/
+.graphify_*

@@ -7,6 +7,7 @@ as clean output; it should be flagged or routed to review.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from decimal import Decimal
 from typing import Callable
 
@@ -15,6 +16,7 @@ from .schema import Check, Statement, TxnType
 # Issuers round the final due amount down to the rupee, so exact equality is the
 # wrong bar; anything under a rupee is presentation, not a parse error.
 ROUNDING_TOLERANCE = Decimal("1.00")
+_AXIS_BBPS_PAYMENT = re.compile(r"\bBBPS\s+PAYMENT\s+RECEIVED\b", re.IGNORECASE)
 
 CHECKS: dict[str, Callable[[Statement], Check]] = {}
 
@@ -85,6 +87,73 @@ def credits_match_payments(stmt: Statement) -> Check:
     )
 
 
+@check("axis_legacy_summary_consistency")
+def axis_legacy_summary_consistency(stmt: Statement) -> Check:
+    """Recognise one proven Axis summary-box omission without hiding parse errors."""
+    name = "axis_legacy_summary_consistency"
+    summary_check = cc_summary_reconcile(stmt)
+    credit_check = credits_match_payments(stmt)
+    if summary_check.passed and credit_check.passed:
+        return Check(
+            name=name,
+            passed=True,
+            detail="Axis summary payments/credits and the transaction rows reconcile",
+        )
+
+    s = stmt.summary
+    required = [s.previous_dues, s.payments_credits, s.purchases_debits, s.total_dues]
+    if any(value is None for value in required):
+        return Check(
+            name=name,
+            passed=False,
+            severity="error",
+            detail="Axis summary panel is incomplete; the known issuer glitch cannot be verified",
+        )
+
+    credits = [t for t in stmt.transactions if t.type is TxnType.CREDIT]
+    credit_total = sum((t.amount for t in credits), Decimal("0"))
+    bbps_total = sum(
+        (t.amount for t in credits if _AXIS_BBPS_PAYMENT.search(t.description)),
+        Decimal("0"),
+    )
+    charges = s.finance_charges or Decimal("0")
+    summary_computed = s.previous_dues - s.payments_credits + s.purchases_debits + charges
+    omitted_credit = credit_total - s.payments_credits
+    summary_overstatement = summary_computed - s.total_dues
+    debit_check = debits_match_purchases(stmt)
+    ledger_check = transactions_reconcile_to_total(stmt)
+
+    proven_issuer_glitch = (
+        debit_check.passed
+        and ledger_check.passed
+        and bbps_total > ROUNDING_TOLERANCE
+        and abs(omitted_credit - bbps_total) <= ROUNDING_TOLERANCE
+        and abs(summary_overstatement - bbps_total) <= ROUNDING_TOLERANCE
+    )
+    if proven_issuer_glitch:
+        return Check(
+            name=name,
+            passed=False,
+            severity="warning",
+            detail=(
+                f"Axis Account Summary omits ₹{bbps_total:,.2f} of BBPS payment(s), although "
+                "those rows are present and the purchases and closing balance reconcile exactly. "
+                "This appears to be a glitch in the issuer-generated statement; please verify the "
+                "PDF once before approving."
+            ),
+        )
+
+    return Check(
+        name=name,
+        passed=False,
+        severity="error",
+        detail=(
+            "Axis summary and credit rows disagree, and the difference is not fully explained by "
+            "identified BBPS payment rows; manual parser review is required"
+        ),
+    )
+
+
 @check("transactions_reconcile_to_total")
 def transactions_reconcile_to_total(stmt: Statement) -> Check:
     """End-to-end: opening dues + every extracted row + charges == closing dues.
@@ -130,15 +199,34 @@ def transactions_within_period(stmt: Statement) -> Check:
             detail="billing period not extracted",
         )
     lo, hi = stmt.period_start - SETTLEMENT_LAG, stmt.period_end
-    stray = [t for t in stmt.transactions if not (lo <= t.date <= hi)]
+    # Refunds and reversals are often printed with the original purchase date,
+    # even though their credit is posted in this cycle. The independent credit
+    # and ledger checks prove whether they belong in the current statement.
+    # Out-of-period debits remain suspicious and continue to fail this check.
+    stray_debits = [
+        t for t in stmt.transactions
+        if t.type is TxnType.DEBIT and not (lo <= t.date <= hi)
+    ]
+    prior_credits = [
+        t for t in stmt.transactions
+        if t.type is TxnType.CREDIT and not (lo <= t.date <= hi)
+    ]
     return Check(
         name="transactions_within_period",
-        passed=not stray,
+        passed=not stray_debits,
         severity="warning",
         detail=(
-            "all dates inside billing period"
-            if not stray
-            else f"{len(stray)} txn(s) outside period, e.g. {stray[0].date} {stray[0].description[:30]}"
+            (
+                f"all debits inside billing period; accepted {len(prior_credits)} "
+                "prior-period credit(s) using original transaction dates"
+            )
+            if not stray_debits and prior_credits
+            else "all dates inside billing period"
+            if not stray_debits
+            else (
+                f"{len(stray_debits)} debit(s) outside period, e.g. "
+                f"{stray_debits[0].date} {stray_debits[0].description[:30]}"
+            )
         ),
     )
 

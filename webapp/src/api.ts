@@ -26,6 +26,10 @@ export type Txn = {
   fcy_amount: number | null
   card: string
   card_id: number
+  statement_date: string | null
+  statement_period_start: string | null
+  statement_period_end: string | null
+  statement_month: string | null
 }
 
 export type CardStatement = {

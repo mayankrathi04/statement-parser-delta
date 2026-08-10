@@ -13,7 +13,7 @@ const RANGES: { label: string; months: number }[] = [
   { label: 'All', months: 0 },
 ]
 
-type SortKey = 'txn_date' | 'amount' | 'merchant' | 'category' | 'card'
+type SortKey = 'txn_date' | 'statement_month' | 'amount' | 'merchant' | 'category' | 'card'
 type ForeignSortKey = 'original' | 'billed'
 type PageSize = 25 | 50 | 75 | 'all'
 
@@ -220,7 +220,10 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
 
       <section className="card">
         <h2>Monthly spend and payments</h2>
-        <p className="hint">Debits billed to the card against payments and credits received, by month.</p>
+        <p className="hint">
+          Purchases use the transaction date; refunds and card payments use the statement cycle.
+          EMI principal and conversion bookkeeping are excluded, so a purchase counts once.
+        </p>
         <div className="legend">
           <span><i className="swatch" style={{ background: 'var(--s1)' }} />Spend</span>
           <span><i className="swatch" style={{ background: 'var(--s2)' }} />Payments &amp; credits</span>
@@ -384,6 +387,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             <thead>
               <tr>
                 {head('txn_date', 'Date')}
+                {head('statement_month', 'Applied statement')}
                 <th>Description</th>
                 {head('merchant', 'Merchant')}
                 {head('category', 'Category')}
@@ -395,6 +399,10 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
               {txnPager.rows.map((r) => (
                 <tr key={r.id}>
                   <td>{r.txn_date}{r.txn_time ? ` ${r.txn_time}` : ''}</td>
+                  <td title={r.statement_period_start && r.statement_period_end
+                    ? `${r.statement_period_start} → ${r.statement_period_end}` : undefined}>
+                    {r.statement_month ?? '—'}
+                  </td>
                   <td className="desc">
                     {r.description}
                     {r.is_emi && <> <span className="pill">EMI</span></>}
@@ -410,7 +418,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
                 </tr>
               ))}
               {!rows.length && (
-                <tr><td colSpan={6} className="empty">Nothing matches these filters.</td></tr>
+                <tr><td colSpan={7} className="empty">Nothing matches these filters.</td></tr>
               )}
             </tbody>
           </table>
