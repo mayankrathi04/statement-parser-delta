@@ -27,6 +27,7 @@ tests/*
 !tests/test_mcp_server.py
 !tests/test_mailbox_collision.py
 !tests/test_pipeline_filters.py
+!tests/test_bank_statements.py
 
 graphify-out/
 .graphify_*

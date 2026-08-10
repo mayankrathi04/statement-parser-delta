@@ -515,7 +515,7 @@ def run_reevaluate(db_path: Path, file_ids: list[int], creds: dict) -> int:
     """
     conn = store.connect(db_path)
     try:
-        where = "WHERE status = 'pending'"
+        where = "WHERE status = 'pending' AND COALESCE(document_type,'credit_card') != 'bank_account'"
         args: list[int] = []
         if file_ids:
             where += f" AND id IN ({','.join('?' * len(file_ids))})"
@@ -561,7 +561,8 @@ def run_approve(db_path: Path, file_ids: list[int], creds: dict, force: bool = F
     conn = store.connect(db_path)
     try:
         rows = conn.execute(
-            f"SELECT id, path, filename FROM ingest_files WHERE id IN "
+            f"SELECT id, path, filename FROM ingest_files WHERE "
+            f"COALESCE(document_type,'credit_card') != 'bank_account' AND id IN "
             f"({','.join('?' * len(file_ids))})",
             file_ids,
         ).fetchall()
@@ -651,7 +652,9 @@ def pending(conn) -> list[dict]:
     rows = conn.execute(
         """SELECT f.*, r.kind, r.note FROM ingest_files f
            JOIN ingest_runs r ON r.id = f.run_id
-           WHERE f.status = 'pending' ORDER BY f.id DESC"""
+           WHERE f.status = 'pending'
+             AND COALESCE(f.document_type,'credit_card') != 'bank_account'
+           ORDER BY f.id DESC"""
     ).fetchall()
     out = []
     for r in rows:
@@ -669,6 +672,7 @@ def discard(conn, file_ids: list[int]) -> int:
         return 0
     cur = conn.execute(
         f"UPDATE ingest_files SET status = 'discarded' WHERE status = 'pending'"
+        f" AND COALESCE(document_type,'credit_card') != 'bank_account'"
         f" AND id IN ({','.join('?' * len(file_ids))})",
         file_ids,
     )
@@ -682,7 +686,8 @@ def runs(conn, limit: int = 40) -> list[dict]:
                   (SELECT COUNT(*) FROM ingest_files f WHERE f.run_id = r.id) AS files,
                   (SELECT COUNT(*) FROM ingest_files f WHERE f.run_id = r.id AND f.status='ok') AS ok,
                   (SELECT COUNT(*) FROM ingest_files f WHERE f.run_id = r.id AND f.status='pending') AS pending
-           FROM ingest_runs r ORDER BY r.id DESC LIMIT ?""",
+           FROM ingest_runs r WHERE r.kind NOT LIKE 'bank_%'
+           ORDER BY r.id DESC LIMIT ?""",
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]

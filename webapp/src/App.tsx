@@ -2,6 +2,9 @@ import { useCallback, useEffect, useState } from 'react'
 import { NavLink, Route, Routes } from 'react-router-dom'
 import { api, type Bootstrap } from './api'
 import Analytics from './pages/Analytics'
+import BankAccounts from './pages/BankAccounts'
+import BankAnalysis from './pages/BankAnalysis'
+import BankPipeline from './pages/BankPipeline'
 import Cards from './pages/Cards'
 import Connections from './pages/Connections'
 import Pipeline from './pages/Pipeline'
@@ -24,16 +27,25 @@ export default function App() {
     <>
       <div className="topbar">
         <div className="topbar-in">
-          <span className="brand">Card Spend Analyser</span>
+          <span className="brand">Statement Analyser</span>
           <nav className="nav">
             <NavLink to="/" end className={({ isActive }) => (isActive ? 'on' : '')}>
-              Analytics
+              Card Analysis
             </NavLink>
             <NavLink to="/cards" className={({ isActive }) => (isActive ? 'on' : '')}>
               Cards
             </NavLink>
             <NavLink to="/pipeline" className={({ isActive }) => (isActive ? 'on' : '')}>
-              Pipeline
+              Card Pipeline
+            </NavLink>
+            <NavLink to="/bank" className={({ isActive }) => (isActive ? 'on' : '')}>
+              Bank Analysis
+            </NavLink>
+            <NavLink to="/bank-accounts" className={({ isActive }) => (isActive ? 'on' : '')}>
+              Bank Accounts
+            </NavLink>
+            <NavLink to="/bank-pipeline" className={({ isActive }) => (isActive ? 'on' : '')}>
+              Bank Pipeline
             </NavLink>
             <NavLink to="/connections" className={({ isActive }) => (isActive ? 'on' : '')}>
               Connections
@@ -42,7 +54,7 @@ export default function App() {
           <span className="spacer" />
           <span className="sub">
             {boot
-              ? `${boot.cards.length} cards · ${boot.statements.length} statements`
+              ? `${boot.cards.length} cards · ${boot.statements.length} card statements`
               : 'connecting…'}
           </span>
           <button
@@ -60,6 +72,9 @@ export default function App() {
           <Route path="/" element={<Analytics boot={boot} />} />
           <Route path="/cards" element={<Cards />} />
           <Route path="/pipeline" element={<Pipeline boot={boot} onChanged={reload} />} />
+          <Route path="/bank" element={<BankAnalysis />} />
+          <Route path="/bank-accounts" element={<BankAccounts />} />
+          <Route path="/bank-pipeline" element={<BankPipeline onChanged={reload} />} />
           <Route path="/connections" element={<Connections onChanged={reload} />} />
         </Routes>
       </div>

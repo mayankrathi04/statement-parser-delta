@@ -1,7 +1,7 @@
 # statement-parser-delta
 
-Credit-card statement PDFs → a canonical database → a spend analyser you can keep
-adding to. Every extraction is **proved by arithmetic** before it is stored.
+Credit-card and bank-account statement PDFs → separate canonical ledgers → analysis
+you can keep adding to. Every extraction is **proved by arithmetic** before it is stored.
 
 Every statement in the regression corpus parses at 100% confidence, with every
 reconciliation check passing to the paisa.
@@ -31,9 +31,9 @@ both together — open **:5173** in dev (hot reload), **:8770** in production.
 
 API docs are always at `/docs`.
 
-## The four screens
+## The screens
 
-**Analytics** — multi-select card filter, date range with 1M/4M/6M/9M/1Y/All
+**Card Analysis** — multi-select card filter, date range with 1M/4M/6M/9M/1Y/All
 shortcuts, six stat tiles, monthly spend-vs-payments, spend by category, by card,
 top merchants, and the full transaction table (sortable, searchable). Reward
 points, EMIs and foreign-currency legs each get their own section — they are
@@ -46,7 +46,7 @@ conventions. When a derived one works it is **saved against that card
 automatically** and marked `learned`, so next month it opens on the first attempt.
 Values are encrypted and only sent to the page when you click *show*.
 
-**Pipeline** — scan-then-approve. Pick *this month*, a **specific month**, the last
+**Card Pipeline** — scan-then-approve. Pick *this month*, a **specific month**, the last
 12 months, or a folder on disk. A scan downloads and fully parses each PDF but
 **stores nothing**; you get a review list showing card, period, transaction count,
 confidence, and whether it is already in the database — then tick what to import,
@@ -65,8 +65,25 @@ statement.pdf  Example Bank Card   hdfc_cc_v1   42 txns   100% confidence
 
 Runs are kept, so "why is this statement missing?" is answerable months later.
 
-**Nothing ever duplicates.** A statement is keyed by (card, statement date, period
-start) and the card by its masked number, so re-fetching a month you already have
+**Bank Analysis** — account and date filters, cash-flow totals, opening/closing
+balances, monthly withdrawals vs deposits, debit categories, counterparties, and
+the complete bank transaction table with reference, value date and running balance.
+Click a category to set a manual label (including `Tax`) or restore the automatic
+label; overrides stay separate from parser-derived enrichment.
+
+**Bank Accounts** — one expandable row per account. The full account number is not
+copied into account records: identity uses a one-way fingerprint and display uses
+the last four digits. Expanded rows show every imported statement's declared period,
+transaction coverage, totals, balances and source file.
+
+**Bank Pipeline** — upload-only for now. HDFC digital-text account statements are
+classified, reconstructed from PDF geometry, checked against every adjacent running
+balance, then held for review with confidence, checks, period, row count and duplicate
+status. Only selected statements are written to the bank ledger. Its run history is
+separate from card runs.
+
+**Nothing ever duplicates.** A card statement is keyed by card and billing cycle;
+a bank statement by account fingerprint and statement period. Re-fetching a cycle
 *replaces* that statement. The review list tells you this before you commit —
 verified by re-importing the whole corpus and watching every count stay put.
 
@@ -132,6 +149,9 @@ sparser/
 ├── enrich.py     merchant names and categories
 ├── pipeline.py   ingest orchestration + recorded audit trail
 ├── store.py      SQLite; money as integer paise
+├── bank_parser.py   HDFC bank geometry parser + bank models
+├── bank_pipeline.py upload-only bank ingest, separate from card templates
+├── bank_store.py    bank accounts/statements/transactions + cash-flow analytics
 ├── api.py        FastAPI
 └── templates/    one YAML per issuer — hdfc, icici, axis, yes_bank
 webapp/           React + TypeScript + Vite
@@ -141,8 +161,13 @@ webapp/           React + TypeScript + Vite
 + ₹2,345.10 into 3579.1499999999996; summed over a few thousand rows that drifts off the very
 reconciliations the parser works to prove.
 
-**Imports are idempotent.** A statement is keyed by (card, statement date, period
-start), so re-running over the same folder replaces rather than doubles.
+**Imports are idempotent.** Statements are keyed by their account/card identity and
+declared period, so re-running the same input replaces rather than doubles it.
+
+Card and bank configuration are deliberately independent. Bank rows live only in
+`bank_*` tables and `/api/bank/*` endpoints; card templates, parsing and analytics
+never query those tables. They share only neutral infrastructure such as exact-paise
+conversion, SQLite connection setup and ingest audit rows.
 
 ### Adding an issuer
 
@@ -184,11 +209,12 @@ conventions: `first4name+DDMM`, `FIRST4+DDMMYYYY`, `DDMMYYYY`, …).
 
 ## Ask an LLM with MCP
 
-The project includes a read-only MCP server and a `statement-analytics` Agent
-Skill for questions that do not fit a fixed dashboard: period comparisons,
-merchant/category trends, recurring charges, unusual debits, card comparisons,
-and parser-health audits. The server exposes curated tools—never arbitrary SQL,
-passwords, PDF paths, or database writes.
+The project includes a curated MCP server and a `statement-analytics` Agent Skill
+for questions that do not fit a fixed dashboard: card period comparisons,
+merchant/category trends, bank cash flow, account/statement coverage,
+counterparties, unusual debits, and parser-health audits. Card and bank tools and
+IDs stay separate. The server exposes no arbitrary SQL, passwords, or PDF paths;
+its only write is an explicit category override for one bank transaction.
 
 Install the project once, using absolute paths in client configuration:
 
@@ -234,7 +260,7 @@ Restart the MCP client after changing its configuration.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q      # 77 passing
+.venv/bin/python -m pytest -q      # 129 passing
 python scripts/make_golden.py      # refresh golden corpus after intended changes
 ```
 
@@ -246,8 +272,8 @@ gitignored, so a clean checkout stays green.
 
 - **Scanned statements are not supported** — everything assumes a text layer. The
   pipeline detects and reports them; OCR is designed for, not built.
-- **No bank-account template.** The schema and the `balance_chain` validator (which
-  localises the exact bad row) exist; no template written.
+- **Bank-account support currently covers HDFC digital-text statements only.** Bank
+  parsing is isolated so another bank can be added without changing card templates.
 - **Generic mode picks up auxiliary tables** (an EMI schedule is structurally
   identical to a transaction list) and under-recovers multi-page tables lacking a
   repeated header. Template mode is unaffected.

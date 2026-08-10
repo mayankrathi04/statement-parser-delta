@@ -103,7 +103,15 @@ function niceStep(max: number): number {
 
 /** Grouped bars: spend and payments share one axis because both are rupees.
  *  Two y-scales would be a dual-axis chart, which is never correct. */
-export function MonthlyBars({ rows }: { rows: { month: string; spend: number; payments: number }[] }) {
+export function MonthlyBars({
+  rows,
+  leftLabel = 'Spend',
+  rightLabel = 'Payments',
+}: {
+  rows: { month: string; spend: number; payments: number }[]
+  leftLabel?: string
+  rightLabel?: string
+}) {
   const { tip, bind } = useTip()
   if (!rows.length) return <p className="empty">No data in this range.</p>
 
@@ -148,8 +156,8 @@ export function MonthlyBars({ rows }: { rows: { month: string; spend: number; pa
               {...bind(
                 <>
                   <div style={{ marginBottom: 4 }}>{r.month}</div>
-                  <div><i className="swatch" style={{ background: 'var(--s1)' }} /> Spend <b>{money2(r.spend)}</b></div>
-                  <div><i className="swatch" style={{ background: 'var(--s2)' }} /> Payments <b>{money2(r.payments)}</b></div>
+                  <div><i className="swatch" style={{ background: 'var(--s1)' }} /> {leftLabel} <b>{money2(r.spend)}</b></div>
+                  <div><i className="swatch" style={{ background: 'var(--s2)' }} /> {rightLabel} <b>{money2(r.payments)}</b></div>
                 </>,
               )}
             >

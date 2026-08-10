@@ -1,4 +1,4 @@
 interface:
   display_name: "Statement Analytics"
-  short_description: "Analyze card statements through read-only MCP"
-  default_prompt: "Use $statement-analytics to investigate my spending patterns and explain the evidence."
+  short_description: "Analyze card and bank statement history"
+  default_prompt: "Use $statement-analytics to investigate my card spending or bank cash flow and explain the evidence."

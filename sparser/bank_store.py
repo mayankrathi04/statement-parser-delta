@@ -1,0 +1,474 @@
+"""Persistence and analytics for deposit-account statements."""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import re
+import sqlite3
+from typing import Any, Iterable, Optional
+
+from . import store
+from .bank_parser import BankStatement
+from .enrich import categorize
+
+_ENRICHMENT_VERSION = "4"
+MAX_CATEGORY_LENGTH = 80
+
+
+def display_name(stmt: BankStatement) -> str:
+    kind = "Account"
+    account_type = (stmt.account_type or "").lower()
+    if "saving" in account_type:
+        kind = "Savings"
+    elif "current" in account_type:
+        kind = "Current"
+    elif stmt.product:
+        kind = stmt.product.title()
+    return f"{stmt.bank_name} {kind} ••{stmt.last4}"
+
+
+def _counterparty(description: str) -> str:
+    text = " ".join((description or "").split()).strip(" -")
+    upper = text.upper()
+    parts = [part.strip() for part in text.split("-") if part.strip()]
+    if upper.startswith("UPI-") and len(parts) > 1:
+        return parts[1][:80]
+    if upper.startswith(("IMPS-", "REV-IMPS-")):
+        offset = 3 if upper.startswith("REV-IMPS-") else 2
+        if len(parts) > offset:
+            return parts[offset][:80]
+    if upper.startswith("NEFT") and len(parts) > 2:
+        return parts[2][:80]
+    if upper.startswith("ACH") and len(parts) > 1:
+        return parts[1][:80]
+    if upper.startswith("POS "):
+        match = re.search(r"X{4,}\d{2,}\s+(.+)", text, re.I)
+        if match:
+            return match.group(1)[:80]
+    return (parts[0] if parts else text)[:80]
+
+
+def _category(description: str) -> str:
+    text = description or ""
+    if re.search(r"^\s*ACH\s+C\s*-", text, re.I):
+        return "Dividends"
+    if re.search(r"\bincome\s+tax\b|\btax\b|\bgst\b", text, re.I):
+        return "Tax"
+    if re.search(r"\bIB\s*BILLPAY\b|\bCHEQ\b|\bCRED\b", text, re.I):
+        return "Bills & Utilities"
+    if re.search(r"salary|payroll", text, re.I):
+        return "Salary & Income"
+    if re.search(r"zerodha|broking|mutual fund|\bipo\b|\bfd\b|fixed deposit", text, re.I):
+        return "Investments"
+    if re.search(r"\bemi\b|loan|finance", text, re.I):
+        return "Loans & EMI"
+    if re.search(r"\batm\b|cash withdrawal", text, re.I):
+        return "Cash"
+    if re.search(r"\bimps\b|\bneft\b|transfer", text, re.I):
+        return "Transfers"
+    derived = categorize(text)
+    if derived != "Other":
+        return derived
+    if re.search(r"\bupi\b", text, re.I):
+        return "Transfers"
+    return "Other"
+
+
+def _ensure_enrichment(conn: sqlite3.Connection) -> None:
+    """Reapply derived bank fields when categorization rules change."""
+    current = conn.execute(
+        "SELECT value FROM app_metadata WHERE key='bank_enrichment_version'"
+    ).fetchone()
+    if current and current["value"] == _ENRICHMENT_VERSION:
+        return
+    rows = conn.execute("SELECT id, description FROM bank_transactions").fetchall()
+    conn.executemany(
+        "UPDATE bank_transactions SET counterparty=?, category=? WHERE id=?",
+        [(_counterparty(row["description"]), _category(row["description"]), row["id"])
+         for row in rows],
+    )
+    conn.execute(
+        """INSERT INTO app_metadata (key,value) VALUES ('bank_enrichment_version',?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (_ENRICHMENT_VERSION,),
+    )
+    conn.commit()
+
+
+def find_statement(conn: sqlite3.Connection, stmt: BankStatement) -> Optional[dict]:
+    row = conn.execute(
+        """SELECT s.id, s.source_file, s.imported_at, a.display_name AS account
+           FROM bank_statements s JOIN bank_accounts a ON a.id = s.account_id
+           WHERE a.account_fingerprint = ? AND s.period_start = ? AND s.period_end = ?""",
+        (stmt.account_fingerprint, stmt.period_start.isoformat(), stmt.period_end.isoformat()),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_account(conn: sqlite3.Connection, stmt: BankStatement) -> int:
+    row = conn.execute(
+        "SELECT id FROM bank_accounts WHERE account_fingerprint = ?",
+        (stmt.account_fingerprint,),
+    ).fetchone()
+    values = (
+        stmt.bank_code, stmt.bank_name, stmt.masked_number, stmt.last4,
+        stmt.account_holder, stmt.account_type, stmt.product, stmt.branch,
+        display_name(stmt),
+    )
+    if row:
+        conn.execute(
+            """UPDATE bank_accounts SET bank_code=?, bank_name=?, masked_number=?, last4=?,
+                      account_holder=?, account_type=?, product=?, branch=?, display_name=?
+               WHERE id=?""",
+            (*values, row["id"]),
+        )
+        return int(row["id"])
+    cur = conn.execute(
+        """INSERT INTO bank_accounts
+           (bank_code, bank_name, account_fingerprint, masked_number, last4,
+            account_holder, account_type, product, branch, display_name, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            stmt.bank_code, stmt.bank_name, stmt.account_fingerprint, stmt.masked_number,
+            stmt.last4, stmt.account_holder, stmt.account_type, stmt.product, stmt.branch,
+            display_name(stmt), dt.datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def import_statement(conn: sqlite3.Connection, stmt: BankStatement) -> tuple[int, int, bool, int]:
+    """Insert/replace a bank statement and return statement, rows, replaced, account."""
+    _ensure_enrichment(conn)
+    account_id = upsert_account(conn, stmt)
+    key = (account_id, stmt.period_start.isoformat(), stmt.period_end.isoformat())
+    existing = conn.execute(
+        """SELECT id FROM bank_statements
+           WHERE account_id = ? AND period_start = ? AND period_end = ?""",
+        key,
+    ).fetchone()
+    replaced = existing is not None
+    overrides: dict[tuple[Any, ...], str] = {}
+    if existing:
+        # Re-import replaces the statement rows. Carry explicit user choices
+        # across that replacement using bank-ledger fields that are stable when
+        # parser/enrichment rules change.
+        old_rows = conn.execute(
+            """SELECT txn_date, value_date, COALESCE(reference,'') reference,
+                      amount, direction, balance, category_override
+               FROM bank_transactions
+               WHERE statement_id=? AND category_override IS NOT NULL""",
+            (existing["id"],),
+        ).fetchall()
+        overrides = {
+            (
+                row["txn_date"], row["value_date"], row["reference"],
+                row["amount"], row["direction"], row["balance"],
+            ): row["category_override"]
+            for row in old_rows
+        }
+        conn.execute("DELETE FROM bank_statements WHERE id = ?", (existing["id"],))
+
+    coverage_start = min((t.date for t in stmt.transactions), default=None)
+    coverage_end = max((t.date for t in stmt.transactions), default=None)
+    cur = conn.execute(
+        """INSERT INTO bank_statements
+           (account_id, source_file, parser_id, period_start, period_end,
+            coverage_start, coverage_end, currency, opening_balance, closing_balance,
+            confidence, checks_json, imported_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            account_id, stmt.source_file, stmt.parser_id,
+            stmt.period_start.isoformat(), stmt.period_end.isoformat(),
+            coverage_start.isoformat() if coverage_start else None,
+            coverage_end.isoformat() if coverage_end else None,
+            stmt.currency, store.to_paise(stmt.opening_balance), store.to_paise(stmt.closing_balance),
+            stmt.confidence, json.dumps([check.model_dump() for check in stmt.checks]),
+            dt.datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    statement_id = int(cur.lastrowid)
+    conn.executemany(
+        """INSERT INTO bank_transactions
+           (statement_id, account_id, txn_date, value_date, description, reference,
+            counterparty, category, amount, direction, signed, balance, page, raw)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [
+            (
+                statement_id, account_id, row.date.isoformat(),
+                row.value_date.isoformat() if row.value_date else None,
+                row.description, row.reference, _counterparty(row.description),
+                _category(row.description), store.to_paise(row.amount), row.type.value,
+                store.to_paise(row.signed), store.to_paise(row.balance), row.page, row.raw,
+            )
+            for row in stmt.transactions
+        ],
+    )
+    if overrides:
+        new_rows = conn.execute(
+            """SELECT id, txn_date, value_date, COALESCE(reference,'') reference,
+                      amount, direction, balance
+               FROM bank_transactions WHERE statement_id=?""",
+            (statement_id,),
+        ).fetchall()
+        conn.executemany(
+            "UPDATE bank_transactions SET category_override=? WHERE id=?",
+            [
+                (override, row["id"])
+                for row in new_rows
+                if (override := overrides.get((
+                    row["txn_date"], row["value_date"], row["reference"],
+                    row["amount"], row["direction"], row["balance"],
+                ))) is not None
+            ],
+        )
+    conn.commit()
+    return statement_id, len(stmt.transactions), replaced, account_id
+
+
+def update_transaction_category(
+    conn: sqlite3.Connection, transaction_id: int, category: Optional[str]
+) -> dict:
+    """Set or clear a manual bank-category override for one ledger row."""
+    row = conn.execute(
+        "SELECT id, category FROM bank_transactions WHERE id=?", (transaction_id,)
+    ).fetchone()
+    if not row:
+        raise KeyError(f"bank transaction {transaction_id} was not found")
+    override = " ".join((category or "").split()).strip() or None
+    if override and len(override) > MAX_CATEGORY_LENGTH:
+        raise ValueError(f"category must be at most {MAX_CATEGORY_LENGTH} characters")
+    conn.execute(
+        "UPDATE bank_transactions SET category_override=? WHERE id=?",
+        (override, transaction_id),
+    )
+    conn.commit()
+    return {
+        "id": transaction_id,
+        "category": override or row["category"] or "Other",
+        "derived_category": row["category"] or "Other",
+        "category_override": override,
+        "category_is_override": override is not None,
+    }
+
+
+def _where(
+    account_ids: Iterable[int] = (),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> tuple[str, list[Any]]:
+    ids = list(account_ids)
+    clauses = ["1=1"]
+    args: list[Any] = []
+    if ids:
+        clauses.append(f"t.account_id IN ({','.join('?' * len(ids))})")
+        args.extend(ids)
+    if date_from:
+        clauses.append("t.txn_date >= ?")
+        args.append(date_from)
+    if date_to:
+        clauses.append("t.txn_date <= ?")
+        args.append(date_to)
+    return " AND ".join(clauses), args
+
+
+def date_bounds(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT MIN(txn_date) a, MAX(txn_date) b FROM bank_transactions").fetchone()
+    return {"min": row["a"], "max": row["b"]}
+
+
+def statements(conn: sqlite3.Connection) -> list[dict]:
+    _ensure_enrichment(conn)
+    rows = conn.execute(
+        """SELECT s.*, a.display_name AS account FROM bank_statements s
+           JOIN bank_accounts a ON a.id = s.account_id
+           ORDER BY s.period_end DESC"""
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        for key in ("opening_balance", "closing_balance"):
+            item[key] = store.to_rupees(item[key])
+        item["checks"] = json.loads(item.pop("checks_json") or "[]")
+        result.append(item)
+    return result
+
+
+def accounts(conn: sqlite3.Connection) -> list[dict]:
+    _ensure_enrichment(conn)
+    rows = conn.execute(
+        """SELECT a.*,
+                  COUNT(DISTINCT s.id) AS statements,
+                  COUNT(t.id) AS txn_count,
+                  MIN(t.txn_date) AS first_txn,
+                  MAX(t.txn_date) AS last_txn
+           FROM bank_accounts a
+           LEFT JOIN bank_statements s ON s.account_id = a.id
+           LEFT JOIN bank_transactions t ON t.statement_id = s.id
+           GROUP BY a.id ORDER BY a.display_name"""
+    ).fetchall()
+    history_rows = conn.execute(
+        """SELECT s.*,
+                  COUNT(t.id) AS txns,
+                  COALESCE(SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END),0) withdrawals,
+                  COALESCE(SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END),0) deposits
+           FROM bank_statements s LEFT JOIN bank_transactions t ON t.statement_id = s.id
+           GROUP BY s.id ORDER BY s.account_id, s.period_end DESC"""
+    ).fetchall()
+    history: dict[int, list[dict]] = {}
+    for row in history_rows:
+        item = dict(row)
+        item["opening_balance"] = store.to_rupees(item["opening_balance"])
+        item["closing_balance"] = store.to_rupees(item["closing_balance"])
+        item["withdrawals"] = store.to_rupees(item["withdrawals"])
+        item["deposits"] = store.to_rupees(item["deposits"])
+        item["checks"] = json.loads(item.pop("checks_json") or "[]")
+        history.setdefault(item.pop("account_id"), []).append(item)
+    result = []
+    for row in rows:
+        item = dict(row)
+        item.pop("account_fingerprint", None)
+        item["history"] = history.get(item["id"], [])
+        result.append(item)
+    return result
+
+
+def transactions(
+    conn: sqlite3.Connection,
+    account_ids: Iterable[int] = (),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 5000,
+) -> list[dict]:
+    _ensure_enrichment(conn)
+    clause, args = _where(account_ids, date_from, date_to)
+    rows = conn.execute(
+        f"""SELECT t.id, t.txn_date, t.value_date, t.description, t.reference,
+                   t.counterparty, t.category AS derived_category,
+                   t.category_override,
+                   COALESCE(NULLIF(TRIM(t.category_override),''), t.category, 'Other') AS category,
+                   t.amount, t.direction, t.signed,
+                   t.balance, t.page, t.account_id, a.display_name AS account,
+                   s.period_start AS statement_period_start,
+                   s.period_end AS statement_period_end
+            FROM bank_transactions t JOIN bank_accounts a ON a.id=t.account_id
+            JOIN bank_statements s ON s.id=t.statement_id
+            WHERE {clause} ORDER BY t.txn_date DESC, t.id DESC LIMIT ?""",
+        args + [limit],
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["category_is_override"] = item["category_override"] is not None
+        for key in ("amount", "signed", "balance"):
+            item[key] = store.to_rupees(item[key])
+        result.append(item)
+    return result
+
+
+def analytics(
+    conn: sqlite3.Connection,
+    account_ids: Iterable[int] = (),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> dict:
+    _ensure_enrichment(conn)
+    clause, args = _where(account_ids, date_from, date_to)
+    totals = conn.execute(
+        f"""SELECT
+              COALESCE(SUM(CASE WHEN direction='debit' THEN amount ELSE 0 END),0) withdrawals,
+              COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE 0 END),0) deposits,
+              COALESCE(SUM(CASE WHEN direction='debit' THEN 1 ELSE 0 END),0) debit_count,
+              COUNT(*) txn_count,
+              COALESCE(MAX(CASE WHEN direction='debit' THEN amount ELSE 0 END),0) largest
+            FROM bank_transactions t WHERE {clause}""",
+        args,
+    ).fetchone()
+    monthly = conn.execute(
+        f"""SELECT substr(txn_date,1,7) month,
+                   SUM(CASE WHEN direction='debit' THEN amount ELSE 0 END) withdrawals,
+                   SUM(CASE WHEN direction='credit' THEN amount ELSE 0 END) deposits
+            FROM bank_transactions t WHERE {clause} GROUP BY month ORDER BY month""",
+        args,
+    ).fetchall()
+    categories = conn.execute(
+        f"""SELECT COALESCE(NULLIF(TRIM(category_override),''), category, 'Other') label,
+                   SUM(amount) total, COUNT(*) n
+            FROM bank_transactions t WHERE {clause} AND direction='debit'
+            GROUP BY label ORDER BY total DESC""",
+        args,
+    ).fetchall()
+    deposit_categories = conn.execute(
+        f"""SELECT COALESCE(NULLIF(TRIM(category_override),''), category, 'Other') label,
+                   SUM(amount) total, COUNT(*) n
+            FROM bank_transactions t WHERE {clause} AND direction='credit'
+            GROUP BY label ORDER BY total DESC""",
+        args,
+    ).fetchall()
+    by_account = conn.execute(
+        f"""SELECT t.account_id, a.display_name label, SUM(t.amount) total, COUNT(*) n
+            FROM bank_transactions t JOIN bank_accounts a ON a.id=t.account_id
+            WHERE {clause} AND t.direction='debit'
+            GROUP BY t.account_id ORDER BY total DESC""",
+        args,
+    ).fetchall()
+    counterparties = conn.execute(
+        f"""SELECT counterparty label, SUM(amount) total, COUNT(*) n
+            FROM bank_transactions t WHERE {clause} AND direction='debit'
+            GROUP BY counterparty ORDER BY total DESC LIMIT 12""",
+        args,
+    ).fetchall()
+    ledger = conn.execute(
+        f"""SELECT account_id, amount, direction, balance
+            FROM bank_transactions t WHERE {clause} ORDER BY txn_date, id""",
+        args,
+    ).fetchall()
+    first: dict[int, sqlite3.Row] = {}
+    last: dict[int, sqlite3.Row] = {}
+    for row in ledger:
+        first.setdefault(row["account_id"], row)
+        last[row["account_id"]] = row
+    opening = sum(
+        row["balance"] + row["amount"] if row["direction"] == "debit"
+        else row["balance"] - row["amount"]
+        for row in first.values()
+    )
+    closing = sum(row["balance"] for row in last.values())
+    withdrawals = totals["withdrawals"]
+    deposits = totals["deposits"]
+    debit_count = totals["debit_count"]
+    return {
+        "totals": {
+            "withdrawals": store.to_rupees(withdrawals),
+            "deposits": store.to_rupees(deposits),
+            "net": store.to_rupees(deposits - withdrawals),
+            "txn_count": totals["txn_count"],
+            "avg_debit": store.to_rupees(withdrawals // debit_count) if debit_count else 0.0,
+            "largest_debit": store.to_rupees(totals["largest"]),
+            "opening_balance": store.to_rupees(opening),
+            "closing_balance": store.to_rupees(closing),
+        },
+        "monthly": [
+            {"month": row["month"], "withdrawals": store.to_rupees(row["withdrawals"]),
+             "deposits": store.to_rupees(row["deposits"])}
+            for row in monthly
+        ],
+        "by_category": [
+            {"label": row["label"], "value": store.to_rupees(row["total"]), "n": row["n"]}
+            for row in categories
+        ],
+        "deposits_by_category": [
+            {"label": row["label"], "value": store.to_rupees(row["total"]), "n": row["n"]}
+            for row in deposit_categories
+        ],
+        "by_account": [
+            {"account_id": row["account_id"], "label": row["label"],
+             "value": store.to_rupees(row["total"]), "n": row["n"]}
+            for row in by_account
+        ],
+        "top_counterparties": [
+            {"label": row["label"] or "Unknown", "value": store.to_rupees(row["total"]),
+             "n": row["n"]}
+            for row in counterparties
+        ],
+    }

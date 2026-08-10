@@ -13,18 +13,21 @@ from __future__ import annotations
 import datetime as dt
 import os
 import logging
+import re
+import shutil
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from . import accounts, pipeline, store
+from . import accounts, bank_pipeline, bank_store, pipeline, store
 from .logging_config import configure_progress_logging
 
 configure_progress_logging()
@@ -34,9 +37,10 @@ WEB_DIST = Path(__file__).parent / "web" / "dist"
 DB_PATH = Path(os.environ.get("SPARSER_DB", "statements.db"))
 INBOX = Path(os.environ.get("SPARSER_INBOX", "inbox"))
 
-app = FastAPI(title="sparser", description="Card statement parser & spend analytics", version="0.2.0")
+app = FastAPI(title="sparser", description="Card and bank statement analytics", version="0.3.0")
 
 _lock = threading.Lock()
+_bank_lock = threading.Lock()
 log = logging.getLogger("sparser.api")
 
 
@@ -46,6 +50,10 @@ def db():
 
 def _cards(cards: Optional[str]) -> list[int]:
     return [int(v) for v in (cards or "").split(",") if v.strip().isdigit()]
+
+
+def _account_ids(accounts: Optional[str]) -> list[int]:
+    return [int(v) for v in (accounts or "").split(",") if v.strip().isdigit()]
 
 
 # ------------------------------------------------------------------ models
@@ -97,6 +105,14 @@ class ReevaluateRequest(Credentials):
 class ImportRequest(Credentials):
     paths: list[str] = Field(default_factory=list, description="PDF paths or directories")
     force: bool = False
+
+
+class BankCategoryIn(BaseModel):
+    category: Optional[str] = Field(
+        default=None,
+        max_length=bank_store.MAX_CATEGORY_LENGTH,
+        description="Manual category label; null or blank restores automatic categorization",
+    )
 
 
 # -------------------------------------------------------------- analytics
@@ -163,6 +179,83 @@ def export(
         conn.close()
     return JSONResponse(
         payload, headers={"Content-Disposition": 'attachment; filename="statements.json"'}
+    )
+
+
+# --------------------------------------------------------- bank analytics
+
+@app.get("/api/bank/bootstrap")
+def bank_bootstrap():
+    conn = db()
+    try:
+        return {"accounts": bank_store.accounts(conn), "bounds": bank_store.date_bounds(conn)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/bank/analytics")
+def bank_analytics(
+    accounts: Optional[str] = None,
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
+):
+    conn = db()
+    try:
+        return bank_store.analytics(conn, _account_ids(accounts), date_from, date_to)
+    finally:
+        conn.close()
+
+
+@app.get("/api/bank/transactions")
+def bank_transactions(
+    accounts: Optional[str] = None,
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
+    limit: int = 5000,
+):
+    conn = db()
+    try:
+        return bank_store.transactions(conn, _account_ids(accounts), date_from, date_to, limit)
+    finally:
+        conn.close()
+
+
+@app.put("/api/bank/transactions/{transaction_id}/category")
+def put_bank_transaction_category(transaction_id: int, body: BankCategoryIn):
+    """Override one bank transaction category, or clear it to use parser logic."""
+    conn = db()
+    try:
+        try:
+            return bank_store.update_transaction_category(conn, transaction_id, body.category)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/bank/export")
+def bank_export(
+    accounts: Optional[str] = None,
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
+):
+    conn = db()
+    try:
+        payload = {
+            "schema": "sparser/bank-statements@1",
+            "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "accounts": bank_store.accounts(conn),
+            "statements": bank_store.statements(conn),
+            "transactions": bank_store.transactions(
+                conn, _account_ids(accounts), date_from, date_to, limit=1_000_000
+            ),
+        }
+    finally:
+        conn.close()
+    return JSONResponse(
+        payload, headers={"Content-Disposition": 'attachment; filename="bank-statements.json"'}
     )
 
 
@@ -367,6 +460,137 @@ def _spawn(fn, *args) -> None:
     threading.Thread(target=fn, args=args, daemon=True).start()
 
 
+@app.post("/api/bank/ingest/upload")
+async def bank_ingest_upload(
+    files: list[UploadFile] = File(...),
+    password: Optional[str] = Form(default=None),
+):
+    """Persist uploaded PDFs, then parse them on the normal background worker."""
+    if not files or len(files) > 20:
+        raise HTTPException(422, "upload between 1 and 20 PDF files")
+    for upload in files:
+        if Path(upload.filename or "").suffix.lower() != ".pdf":
+            raise HTTPException(422, f"{upload.filename or 'file'} is not a PDF")
+    if not _bank_lock.acquire(blocking=False):
+        raise HTTPException(409, "a bank ingest run is already in progress")
+
+    upload_dir = INBOX / "bank-uploads" / uuid.uuid4().hex
+    saved: list[Path] = []
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=False)
+        for index, upload in enumerate(files, 1):
+            original = Path(upload.filename or f"statement-{index}.pdf").name
+            safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", original).strip(" .")
+            if not safe.lower().endswith(".pdf"):
+                safe += ".pdf"
+            target = upload_dir / safe
+            if target.exists():
+                target = upload_dir / f"{target.stem}-{index}{target.suffix}"
+            size = 0
+            first = b""
+            with target.open("wb") as handle:
+                while chunk := await upload.read(1024 * 1024):
+                    if not first:
+                        first = chunk[:5]
+                    size += len(chunk)
+                    if size > 25 * 1024 * 1024:
+                        raise HTTPException(413, f"{original} exceeds the 25 MB upload limit")
+                    handle.write(chunk)
+            if first != b"%PDF-":
+                raise HTTPException(422, f"{original} does not contain a valid PDF header")
+            saved.append(target)
+    except Exception:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        _bank_lock.release()
+        raise
+    finally:
+        for upload in files:
+            await upload.close()
+
+    def job():
+        try:
+            bank_pipeline.run_scan(DB_PATH, saved, {"password": password})
+        finally:
+            _bank_lock.release()
+
+    _spawn(job)
+    return {"status": "started", "files": [path.name for path in saved]}
+
+
+@app.get("/api/bank/pending")
+def bank_pending():
+    conn = db()
+    try:
+        return {"pending": bank_pipeline.pending(conn)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/bank/pending/discard")
+def bank_discard_pending(body: dict):
+    ids = [int(value) for value in body.get("file_ids", [])]
+    conn = db()
+    try:
+        return {"discarded": bank_pipeline.discard(conn, ids)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/bank/pending/reevaluate")
+def bank_reevaluate_pending(req: ReevaluateRequest):
+    if not _bank_lock.acquire(blocking=False):
+        raise HTTPException(409, "a bank ingest run is already in progress")
+    credentials, ids = req.as_dict(), req.file_ids
+
+    def job():
+        try:
+            bank_pipeline.run_reevaluate(DB_PATH, ids, credentials)
+        finally:
+            _bank_lock.release()
+
+    _spawn(job)
+    return {"status": "started", "count": len(ids) if ids else None}
+
+
+@app.post("/api/bank/ingest/approve")
+def bank_ingest_approve(req: ApproveRequest):
+    if not _bank_lock.acquire(blocking=False):
+        raise HTTPException(409, "a bank ingest run is already in progress")
+    credentials, ids = req.as_dict(), req.file_ids
+
+    def job():
+        try:
+            bank_pipeline.run_approve(DB_PATH, ids, credentials)
+        finally:
+            _bank_lock.release()
+
+    _spawn(job)
+    return {"status": "started", "count": len(ids)}
+
+
+@app.get("/api/bank/runs")
+def bank_runs(limit: int = 40):
+    conn = db()
+    try:
+        return {"runs": bank_pipeline.runs(conn, limit), "busy": _bank_lock.locked()}
+    finally:
+        conn.close()
+
+
+@app.get("/api/bank/runs/{run_id}")
+def bank_run_detail(run_id: int):
+    conn = db()
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM ingest_runs WHERE id=? AND kind='bank_import'", (run_id,)
+        ).fetchone()
+        if not found:
+            raise HTTPException(404, "no such bank ingest run")
+        return pipeline.run_detail(conn, run_id)
+    finally:
+        conn.close()
+
+
 @app.post("/api/ingest/fetch")
 def ingest_fetch(req: FetchRequest, tasks: BackgroundTasks):
     """Pull this month's statements from every configured mailbox and import."""
@@ -520,7 +744,9 @@ def pending_pdf(file_id: int):
     conn = db()
     try:
         row = conn.execute(
-            "SELECT filename, path FROM ingest_files WHERE id = ? AND status = 'pending'",
+            """SELECT filename, path FROM ingest_files
+               WHERE id = ? AND status = 'pending'
+                 AND COALESCE(document_type,'credit_card') != 'bank_account'""",
             (file_id,),
         ).fetchone()
         if not row:

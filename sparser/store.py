@@ -85,6 +85,62 @@ CREATE TABLE IF NOT EXISTS transactions (
     raw           TEXT
 );
 
+-- Deposit accounts are intentionally separate from cards. Their ledger sign,
+-- running balance, value date and reference number have different semantics,
+-- and keeping separate foreign keys prevents bank transfers from leaking into
+-- card-spend analytics.
+CREATE TABLE IF NOT EXISTS bank_accounts (
+    id                  INTEGER PRIMARY KEY,
+    bank_code           TEXT NOT NULL,
+    bank_name           TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL UNIQUE,
+    masked_number       TEXT NOT NULL,
+    last4               TEXT NOT NULL,
+    account_holder      TEXT,
+    account_type        TEXT,
+    product             TEXT,
+    branch              TEXT,
+    display_name        TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bank_statements (
+    id                INTEGER PRIMARY KEY,
+    account_id        INTEGER NOT NULL REFERENCES bank_accounts(id) ON DELETE CASCADE,
+    source_file       TEXT,
+    parser_id         TEXT NOT NULL,
+    period_start      TEXT NOT NULL,
+    period_end        TEXT NOT NULL,
+    coverage_start    TEXT,
+    coverage_end      TEXT,
+    currency          TEXT DEFAULT 'INR',
+    opening_balance   INTEGER,
+    closing_balance   INTEGER,
+    confidence        REAL,
+    checks_json       TEXT,
+    imported_at       TEXT NOT NULL,
+    UNIQUE (account_id, period_start, period_end)
+);
+
+CREATE TABLE IF NOT EXISTS bank_transactions (
+    id            INTEGER PRIMARY KEY,
+    statement_id  INTEGER NOT NULL REFERENCES bank_statements(id) ON DELETE CASCADE,
+    account_id    INTEGER NOT NULL REFERENCES bank_accounts(id) ON DELETE CASCADE,
+    txn_date      TEXT NOT NULL,
+    value_date    TEXT,
+    description   TEXT NOT NULL,
+    reference     TEXT,
+    counterparty  TEXT,
+    category      TEXT,
+    category_override TEXT,
+    amount        INTEGER NOT NULL,  -- paise, always positive
+    direction     TEXT NOT NULL,     -- debit | credit
+    signed        INTEGER NOT NULL,  -- paise, credit positive
+    balance       INTEGER NOT NULL,  -- paise after this transaction
+    page          INTEGER,
+    raw           TEXT
+);
+
 CREATE TABLE IF NOT EXISTS app_metadata (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -127,6 +183,9 @@ CREATE TABLE IF NOT EXISTS ingest_steps (
 CREATE INDEX IF NOT EXISTS ix_txn_date ON transactions(txn_date);
 CREATE INDEX IF NOT EXISTS ix_txn_card ON transactions(card_id);
 CREATE INDEX IF NOT EXISTS ix_txn_cat  ON transactions(category);
+CREATE INDEX IF NOT EXISTS ix_bank_txn_date ON bank_transactions(txn_date);
+CREATE INDEX IF NOT EXISTS ix_bank_txn_account ON bank_transactions(account_id);
+CREATE INDEX IF NOT EXISTS ix_bank_txn_cat ON bank_transactions(category);
 """
 
 DEFAULT_DB = Path("statements.db")
@@ -153,10 +212,17 @@ _MIGRATIONS = {
         "period_start": "TEXT",
         "period_end": "TEXT",
         "duplicate_of": "INTEGER",
+        "document_type": "TEXT DEFAULT 'credit_card'",
+        "bank_account_id": "INTEGER",
     },
     "transactions": {
         "spend_effect": "INTEGER NOT NULL DEFAULT 0",
         "payment_effect": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "bank_transactions": {
+        # Keep user corrections separate from parser-derived enrichment so a
+        # future categorization refresh cannot silently overwrite them.
+        "category_override": "TEXT",
     },
 }
 

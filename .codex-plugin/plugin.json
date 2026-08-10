@@ -1,25 +1,26 @@
 {
   "name": "statement-analytics",
-  "version": "0.1.0",
-  "description": "Read-only MCP tools and analysis guidance for credit-card statement history.",
+  "version": "0.2.0",
+  "description": "Curated MCP tools and analysis guidance for credit-card and bank-account statement history.",
   "author": {
     "name": "statement-parser-delta contributors"
   },
   "license": "MIT",
-  "keywords": ["finance", "analytics", "mcp", "credit-cards"],
+  "keywords": ["finance", "analytics", "mcp", "credit-cards", "bank-statements"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Statement Analytics",
     "shortDescription": "Ask deeper questions about statement history",
-    "longDescription": "Read-only analytics tools for spending trends, period comparisons, recurring merchants, outliers, and parser health.",
+    "longDescription": "Curated analytics tools for card spending, bank cash flow, period comparisons, categories, counterparties, outliers, and parser health.",
     "developerName": "statement-parser-delta contributors",
     "category": "Productivity",
-    "capabilities": ["Read", "Analyze"],
+    "capabilities": ["Read", "Analyze", "Write"],
     "defaultPrompt": [
       "Where did my spending increase most?",
       "Find recurring merchants and unusual debits.",
-      "Compare card spending over the last six months."
+      "Compare card spending over the last six months.",
+      "Break down bank withdrawals and deposits by category."
     ],
     "brandColor": "#4F46E5"
   }

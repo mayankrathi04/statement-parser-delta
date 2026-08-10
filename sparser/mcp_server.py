@@ -1,8 +1,8 @@
-"""Read-only MCP server for open-ended statement analytics.
+"""Curated MCP server for open-ended card and bank-statement analytics.
 
-The server deliberately exposes curated analytical operations instead of raw
-SQL.  MCP clients can inspect financial history but cannot mutate the database,
-read stored passwords, or traverse local files.
+The server deliberately exposes analytical operations instead of raw SQL. MCP
+clients cannot read stored passwords or traverse local files. The sole mutation
+is an explicit, transaction-scoped bank category override.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
 
+from . import bank_store, store
 from .store import to_rupees
 
 DB_PATH = Path(os.environ.get("SPARSER_DB", "statements.db")).expanduser().resolve()
@@ -26,8 +27,10 @@ DB_PATH = Path(os.environ.get("SPARSER_DB", "statements.db")).expanduser().resol
 mcp = FastMCP(
     "Statement Analytics",
     instructions=(
-        "Read-only analysis of imported credit-card statements. Start with list_cards or "
-        "get_overview, narrow by ISO dates/card IDs, and cite returned counts and totals. "
+        "Analysis of imported credit-card and bank-account statements. Start with list_cards "
+        "or list_bank_accounts, narrow by ISO dates and IDs, and cite counts and totals. "
+        "Only set_bank_transaction_category may write, and only when the user explicitly "
+        "asks to correct one transaction's category. "
         "Amounts are INR unless a foreign currency is explicitly present."
     ),
     json_response=True,
@@ -42,6 +45,12 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     return conn
+
+
+def _connect_write() -> sqlite3.Connection:
+    if not DB_PATH.is_file():
+        raise FileNotFoundError(f"statement database not found: {DB_PATH}")
+    return store.connect(DB_PATH)
 
 
 def _date(value: Optional[str], name: str) -> Optional[str]:
@@ -79,6 +88,35 @@ def _where(
     return " AND ".join(terms), args
 
 
+def _bank_where(
+    account_ids: Optional[list[int]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    *,
+    direction: Optional[str] = None,
+) -> tuple[str, list[object]]:
+    terms = ["1=1"]
+    args: list[object] = []
+    if account_ids:
+        terms.append(f"t.account_id IN ({','.join('?' * len(account_ids))})")
+        args.extend(account_ids)
+    if start := _date(date_from, "date_from"):
+        terms.append("t.txn_date >= ?")
+        args.append(start)
+    if end := _date(date_to, "date_to"):
+        terms.append("t.txn_date <= ?")
+        args.append(end)
+    if direction:
+        if direction not in {"debit", "credit"}:
+            raise ValueError("direction must be debit or credit")
+        terms.append("t.direction = ?")
+        args.append(direction)
+    return " AND ".join(terms), args
+
+
+_BANK_CATEGORY = "COALESCE(NULLIF(TRIM(t.category_override),''),t.category,'Other')"
+
+
 def _money_row(row: sqlite3.Row, fields: tuple[str, ...]) -> dict:
     item = dict(row)
     for field in fields:
@@ -98,6 +136,253 @@ def list_cards() -> dict:
                GROUP BY c.id ORDER BY c.display_name"""
         ).fetchall()
     return {"database": str(DB_PATH), "cards": [dict(r) for r in rows]}
+
+
+@mcp.tool()
+def list_bank_accounts() -> dict:
+    """List bank accounts with IDs, transaction coverage, and imported statement periods."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT a.id, a.display_name, a.bank_code, a.bank_name, a.last4,
+                      a.account_type, a.product, COUNT(DISTINCT s.id) statements,
+                      COUNT(t.id) transactions, MIN(t.txn_date) first_date,
+                      MAX(t.txn_date) last_date
+               FROM bank_accounts a
+               LEFT JOIN bank_statements s ON s.account_id=a.id
+               LEFT JOIN bank_transactions t ON t.statement_id=s.id
+               GROUP BY a.id ORDER BY a.display_name"""
+        ).fetchall()
+        periods = conn.execute(
+            """SELECT id, account_id, period_start, period_end, coverage_start,
+                      coverage_end, parser_id, confidence, imported_at
+               FROM bank_statements ORDER BY account_id, period_end"""
+        ).fetchall()
+    by_account: defaultdict[int, list[dict]] = defaultdict(list)
+    for period in periods:
+        item = dict(period)
+        by_account[item.pop("account_id")].append(item)
+    accounts = []
+    for row in rows:
+        item = dict(row)
+        item["statement_periods"] = by_account[item["id"]]
+        accounts.append(item)
+    return {"database": str(DB_PATH), "accounts": accounts}
+
+
+@mcp.tool()
+def get_bank_overview(
+    account_ids: Optional[list[int]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> dict:
+    """Get exact bank withdrawals, deposits, net cash flow, balances, and monthly totals."""
+    clause, args = _bank_where(account_ids, date_from, date_to)
+    with _connect() as conn:
+        totals = conn.execute(
+            f"""SELECT COUNT(*) transactions,
+                       COALESCE(SUM(CASE WHEN direction='debit' THEN amount ELSE 0 END),0) withdrawals,
+                       COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE 0 END),0) deposits,
+                       COALESCE(MAX(CASE WHEN direction='debit' THEN amount ELSE 0 END),0) largest_withdrawal
+                FROM bank_transactions t WHERE {clause}""",
+            args,
+        ).fetchone()
+        monthly = conn.execute(
+            f"""SELECT substr(txn_date,1,7) month,
+                       COALESCE(SUM(CASE WHEN direction='debit' THEN amount ELSE 0 END),0) withdrawals,
+                       COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE 0 END),0) deposits,
+                       COUNT(*) transactions
+                FROM bank_transactions t WHERE {clause}
+                GROUP BY month ORDER BY month""",
+            args,
+        ).fetchall()
+        ledger = conn.execute(
+            f"""SELECT account_id, amount, direction, balance
+                FROM bank_transactions t WHERE {clause} ORDER BY txn_date, id""",
+            args,
+        ).fetchall()
+    first: dict[int, sqlite3.Row] = {}
+    last: dict[int, sqlite3.Row] = {}
+    for row in ledger:
+        first.setdefault(row["account_id"], row)
+        last[row["account_id"]] = row
+    opening = sum(
+        row["balance"] + row["amount"] if row["direction"] == "debit"
+        else row["balance"] - row["amount"]
+        for row in first.values()
+    )
+    closing = sum(row["balance"] for row in last.values())
+    result = _money_row(totals, ("withdrawals", "deposits", "largest_withdrawal"))
+    result["net_cash_flow"] = round(result["deposits"] - result["withdrawals"], 2)
+    result["opening_balance"] = to_rupees(opening)
+    result["closing_balance"] = to_rupees(closing)
+    return {
+        "filters": {"account_ids": account_ids or [], "date_from": date_from, "date_to": date_to},
+        "totals": result,
+        "monthly": [_money_row(row, ("withdrawals", "deposits")) for row in monthly],
+    }
+
+
+@mcp.tool()
+def search_bank_transactions(
+    query: Optional[str] = None,
+    account_ids: Optional[list[int]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    direction: Optional[Literal["debit", "credit"]] = None,
+    category: Optional[str] = None,
+    minimum_amount: Optional[float] = None,
+    maximum_amount: Optional[float] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict:
+    """Search bank rows by narration, reference, counterparty, category, dates, and amount."""
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    clause, args = _bank_where(account_ids, date_from, date_to, direction=direction)
+    terms = [clause]
+    if query:
+        terms.append("(t.description LIKE ? OR t.reference LIKE ? OR t.counterparty LIKE ?)")
+        needle = f"%{query}%"
+        args.extend([needle, needle, needle])
+    if category:
+        terms.append(f"{_BANK_CATEGORY} = ? COLLATE NOCASE")
+        args.append(category)
+    if minimum_amount is not None:
+        terms.append("t.amount >= ?")
+        args.append(round(minimum_amount * 100))
+    if maximum_amount is not None:
+        terms.append("t.amount <= ?")
+        args.append(round(maximum_amount * 100))
+    where = " AND ".join(terms)
+    with _connect() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM bank_transactions t WHERE {where}", args
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""SELECT t.id, t.txn_date, t.value_date, t.description, t.reference,
+                       t.counterparty, {_BANK_CATEGORY} category, t.category derived_category,
+                       t.category_override, t.amount, t.direction, t.balance,
+                       a.display_name account
+                FROM bank_transactions t JOIN bank_accounts a ON a.id=t.account_id
+                WHERE {where} ORDER BY t.txn_date DESC, t.id DESC LIMIT ? OFFSET ?""",
+            args + [limit, offset],
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = _money_row(row, ("amount", "balance"))
+        item["category_is_override"] = item["category_override"] is not None
+        items.append(item)
+    return {"total_matches": total, "limit": limit, "offset": offset, "transactions": items}
+
+
+@mcp.tool()
+def bank_cashflow_breakdown(
+    group_by: Literal["month", "category", "counterparty", "account"],
+    direction: Literal["debit", "credit"],
+    account_ids: Optional[list[int]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 50,
+) -> dict:
+    """Group withdrawals or deposits by month, effective category, counterparty, or account."""
+    expressions = {
+        "month": "substr(t.txn_date,1,7)",
+        "category": _BANK_CATEGORY,
+        "counterparty": "COALESCE(t.counterparty,t.description,'Unknown')",
+        "account": "a.display_name",
+    }
+    clause, args = _bank_where(account_ids, date_from, date_to, direction=direction)
+    limit = max(1, min(limit, 200))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT {expressions[group_by]} label, SUM(t.amount) amount,
+                       COUNT(*) transactions
+                FROM bank_transactions t JOIN bank_accounts a ON a.id=t.account_id
+                WHERE {clause} GROUP BY label ORDER BY amount DESC LIMIT ?""",
+            args + [limit],
+        ).fetchall()
+        total = conn.execute(
+            f"SELECT COALESCE(SUM(t.amount),0) FROM bank_transactions t WHERE {clause}", args
+        ).fetchone()[0]
+    total_rupees = to_rupees(total)
+    groups = []
+    for row in rows:
+        item = _money_row(row, ("amount",))
+        item["share_percent"] = round(item["amount"] * 100 / total_rupees, 2) if total_rupees else 0
+        groups.append(item)
+    return {"group_by": group_by, "direction": direction, "total": total_rupees, "groups": groups}
+
+
+@mcp.tool()
+def bank_statement_health(account_ids: Optional[list[int]] = None) -> dict:
+    """Summarize bank-parser confidence and failed checks for imported statement periods."""
+    terms, args = ["1=1"], []
+    if account_ids:
+        terms.append(f"s.account_id IN ({','.join('?' * len(account_ids))})")
+        args.extend(account_ids)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT s.id, s.period_start, s.period_end, s.coverage_start, s.coverage_end,
+                       s.confidence, s.parser_id, s.checks_json, a.display_name account
+                FROM bank_statements s JOIN bank_accounts a ON a.id=s.account_id
+                WHERE {' AND '.join(terms)} ORDER BY s.period_start""",
+            args,
+        ).fetchall()
+    failed_checks: defaultdict[str, int] = defaultdict(int)
+    statements = []
+    for row in rows:
+        item = dict(row)
+        checks = json.loads(item.pop("checks_json") or "[]")
+        failed = [check["name"] for check in checks if not check.get("passed")]
+        for name in failed:
+            failed_checks[name] += 1
+        item["failed_checks"] = failed
+        statements.append(item)
+    return {
+        "statements": len(statements),
+        "fully_reconciled": sum(item["confidence"] == 1 for item in statements),
+        "failed_check_counts": dict(sorted(failed_checks.items())),
+        "details": statements,
+    }
+
+
+@mcp.tool()
+def bank_pipeline_status(limit: int = 20) -> dict:
+    """Inspect recent bank import runs and statements currently awaiting approval."""
+    limit = max(1, min(limit, 100))
+    with _connect() as conn:
+        runs = conn.execute(
+            """SELECT r.id, r.kind, r.status, r.started_at, r.finished_at, r.note,
+                      (SELECT COUNT(*) FROM ingest_files f WHERE f.run_id=r.id) files,
+                      (SELECT COUNT(*) FROM ingest_files f WHERE f.run_id=r.id AND f.status='ok') ok,
+                      (SELECT COUNT(*) FROM ingest_files f WHERE f.run_id=r.id AND f.status='pending') pending
+               FROM ingest_runs r WHERE r.kind LIKE 'bank_%'
+               ORDER BY r.id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        pending = conn.execute(
+            """SELECT f.id, f.filename, f.issuer bank, f.card account, f.template_id parser_id,
+                      f.encrypted, f.txn_count, f.confidence, f.statement_date,
+                      f.period_start, f.period_end, f.duplicate_of, f.checks_json, f.error
+               FROM ingest_files f
+               WHERE f.status='pending' AND f.document_type='bank_account'
+               ORDER BY f.id DESC"""
+        ).fetchall()
+    review = []
+    for row in pending:
+        item = dict(row)
+        item["encrypted"] = bool(item["encrypted"])
+        item["is_duplicate"] = item.pop("duplicate_of") is not None
+        item["checks"] = json.loads(item.pop("checks_json") or "[]")
+        review.append(item)
+    return {"runs": [dict(row) for row in runs], "pending_review": review}
+
+
+@mcp.tool()
+def set_bank_transaction_category(transaction_id: int, category: Optional[str] = None) -> dict:
+    """Explicitly set one bank row's category; blank/null restores automatic categorization."""
+    with _connect_write() as conn:
+        return bank_store.update_transaction_category(conn, transaction_id, category)
 
 
 @mcp.tool()
@@ -451,8 +736,11 @@ def statement_health(card_ids: Optional[list[int]] = None) -> dict:
 def schema_resource() -> str:
     """Explain the analytical data model and units."""
     return (
-        "Cards own statements and transactions. Dates are ISO YYYY-MM-DD. "
-        "Tool outputs express card amounts in INR rupees; the SQLite database stores paise. "
+        "Cards and bank accounts use separate statement and transaction tables. Dates are ISO "
+        "YYYY-MM-DD. Tool outputs express amounts in INR rupees; SQLite stores integer paise. "
+        "Bank withdrawals and deposits remain separate; balance is the post-transaction balance. "
+        "A bank category_override, when present, is the effective category while category remains "
+        "the parser-derived value. "
         "spend uses purchase-based spend_effect: purchases and fees are positive, genuine "
         "refunds are negative, and EMI principal/bookkeeping is zero. payment_effect contains "
         "only actual card payments. direction remains the raw statement-side debit/credit. "
@@ -466,8 +754,10 @@ def analyze_statement_history(question: str) -> str:
     """Create a disciplined workflow for answering a financial-history question."""
     return (
         f"Answer this question using Statement Analytics MCP tools: {question}\n\n"
-        "First inspect cards/date coverage. Choose the narrowest relevant tools and filters. "
-        "Separate debit spend from credits, INR from foreign currency, and points from money. "
+        "First identify whether the question concerns cards or bank accounts, then inspect the "
+        "matching IDs/date coverage. Choose the narrowest relevant tools and filters. Separate "
+        "card spend from payments and bank withdrawals from deposits. Keep INR, foreign currency, "
+        "and points distinct. Never change a bank category unless the user explicitly requests it. "
         "Quantify claims with totals/counts/date ranges, identify limitations, and do not infer "
         "intent or fraud from a merchant name alone."
     )

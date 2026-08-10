@@ -57,7 +57,7 @@ export type CardRow = Card & {
   subject_patterns: string[]
 }
 
-export type Slice = { label: string; value: number; n: number; card_id?: number }
+export type Slice = { label: string; value: number; n: number; card_id?: number; account_id?: number }
 
 export type RewardCard = { card_id: number; label: string; points: number; n: number }
 export type EmiRow = {
@@ -150,9 +150,106 @@ export type Bootstrap = {
 
 export type Filters = { cards: number[]; allCards: number; from: string | null; to: string | null }
 
+export type BankStatementRow = {
+  id: number
+  source_file: string
+  parser_id: string
+  period_start: string
+  period_end: string
+  coverage_start: string | null
+  coverage_end: string | null
+  opening_balance: number
+  closing_balance: number
+  withdrawals: number
+  deposits: number
+  confidence: number
+  imported_at: string
+  txns: number
+  checks: Check[]
+}
+
+export type BankAccount = {
+  id: number
+  bank_code: string
+  bank_name: string
+  masked_number: string
+  last4: string
+  account_holder: string | null
+  account_type: string | null
+  product: string | null
+  branch: string | null
+  display_name: string
+  statements: number
+  txn_count: number
+  first_txn: string | null
+  last_txn: string | null
+  history: BankStatementRow[]
+}
+
+export type BankTxn = {
+  id: number
+  txn_date: string
+  value_date: string | null
+  description: string
+  reference: string | null
+  counterparty: string
+  category: string
+  derived_category: string
+  category_override: string | null
+  category_is_override: boolean
+  amount: number
+  direction: 'debit' | 'credit'
+  signed: number
+  balance: number
+  page: number
+  account_id: number
+  account: string
+  statement_period_start: string
+  statement_period_end: string
+}
+
+export type BankAnalytics = {
+  totals: {
+    withdrawals: number
+    deposits: number
+    net: number
+    txn_count: number
+    avg_debit: number
+    largest_debit: number
+    opening_balance: number
+    closing_balance: number
+  }
+  monthly: { month: string; withdrawals: number; deposits: number }[]
+  by_category: Slice[]
+  deposits_by_category: Slice[]
+  by_account: (Slice & { account_id: number })[]
+  top_counterparties: Slice[]
+}
+
+export type BankBootstrap = {
+  accounts: BankAccount[]
+  bounds: { min: string | null; max: string | null }
+}
+
+export type BankFilters = {
+  accounts: number[]
+  allAccounts: number
+  from: string | null
+  to: string | null
+}
+
 function qs(f: Filters): string {
   const p = new URLSearchParams()
   if (f.cards.length && f.cards.length !== f.allCards) p.set('cards', f.cards.join(','))
+  if (f.from) p.set('from', f.from)
+  if (f.to) p.set('to', f.to)
+  const s = p.toString()
+  return s ? `?${s}` : ''
+}
+
+function bankQs(f: BankFilters): string {
+  const p = new URLSearchParams()
+  if (f.accounts.length && f.accounts.length !== f.allAccounts) p.set('accounts', f.accounts.join(','))
   if (f.from) p.set('from', f.from)
   if (f.to) p.set('to', f.to)
   const s = p.toString()
@@ -215,6 +312,38 @@ export const api = {
   analytics: (f: Filters) => get<Analytics>(`/api/analytics${qs(f)}`),
   transactions: (f: Filters) => get<Txn[]>(`/api/transactions${qs(f)}`),
   exportUrl: (f: Filters) => `/api/export${qs(f)}`,
+  bankBootstrap: () => get<BankBootstrap>('/api/bank/bootstrap'),
+  bankAnalytics: (f: BankFilters) => get<BankAnalytics>(`/api/bank/analytics${bankQs(f)}`),
+  bankTransactions: (f: BankFilters) => get<BankTxn[]>(`/api/bank/transactions${bankQs(f)}`),
+  updateBankTransactionCategory: (id: number, category: string | null) =>
+    request<Pick<BankTxn, 'id' | 'category' | 'derived_category' | 'category_override' | 'category_is_override'>>(
+      `/api/bank/transactions/${id}/category`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category }),
+      },
+    ),
+  bankExportUrl: (f: BankFilters) => `/api/bank/export${bankQs(f)}`,
+  bankRuns: () => get<{ runs: Run[]; busy: boolean }>('/api/bank/runs'),
+  bankRun: (id: number) => get<{ run: Run; files: IngestFile[] }>(`/api/bank/runs/${id}`),
+  bankPending: () => get<{ pending: Pending[] }>('/api/bank/pending'),
+  discardBankPending: (file_ids: number[]) =>
+    post<{ discarded: number }>('/api/bank/pending/discard', { file_ids }),
+  reevaluateBankPending: (file_ids: number[] = [], password = '') =>
+    post<{ status: string; count: number | null }>('/api/bank/pending/reevaluate', {
+      file_ids, password,
+    }),
+  approveBankStatements: (file_ids: number[], password = '') =>
+    post<{ status: string; count: number }>('/api/bank/ingest/approve', { file_ids, password }),
+  uploadBankStatements: (files: File[], password = '') => {
+    const body = new FormData()
+    files.forEach((file) => body.append('files', file))
+    if (password) body.append('password', password)
+    return request<{ status: string; files: string[] }>('/api/bank/ingest/upload', {
+      method: 'POST',
+      body,
+    })
+  },
   runs: () => get<{ runs: Run[]; busy: boolean }>('/api/runs'),
   run: (id: number) => get<{ run: Run; files: IngestFile[] }>(`/api/runs/${id}`),
   fetchMail: (body: Record<string, unknown>) =>
