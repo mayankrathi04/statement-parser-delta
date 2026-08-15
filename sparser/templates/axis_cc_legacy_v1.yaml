@@ -37,8 +37,10 @@ row:
   drop_patterns:
     - '^Card No:'
     # Legacy summaries classify card fees, tax, and EMI interest as finance
-    # charges. Keeping them in purchase rows would count them twice.
-    - '^\d{2}/\d{2}/\d{4}\s+(?:ANNUAL FEE|GST|EMI INTEREST|EMI PROCESSING FEE)\b'
+    # charges ("Other Debit & Charges"), not as Purchase. Keeping them in the
+    # purchase rows would count them twice. These five are the whole fee
+    # vocabulary across the statements on hand.
+    - '^\d{2}/\d{2}/\d{4}\s+(?:ANNUAL FEE|JOINING FEE|GST|EMI INTEREST|EMI PROCESSING FEE)\b'
     - '^\*+ End of Statement'
     - '^Page \d+ of \d+$'
 header:

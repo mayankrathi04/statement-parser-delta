@@ -1,21 +1,27 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
-import { api, type BankAccount } from '../api'
+import { api, type BankAccount, type Member } from '../api'
 import { seriesVar } from '../components/Charts'
 import { money2 } from '../lib/format'
 
-export default function BankAccounts() {
+export default function BankAccounts({
+  roster, members,
+}: {
+  /** Every member, so an account can be reassigned to one not currently selected. */
+  roster: Member[]
+  members: Set<number>
+}) {
   const [accounts, setAccounts] = useState<BankAccount[]>([])
   const [open, setOpen] = useState<Record<number, boolean>>({})
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
-      setAccounts((await api.bankBootstrap()).accounts)
+      setAccounts((await api.bankBootstrap(members)).accounts)
       setError(null)
     } catch (caught) {
       setError(String((caught as Error).message))
     }
-  }, [])
+  }, [members])
 
   useEffect(() => { load() }, [load])
   const colourOf = (id: number) => seriesVar(
@@ -32,14 +38,18 @@ export default function BankAccounts() {
           one-way fingerprint and the last four digits are stored for identity and display.
         </p>
         {!accounts.length && (
-          <p className="empty">No bank accounts yet. Upload an HDFC statement in Bank Pipeline.</p>
+          <p className="empty">
+            {members.size && members.size < roster.length
+              ? 'No bank accounts for the selected member. Widen the selector at the top to see the rest.'
+              : 'No bank accounts yet. Upload an account statement in Bank Pipeline.'}
+          </p>
         )}
         {!!accounts.length && (
           <div className="tbl-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Account</th><th>Number</th><th>Type</th><th>Branch</th>
+                  <th>Account</th><th>Member</th><th>Number</th><th>Type</th><th>Branch</th>
                   <th style={{ textAlign: 'right' }}>Statements</th>
                   <th style={{ textAlign: 'right' }}>Txns</th><th>Coverage</th>
                 </tr>
@@ -62,6 +72,9 @@ export default function BankAccounts() {
                         <i className="swatch" style={{ background: colourOf(account.id) }} />{' '}
                         {account.display_name}
                       </td>
+                      <td><select value={account.member_id ?? ''} onChange={async (event) => {
+                        await api.assignBankAccountMember(account.id, Number(event.target.value)); void load()
+                      }}>{roster.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></td>
                       <td><code>{account.masked_number}</code></td>
                       <td>{account.account_type ?? account.product ?? '—'}</td>
                       <td>{account.branch ?? '—'}</td>
@@ -74,7 +87,7 @@ export default function BankAccounts() {
                     </tr>
                     {open[account.id] && (
                       <tr>
-                        <td colSpan={7} style={{ background: 'var(--surface-2)' }}>
+                        <td colSpan={8} style={{ background: 'var(--surface-2)' }}>
                           <div className="tile-l" style={{ marginBottom: 8 }}>
                             Statements present for this account — newest first
                           </div>

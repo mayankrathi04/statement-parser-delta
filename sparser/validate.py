@@ -87,6 +87,52 @@ def credits_match_payments(stmt: Statement) -> Check:
     )
 
 
+@check("hdfc_legacy_side_totals")
+def hdfc_legacy_side_totals(stmt: Statement) -> Check:
+    """Debits and credits against the summary, tolerating an offsetting pair.
+
+    HDFC occasionally counts a reversed charge in *both* the Purchase and the
+    Payments/Credits column without printing either leg as a transaction row, so
+    both sides read short by the identical amount while the closing balance is
+    exact. That is an issuer bookkeeping artifact, not a parse error: the ledger
+    it produces is right to the paisa. Requiring the two shortfalls to match
+    each other *and* the closing balance to reconcile keeps the pair of checks
+    honest — a dropped row moves one side only, and still fails here.
+    """
+    name = "hdfc_legacy_side_totals"
+    debits = debits_match_purchases(stmt)
+    credits = credits_match_payments(stmt)
+    if debits.passed and credits.passed:
+        return Check(name=name, passed=True, detail=f"{debits.detail}; {credits.detail}")
+
+    s = stmt.summary
+    if s.purchases_debits is None or s.payments_credits is None:
+        return Check(name=name, passed=False, severity="error", detail=f"{debits.detail}; {credits.detail}")
+
+    def _side(kind: TxnType) -> Decimal:
+        return sum((t.amount for t in stmt.transactions if t.type is kind), Decimal("0"))
+
+    debit_gap = s.purchases_debits - _side(TxnType.DEBIT)
+    credit_gap = s.payments_credits - _side(TxnType.CREDIT)
+    offsetting = (
+        debit_gap > ROUNDING_TOLERANCE
+        and abs(debit_gap - credit_gap) <= ROUNDING_TOLERANCE
+        and transactions_reconcile_to_total(stmt).passed
+        and cc_summary_reconcile(stmt).passed
+    )
+    if offsetting:
+        return Check(
+            name=name,
+            passed=True,
+            detail=(
+                f"summary counts ₹{debit_gap:,.2f} in both the Purchase and the Payments/Credits "
+                "column that is not printed as a transaction row; the two cancel and the closing "
+                "balance reconciles exactly, so the imported ledger is complete"
+            ),
+        )
+    return Check(name=name, passed=False, severity="error", detail=f"{debits.detail}; {credits.detail}")
+
+
 @check("axis_legacy_summary_consistency")
 def axis_legacy_summary_consistency(stmt: Statement) -> Check:
     """Recognise one proven Axis summary-box omission without hiding parse errors."""

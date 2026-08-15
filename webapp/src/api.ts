@@ -5,6 +5,8 @@ export type Card = {
   masked_number: string
   last4: string
   display_name: string
+  member_id: number
+  member_name: string
   txn_count: number
   first_txn: string | null
   last_txn: string | null
@@ -17,6 +19,9 @@ export type Txn = {
   description: string
   merchant: string
   category: string
+  derived_category: string
+  category_override: string | null
+  category_is_override: boolean
   amount: number
   direction: 'debit' | 'credit'
   signed: number
@@ -67,6 +72,7 @@ export type EmiRow = {
 export type FcyRow = EmiRow & { currency: string; fcy_amount: number }
 
 export type Analytics = {
+  by_member: { member_id: number; member: string; debits: number; credits: number; n: number }[]
   rewards: {
     total_points: number
     earning_txns: number
@@ -125,6 +131,9 @@ export type Pending = {
   period_end: string | null
   is_duplicate: boolean
   error: string | null
+  /** Member this file was uploaded/fetched for, fixed at scan time. */
+  member_id: number | null
+  member_name: string | null
   checks: Check[]
   steps: Step[]
 }
@@ -141,14 +150,23 @@ export type Run = {
   pending: number
 }
 
+/** A category present on the rows in scope, with how many carry it. */
+export type CategoryFacet = { name: string; n: number }
+
 export type Bootstrap = {
   cards: Card[]
   bounds: { min: string | null; max: string | null }
+  categories: CategoryFacet[]
   statements: { id: number; card: string; statement_date: string; confidence: number }[]
   mailboxes_configured: boolean
 }
 
-export type Filters = { cards: number[]; allCards: number; from: string | null; to: string | null }
+export type Filters = {
+  cards: number[]; allCards: number; members: number[]; from: string | null; to: string | null
+  /** Ticked category names. Everything ticked and nothing ticked are different. */
+  categories: string[]
+  allCategories: number
+}
 
 export type BankStatementRow = {
   id: number
@@ -179,6 +197,8 @@ export type BankAccount = {
   product: string | null
   branch: string | null
   display_name: string
+  member_id: number
+  member_name: string
   statements: number
   txn_count: number
   first_txn: string | null
@@ -209,6 +229,9 @@ export type BankTxn = {
 }
 
 export type BankAnalytics = {
+  by_member: {
+    member_id: number; member: string; withdrawals: number; deposits: number; n: number
+  }[]
   totals: {
     withdrawals: number
     deposits: number
@@ -222,6 +245,7 @@ export type BankAnalytics = {
   monthly: { month: string; withdrawals: number; deposits: number }[]
   by_category: Slice[]
   deposits_by_category: Slice[]
+  net_by_category: Slice[]
   by_account: (Slice & { account_id: number })[]
   top_counterparties: Slice[]
 }
@@ -229,20 +253,48 @@ export type BankAnalytics = {
 export type BankBootstrap = {
   accounts: BankAccount[]
   bounds: { min: string | null; max: string | null }
+  categories: CategoryFacet[]
 }
 
 export type BankFilters = {
   accounts: number[]
   allAccounts: number
+  members: number[]
   from: string | null
   to: string | null
+  /** Ticked category names. Everything ticked and nothing ticked are different. */
+  categories: string[]
+  allCategories: number
+}
+
+/** The top-bar member picker, as a query string. Every listing endpoint takes it,
+ *  so one selection scopes analytics, cards, accounts and the pipelines alike. */
+function memberQs(members: Iterable<number>): string {
+  const ids = [...members]
+  return ids.length ? `?members=${ids.join(',')}` : ''
+}
+
+/** Add the category filter to a query string, if the user narrowed one.
+ *
+ *  Repeated `categories=` values, never one comma-joined string, because a
+ *  category name may itself contain a comma. Everything ticked is the same as
+ *  no filter and sends nothing, which keeps the common URL short. Nothing
+ *  ticked is the opposite and must still reach the server: a query string
+ *  cannot carry an empty repeated parameter, so one blank value says it.
+ */
+function appendCategories(p: URLSearchParams, picked: string[], total: number): void {
+  if (picked.length === total) return
+  if (!picked.length) p.append('categories', '')
+  else picked.forEach((name) => p.append('categories', name))
 }
 
 function qs(f: Filters): string {
   const p = new URLSearchParams()
   if (f.cards.length && f.cards.length !== f.allCards) p.set('cards', f.cards.join(','))
+  if (f.members.length) p.set('members', f.members.join(','))
   if (f.from) p.set('from', f.from)
   if (f.to) p.set('to', f.to)
+  appendCategories(p, f.categories, f.allCategories)
   const s = p.toString()
   return s ? `?${s}` : ''
 }
@@ -250,8 +302,10 @@ function qs(f: Filters): string {
 function bankQs(f: BankFilters): string {
   const p = new URLSearchParams()
   if (f.accounts.length && f.accounts.length !== f.allAccounts) p.set('accounts', f.accounts.join(','))
+  if (f.members.length) p.set('members', f.members.join(','))
   if (f.from) p.set('from', f.from)
   if (f.to) p.set('to', f.to)
+  appendCategories(p, f.categories, f.allCategories)
   const s = p.toString()
   return s ? `?${s}` : ''
 }
@@ -273,6 +327,46 @@ export type Mailbox = {
   last_sync: string | null
   added_at: string | null
   secret_ok: boolean
+  member_id: number
+  member_name: string
+}
+
+/** One shared sub-category list drives both the card and bank ledgers. */
+export type Category = {
+  id: number
+  name: string
+  pattern: string | null
+  applies_to: 'both' | 'cards' | 'bank'
+  position: number
+  created_at: string
+  usage: { cards: number; bank: number }
+  /** The major this rolls up into; null means it is still unfiled. */
+  major_id: number | null
+  major: string | null
+  /** Rows carried over by a rename — only present on an update response. */
+  moved?: number
+}
+
+/**
+ * A heading in the household's own list. Carries no pattern: a major never
+ * matches a narration itself, it collects what its subs catch.
+ */
+export type MajorCategory = {
+  id: number
+  name: string
+  position: number
+  created_at: string
+  children: Category[]
+}
+
+/** A label the card issuer printed itself — shown read-only; we cannot edit it. */
+export type ProviderCategory = { name: string; rows: number; sources: string[] }
+
+export type Member = { id: number; name: string; is_default: number; created_at: string }
+/** A member plus what is filed under them — only the Members tab needs the counts. */
+export type MemberDetail = Member & { cards: number; bank_accounts: number; mailboxes: number }
+export type PortalUser = {
+  id: number; username: string; display_name: string; created_at: string; members: Member[]
 }
 
 /** A failed `fetch` rejects with a bare TypeError reading "Failed to fetch",
@@ -281,19 +375,45 @@ export type Mailbox = {
  *  translated into the thing they actually need to do about it. */
 const UNREACHABLE =
   'Cannot reach the API — is the backend running? Start it with ' +
-  '`python -m sparser serve --db statements.db`, or use ./scripts/dev.sh to run both.'
+  '`python -m sparser serve --db data/statements.db`, or use ./scripts/dev.sh to run both.'
+
+/** An API failure carrying its HTTP status.
+ *
+ *  ``status === 0`` means the request never reached the server. Callers must be
+ *  able to tell that apart from a rejected token: only the latter should end a
+ *  session, or restarting the backend would sign the user out.
+ */
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+
+  get unreachable(): boolean {
+    return this.status === 0
+  }
+}
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let r: Response
   try {
-    r = await fetch(url, init)
+    const headers = new Headers(init?.headers)
+    const token = localStorage.getItem('sparser_token')
+    if (token) headers.set('Authorization', `Bearer ${token}`)
+    r = await fetch(url, { ...init, headers })
   } catch {
-    throw new Error(UNREACHABLE)
+    throw new ApiError(UNREACHABLE, 0)
   }
   const data = await r.json().catch(() => ({}))
   if (!r.ok) {
+    if (r.status === 401 && !url.startsWith('/api/auth/')) {
+      window.dispatchEvent(new Event('sparser-auth-required'))
+    }
     const detail = (data as { detail?: string }).detail
-    throw new Error(detail ?? `${r.status} ${r.statusText}`)
+    throw new ApiError(detail ?? `${r.status} ${r.statusText}`, r.status)
   }
   return data as T
 }
@@ -308,11 +428,34 @@ const post = <T,>(url: string, body: unknown) =>
   })
 
 export const api = {
-  bootstrap: () => get<Bootstrap>('/api/bootstrap'),
+  authStatus: () => get<{ registration_required: boolean }>('/api/auth/status'),
+  me: () => get<PortalUser>('/api/auth/me'),
+  logout: () => post<{ status: string }>('/api/auth/logout', {}),
+  login: (username: string, password: string) =>
+    post<{ token: string; user: PortalUser }>('/api/auth/login', { username, password }),
+  register: (username: string, password: string, display_name: string) =>
+    post<{ token: string; user: PortalUser }>('/api/auth/register', { username, password, display_name }),
+  members: () => get<{ members: MemberDetail[] }>('/api/members'),
+  addMember: (name: string) => post<Member>('/api/members', { name }),
+  renameMember: (id: number, name: string) =>
+    request<Member>(`/api/members/${id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+    }),
+  setDefaultMember: (id: number) =>
+    request<Member>(`/api/members/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_default: true }),
+    }),
+  removeMember: (id: number) =>
+    request<{ status: string }>(`/api/members/${id}`, { method: 'DELETE' }),
+  bootstrap: (members: Iterable<number> = []) =>
+    get<Bootstrap>(`/api/bootstrap${memberQs(members)}`),
   analytics: (f: Filters) => get<Analytics>(`/api/analytics${qs(f)}`),
   transactions: (f: Filters) => get<Txn[]>(`/api/transactions${qs(f)}`),
-  exportUrl: (f: Filters) => `/api/export${qs(f)}`,
-  bankBootstrap: () => get<BankBootstrap>('/api/bank/bootstrap'),
+  exportUrl: (f: Filters) => authenticatedUrl(`/api/export${qs(f)}`),
+  bankBootstrap: (members: Iterable<number> = []) =>
+    get<BankBootstrap>(`/api/bank/bootstrap${memberQs(members)}`),
   bankAnalytics: (f: BankFilters) => get<BankAnalytics>(`/api/bank/analytics${bankQs(f)}`),
   bankTransactions: (f: BankFilters) => get<BankTxn[]>(`/api/bank/transactions${bankQs(f)}`),
   updateBankTransactionCategory: (id: number, category: string | null) =>
@@ -323,7 +466,17 @@ export const api = {
         body: JSON.stringify({ category }),
       },
     ),
-  bankExportUrl: (f: BankFilters) => `/api/bank/export${bankQs(f)}`,
+  updateBankTransactionCategories: (ids: number[], category: string | null) =>
+    request<{
+      updated: number
+      rows: Pick<BankTxn,
+        'id' | 'category' | 'derived_category' | 'category_override' | 'category_is_override'>[]
+    }>('/api/bank/transactions/category', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids, category }),
+    }),
+  bankExportUrl: (f: BankFilters) => authenticatedUrl(`/api/bank/export${bankQs(f)}`),
   bankRuns: () => get<{ runs: Run[]; busy: boolean }>('/api/bank/runs'),
   bankRun: (id: number) => get<{ run: Run; files: IngestFile[] }>(`/api/bank/runs/${id}`),
   bankPending: () => get<{ pending: Pending[] }>('/api/bank/pending'),
@@ -333,12 +486,15 @@ export const api = {
     post<{ status: string; count: number | null }>('/api/bank/pending/reevaluate', {
       file_ids, password,
     }),
-  approveBankStatements: (file_ids: number[], password = '') =>
-    post<{ status: string; count: number }>('/api/bank/ingest/approve', { file_ids, password }),
-  uploadBankStatements: (files: File[], password = '') => {
+  approveBankStatements: (file_ids: number[], password = '', member_id?: number) =>
+    post<{ status: string; count: number }>('/api/bank/ingest/approve', {
+      file_ids, password, member_id,
+    }),
+  uploadBankStatements: (files: File[], password = '', member_id?: number) => {
     const body = new FormData()
     files.forEach((file) => body.append('files', file))
     if (password) body.append('password', password)
+    if (member_id) body.append('member_id', String(member_id))
     return request<{ status: string; files: string[] }>('/api/bank/ingest/upload', {
       method: 'POST',
       body,
@@ -353,27 +509,78 @@ export const api = {
   scanLocal: (body: Record<string, unknown>) =>
     post<{ status: string }>('/api/ingest/scan-local', body),
   pending: () => get<{ pending: Pending[] }>('/api/pending'),
-  pendingPdfUrl: (id: number) => `/api/pending/${id}/pdf`,
+  // Opened by navigating a link, which cannot carry the Authorization header the
+  // fetch wrapper adds, so the token rides the query string as the auth
+  // middleware allows. Without it the tab shows "sign in to continue".
+  pendingPdfUrl: (id: number) => authenticatedUrl(`/api/pending/${id}/pdf`),
   discard: (file_ids: number[]) =>
     post<{ discarded: number }>('/api/pending/discard', { file_ids }),
   reevaluatePending: (file_ids: number[] = []) =>
     post<{ status: string; count: number | null }>('/api/pending/reevaluate', { file_ids }),
-  approve: (file_ids: number[]) =>
-    post<{ status: string; count: number }>('/api/ingest/approve', { file_ids }),
+  approve: (file_ids: number[], member_id?: number) =>
+    post<{ status: string; count: number }>('/api/ingest/approve', { file_ids, member_id }),
   importLocal: (body: Record<string, unknown>) =>
     post<{ status: string; files: string[] }>('/api/ingest/local', body),
   mailboxes: () =>
     get<{ mailboxes: Mailbox[]; env_configured: boolean; key_file: string }>('/api/mailboxes'),
-  addMailbox: (address: string, app_password: string) =>
-    post<{ status: string; detail: string }>('/api/mailboxes', { address, app_password }),
+  addMailbox: (address: string, app_password: string, member_id?: number) =>
+    post<{ status: string; detail: string }>('/api/mailboxes', { address, app_password, member_id }),
   testMailbox: (id: number) =>
     post<{ status: string; detail: string }>(`/api/mailboxes/${id}/test`, {}),
   removeMailbox: (id: number) =>
     request<{ status: string }>(`/api/mailboxes/${id}`, { method: 'DELETE' }),
-  cards: () => get<{ cards: CardRow[] }>('/api/cards'),
-  profile: () => get<Profile>('/api/profile'),
-  saveProfile: (full_name: string, dob: string) =>
-    request<Profile & { status: string }>('/api/profile', {
+  assignMailboxMember: (id: number, member_id: number) =>
+    request<{ status: string }>(`/api/mailboxes/${id}/member`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ member_id }),
+    }),
+  cards: (members: Iterable<number> = []) =>
+    get<{ cards: CardRow[] }>(`/api/cards${memberQs(members)}`),
+  categories: () =>
+    get<{
+      categories: Category[]
+      majors: MajorCategory[]
+      unmapped: Category[]
+      provider_categories: ProviderCategory[]
+    }>('/api/categories'),
+  addCategory: (name: string, pattern: string | null, applies_to: string, major_id?: number | null) =>
+    post<Category>('/api/categories', { name, pattern, applies_to, major_id: major_id ?? null }),
+  updateCategory: (id: number, body: {
+    name?: string; pattern?: string | null; applies_to?: string; clear_pattern?: boolean
+  }) => request<Category>(`/api/categories/${id}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }),
+  /** File one sub under a major, or pass null to send it back to unmapped. */
+  linkCategory: (id: number, major_id: number | null) =>
+    request<Category>(`/api/categories/${id}/major`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ major_id }),
+    }),
+  removeCategory: (id: number) =>
+    request<{ status: string }>(`/api/categories/${id}`, { method: 'DELETE' }),
+  reorderCategories: (ids: number[]) =>
+    request<{ categories: Category[] }>('/api/categories/order', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }),
+    }),
+  addMajorCategory: (name: string) => post<MajorCategory>('/api/major-categories', { name }),
+  renameMajorCategory: (id: number, name: string) =>
+    request<MajorCategory>(`/api/major-categories/${id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+    }),
+  removeMajorCategory: (id: number) =>
+    request<{ status: string; unmapped: number }>(`/api/major-categories/${id}`, { method: 'DELETE' }),
+  reapplyCategories: () => post<{ cards: number; bank: number }>('/api/categories/reapply', {}),
+  updateCardTransactionCategories: (ids: number[], category: string | null) =>
+    request<{
+      updated: number
+      rows: Pick<Txn,
+        'id' | 'category' | 'derived_category' | 'category_override' | 'category_is_override'>[]
+    }>('/api/transactions/category', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids, category }),
+    }),
+  profile: (memberId?: number) => get<Profile>(`/api/profile${memberId ? `?member_id=${memberId}` : ''}`),
+  saveProfile: (full_name: string, dob: string, memberId?: number) =>
+    request<Profile & { status: string }>(`/api/profile${memberId ? `?member_id=${memberId}` : ''}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ full_name, dob }),
@@ -393,4 +600,18 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sender_ids, subject_patterns }),
     }),
+  assignCardMember: (id: number, member_id: number) =>
+    request<{ status: string }>(`/api/cards/${id}/member`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ member_id }),
+    }),
+  assignBankAccountMember: (id: number, member_id: number) =>
+    request<{ status: string }>(`/api/bank/accounts/${id}/member`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ member_id }),
+    }),
+}
+
+function authenticatedUrl(url: string): string {
+  const token = localStorage.getItem('sparser_token')
+  if (!token) return url
+  return `${url}${url.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(token)}`
 }

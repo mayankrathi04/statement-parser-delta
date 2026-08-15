@@ -15,7 +15,7 @@ from typing import Iterable, Optional
 import pdfplumber
 
 from . import accounts, bank_store, store
-from .bank_parser import UnsupportedBankStatement, parse_bank_pdf
+from .banks import UnsupportedBankStatement, parse_bank_pdf
 from .decrypt import DecryptError, candidate_passwords, decrypt_to, is_encrypted
 from .doctype import document_kind
 from .pipeline import Recorder
@@ -117,9 +117,28 @@ def ingest_file(rec: Recorder, pdf: Path, creds: dict, *, commit: bool = True) -
         conn = store.connect(rec.db_path)
         try:
             duplicate = bank_store.find_statement(conn, statement)
+            existing_owner = conn.execute(
+                """SELECT a.member_id, m.name FROM bank_accounts a
+                   LEFT JOIN members m ON m.id = a.member_id
+                   WHERE a.account_fingerprint = ?""",
+                (statement.account_fingerprint,),
+            ).fetchone()
         finally:
             conn.close()
         common["duplicate_of"] = (duplicate or {}).get("id")
+
+        # Warn before the import, not after: the account's existing owner wins, so
+        # this is the last point where the user can still redirect it.
+        requested_member = creds.get("_member_id")
+        if (
+            existing_owner and requested_member
+            and existing_owner["member_id"] not in (None, requested_member)
+        ):
+            rec.step(
+                "attribute", "warning",
+                f"this account already belongs to {existing_owner['name']} — importing files "
+                f"the statement under them, not the member selected above.",
+            )
 
         if not commit:
             rec.step(
@@ -139,7 +158,14 @@ def ingest_file(rec: Recorder, pdf: Path, creds: dict, *, commit: bool = True) -
         rec.timed()
         conn = store.connect(rec.db_path)
         try:
-            _, rows, replaced, account_id = bank_store.import_statement(conn, statement)
+            _, rows, replaced, account_id = bank_store.import_statement(
+                conn, statement, requested_member
+            )
+            owner = conn.execute(
+                """SELECT a.member_id, m.name FROM bank_accounts a
+                   LEFT JOIN members m ON m.id = a.member_id WHERE a.id = ?""",
+                (account_id,),
+            ).fetchone()
         finally:
             conn.close()
         rec.step(
@@ -147,6 +173,15 @@ def ingest_file(rec: Recorder, pdf: Path, creds: dict, *, commit: bool = True) -
             f"{'replaced existing' if replaced else 'inserted'} statement, {rows} rows",
             rec.elapsed_ms,
         )
+        # An account keeps its owner across re-imports, so a statement for an account
+        # someone else already owns does not move it. Say so — the alternative is an
+        # import that reports success while the data lands under another member.
+        if owner and requested_member and owner["member_id"] not in (None, requested_member):
+            rec.step(
+                "attribute", "warning",
+                f"this account already belongs to {owner['name']}, so the statement was filed "
+                f"under them. Change the owner on the Bank Accounts tab if that is wrong.",
+            )
         rec.end_file("ok", bank_account_id=account_id, **common)
         return True
     except (UnsupportedBankStatement, DecryptError) as exc:
@@ -169,7 +204,10 @@ def ingest_file(rec: Recorder, pdf: Path, creds: dict, *, commit: bool = True) -
 
 def run_scan(db_path: Path, pdfs: Iterable[Path], creds: Optional[dict] = None) -> int:
     files = [Path(pdf) for pdf in pdfs]
-    recorder = Recorder(db_path, "bank_scan", f"{len(files)} uploaded file(s)")
+    recorder = Recorder(
+        db_path, "bank_scan", f"{len(files)} uploaded file(s)",
+        member_id=(creds or {}).get("_member_id"),
+    )
     try:
         for pdf in files:
             ingest_file(recorder, pdf, creds or {}, commit=False)
@@ -185,8 +223,9 @@ def run_scan(db_path: Path, pdfs: Iterable[Path], creds: Optional[dict] = None) 
 
 def pending(conn) -> list[dict]:
     rows = conn.execute(
-        """SELECT f.*, r.kind, r.note FROM ingest_files f
+        """SELECT f.*, r.kind, r.note, m.name AS member_name FROM ingest_files f
            JOIN ingest_runs r ON r.id=f.run_id
+           LEFT JOIN members m ON m.id=f.member_id
            WHERE f.status='pending' AND f.document_type='bank_account'
            ORDER BY f.id DESC"""
     ).fetchall()
@@ -223,18 +262,22 @@ def run_reevaluate(db_path: Path, file_ids: list[int], creds: Optional[dict] = N
             where += f" AND id IN ({','.join('?' * len(file_ids))})"
             args = file_ids
         rows = conn.execute(
-            f"SELECT id, path FROM ingest_files {where} ORDER BY id", args
+            f"SELECT id, path, member_id FROM ingest_files {where} ORDER BY id", args
         ).fetchall()
-        sources = [(int(row["id"]), Path(row["path"])) for row in rows if row["path"]]
+        sources = [
+            (int(row["id"]), Path(row["path"]), row["member_id"]) for row in rows if row["path"]
+        ]
     finally:
         conn.close()
 
     recorder = Recorder(db_path, "bank_reevaluate", f"{len(sources)} pending statement(s)")
     refreshed = 0
     try:
-        for source_id, pdf in sources:
+        for source_id, pdf, source_member in sources:
             if not pdf.exists():
                 continue
+            # A reparse must not relabel the statement; carry the original member.
+            recorder.member_id = source_member
             ingest_file(recorder, pdf, creds or {}, commit=False)
             replacement_id = recorder.file_id
             resolved = store.connect(db_path)
@@ -260,25 +303,33 @@ def run_approve(db_path: Path, file_ids: list[int], creds: Optional[dict] = None
     conn = store.connect(db_path)
     try:
         rows = conn.execute(
-            f"""SELECT id, path FROM ingest_files
+            f"""SELECT id, path, member_id FROM ingest_files
                 WHERE status='pending' AND document_type='bank_account'
                 AND id IN ({','.join('?' * len(file_ids))}) ORDER BY id""",
             file_ids,
         ).fetchall()
-        sources = [(int(row["id"]), Path(row["path"])) for row in rows if row["path"]]
+        sources = [
+            (int(row["id"]), Path(row["path"]), row["member_id"]) for row in rows if row["path"]
+        ]
     finally:
         conn.close()
 
+    creds = creds or {}
     recorder = Recorder(db_path, "bank_approve", f"{len(sources)} approved")
     imported = 0
     try:
-        for source_id, pdf in sources:
+        for source_id, pdf, source_member in sources:
+            # The member chosen when the file was uploaded wins: approval can happen
+            # days later, with a different member selected in the UI.
+            member_id = source_member if source_member is not None else creds.get("_member_id")
+            recorder.member_id = member_id
+            file_creds = {**creds, "_member_id": member_id}
             if not pdf.exists():
                 recorder.begin_file(pdf.name)
                 recorder.step("download", "failed", "file no longer on disk — upload it again")
                 recorder.end_file("failed", error="missing file", document_type="bank_account")
                 continue
-            imported += bool(ingest_file(recorder, pdf, creds or {}, commit=True))
+            imported += bool(ingest_file(recorder, pdf, file_creds, commit=True))
             resolved = store.connect(db_path)
             try:
                 resolved.execute(

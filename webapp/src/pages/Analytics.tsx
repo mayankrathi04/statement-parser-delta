@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, type Analytics as A, type Bootstrap, type Filters, type Txn } from '../api'
+import {
+  api, type Analytics as A, type Bootstrap, type CategoryFacet, type Filters, type Txn,
+} from '../api'
 import CardSelect from '../components/CardSelect'
+import CategorySelect from '../components/CategorySelect'
 import { MonthlyBars, RankBars, seriesVar } from '../components/Charts'
+import { reconcileSelection, useCategoryOptions } from '../lib/categories'
 import { money0, money2, monthsBefore } from '../lib/format'
 
 const RANGES: { label: string; months: number }[] = [
@@ -17,17 +21,24 @@ type SortKey = 'txn_date' | 'statement_month' | 'amount' | 'merchant' | 'categor
 type ForeignSortKey = 'original' | 'billed'
 type PageSize = 25 | 50 | 75 | 'all'
 
-function usePagination<T>(rows: T[]) {
+/**
+ * `resetKey` describes what the rows are — the filters, search and sort behind
+ * them. Paging restarts when that changes, but not when a category edit
+ * rewrites rows already on screen, which would otherwise throw the reader back
+ * to page one every time they retag a transaction.
+ */
+function usePagination<T>(rows: T[], resetKey: unknown) {
   const [size, setSize] = useState<PageSize>(25)
   const [page, setPage] = useState(0)
   const pageSize = size === 'all' ? Math.max(rows.length, 1) : size
   const pages = Math.max(1, Math.ceil(rows.length / pageSize))
+  const pageIndex = Math.min(page, pages - 1)
 
-  useEffect(() => { setPage(0) }, [rows, size])
+  useEffect(() => { setPage(0) }, [resetKey, size])
 
   return {
-    rows: size === 'all' ? rows : rows.slice(page * pageSize, (page + 1) * pageSize),
-    page: Math.min(page, pages - 1),
+    rows: size === 'all' ? rows : rows.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize),
+    page: pageIndex,
     pages,
     size,
     setPage,
@@ -72,13 +83,21 @@ function TablePager({
   )
 }
 
-export default function Analytics({ boot }: { boot: Bootstrap | null }) {
+export default function Analytics({ boot, members }: { boot: Bootstrap | null; members: Set<number> }) {
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [facets, setFacets] = useState<CategoryFacet[]>([])
+  const [categories, setCategories] = useState<Set<string>>(new Set())
   const [range, setRange] = useState(0)
   const [from, setFrom] = useState<string | null>(null)
   const [to, setTo] = useState<string | null>(null)
   const [data, setData] = useState<A | null>(null)
   const [txns, setTxns] = useState<Txn[]>([])
+  const [picked, setPicked] = useState<Set<number>>(new Set())
+  const [bulkDraft, setBulkDraft] = useState('')
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const [bulkNote, setBulkNote] = useState<string | null>(null)
+  const [editingCategory, setEditingCategory] = useState<number | null>(null)
+  const [categoryDraft, setCategoryDraft] = useState('')
   const [q, setQ] = useState('')
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'txn_date', dir: -1 })
   const [emiAmountDir, setEmiAmountDir] = useState<1 | -1 | null>(null)
@@ -95,13 +114,18 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
   useEffect(() => {
     if (!boot) return
     setSelected(new Set(boot.cards.map((c) => c.id)))
+    setFacets(boot.categories)
+    setCategories(new Set(boot.categories.map((category) => category.name)))
     setFrom(boot.bounds.min)
     setTo(boot.bounds.max)
   }, [boot])
 
   const filters: Filters = useMemo(
-    () => ({ cards: [...selected], allCards: boot?.cards.length ?? 0, from, to }),
-    [selected, boot, from, to],
+    () => ({
+      cards: [...selected], allCards: boot?.cards.length ?? 0, members: [...members], from, to,
+      categories: [...categories], allCategories: facets.length,
+    }),
+    [selected, boot, members, from, to, categories, facets.length],
   )
 
   useEffect(() => {
@@ -135,6 +159,62 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
     })
   }, [txns, q, sort])
 
+  useEffect(() => {
+    // Selections follow the visible result set, so narrowing the search cannot
+    // leave rows ticked that are no longer on screen.
+    setPicked((current) => {
+      if (!current.size) return current
+      const visible = new Set(rows.map((row) => row.id))
+      const kept = [...current].filter((id) => visible.has(id))
+      return kept.length === current.size ? current : new Set(kept)
+    })
+  }, [rows])
+
+  // Sourced from the bootstrap facets, not from the analytics response: those
+  // are narrowed by the category filter, and the editor must keep offering the
+  // labels the filter is currently hiding.
+  const categoryOptions = useCategoryOptions(facets.map((c) => c.name))
+
+  /** Re-read the filter's options after an edit moved rows between categories:
+   *  a label invented in the editor has to become filterable, and the counts
+   *  beside each one have to stay true. */
+  const refreshFacets = async () => {
+    try {
+      const next = (await api.bootstrap(members)).categories
+      setCategories((current) => reconcileSelection(facets, current, next))
+      setFacets(next)
+    } catch {
+      // Leave the picker as it was: the filter still works on known labels.
+    }
+  }
+
+  const applyCategory = async (ids: number[], category: string | null) => {
+    if (!ids.length) return
+    setBulkBusy(true)
+    setBulkNote(null)
+    try {
+      const { rows: updated } = await api.updateCardTransactionCategories(ids, category)
+      const byId = new Map(updated.map((row) => [row.id, row]))
+      setTxns((current) => current.map((item) => {
+        const patch = byId.get(item.id)
+        return patch ? { ...item, ...patch } : item
+      }))
+      setData(await api.analytics(filters))
+      await refreshFacets()
+      setBulkNote(
+        `${updated.length} transaction${updated.length === 1 ? '' : 's'} `
+        + (category ? `set to ${category}.` : 'restored to their automatic category.'),
+      )
+      setPicked(new Set())
+      setBulkDraft('')
+      setEditingCategory(null)
+    } catch (caught) {
+      setBulkNote(String((caught as Error).message))
+    } finally {
+      setBulkBusy(false)
+    }
+  }
+
   const rewardRows = data?.rewards.by_month ?? []
   const emiRows = useMemo(() => {
     const source = data?.emi.rows ?? []
@@ -149,10 +229,12 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
       foreignSort.key === 'original' ? row.fcy_amount : row.amount
     return [...source].sort((a, b) => (amount(a) - amount(b)) * foreignSort.dir)
   }, [data?.fcy.rows, foreignSort])
-  const rewardPager = usePagination(rewardRows)
-  const emiPager = usePagination(emiRows)
-  const fcyPager = usePagination(fcyRows)
-  const txnPager = usePagination(rows)
+  // Compared by value, so each table keeps its page until its own filters,
+  // search or sort move.
+  const rewardPager = usePagination(rewardRows, JSON.stringify(filters))
+  const emiPager = usePagination(emiRows, JSON.stringify([filters, emiAmountDir]))
+  const fcyPager = usePagination(fcyRows, JSON.stringify([filters, foreignSort]))
+  const txnPager = usePagination(rows, JSON.stringify([filters, q, sort]))
 
   const head = (key: SortKey, label: string, right = false) => (
     <th
@@ -188,6 +270,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
     <>
       <div className="filters">
         <CardSelect cards={boot.cards} selected={selected} colourOf={colourOf} onChange={setSelected} />
+        <CategorySelect categories={facets} selected={categories} onChange={setCategories} />
         {RANGES.map((r) => (
           <span
             key={r.label}
@@ -217,6 +300,14 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
           </div>
         ))}
       </div>
+
+      {members.size > 1 && !!data?.by_member.length && <section className="card">
+        <h2>Member-wise card activity</h2>
+        <p className="hint">Credits and debits remain attributable while this view combines members.</p>
+        <div className="tbl-wrap"><table><thead><tr><th>Member</th><th className="num">Debits</th><th className="num">Credits</th><th className="num">Transactions</th></tr></thead>
+          <tbody>{data.by_member.map((row) => <tr key={row.member_id}><td>{row.member}</td><td className="num">{money2(row.debits)}</td><td className="num cre">{money2(row.credits)}</td><td className="num">{row.n}</td></tr>)}</tbody>
+        </table></div>
+      </section>}
 
       <section className="card">
         <h2>Monthly spend and payments</h2>
@@ -382,10 +473,58 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             onChange={(e) => setQ(e.target.value)}
           />
         </div>
-        <div className="tbl-wrap tbl-scroll">
+
+        <div className="bulk-bar">
+          <label className="bulk-check">
+            <input
+              type="checkbox"
+              checked={!!rows.length && picked.size === rows.length}
+              ref={(node) => {
+                if (node) node.indeterminate = picked.size > 0 && picked.size < rows.length
+              }}
+              disabled={!rows.length}
+              onChange={(event) => setPicked(
+                event.target.checked ? new Set(rows.map((row) => row.id)) : new Set(),
+              )}
+            />
+            <span>
+              {picked.size
+                ? `${picked.size} selected`
+                : `Select all ${rows.length} result${rows.length === 1 ? '' : 's'}`}
+            </span>
+          </label>
+          {picked.size > 0 && (
+            <form className="bulk-actions" onSubmit={(event) => {
+              event.preventDefault()
+              if (bulkDraft.trim()) void applyCategory([...picked], bulkDraft.trim())
+            }}>
+              <input
+                className="input" list="card-category-options" maxLength={80}
+                placeholder="Set category to…" value={bulkDraft}
+                onChange={(event) => setBulkDraft(event.target.value)}
+                aria-label={`Category for ${picked.size} selected transactions`}
+              />
+              <button className="btn primary" disabled={bulkBusy || !bulkDraft.trim()}>
+                {bulkBusy ? 'Applying…' : `Apply to ${picked.size}`}
+              </button>
+              <button type="button" className="btn" disabled={bulkBusy}
+                title="Drop the manual override and use the automatic category again"
+                onClick={() => void applyCategory([...picked], null)}>Automatic</button>
+              <button type="button" className="btn" disabled={bulkBusy}
+                onClick={() => setPicked(new Set())}>Clear</button>
+            </form>
+          )}
+          {bulkNote && <span className="sub">{bulkNote}</span>}
+        </div>
+
+        <div className="tbl-wrap tbl-scroll bank-tbl">
+          <datalist id="card-category-options">
+            {categoryOptions.map((category) => <option key={category} value={category} />)}
+          </datalist>
           <table>
             <thead>
               <tr>
+                <th style={{ width: 30 }} aria-label="Select" />
                 {head('txn_date', 'Date')}
                 {head('statement_month', 'Applied statement')}
                 <th>Description</th>
@@ -397,7 +536,19 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
             </thead>
             <tbody>
               {txnPager.rows.map((r) => (
-                <tr key={r.id}>
+                <tr key={r.id} className={picked.has(r.id) ? 'row-picked' : undefined}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={picked.has(r.id)}
+                      aria-label={`Select ${r.description}`}
+                      onChange={() => setPicked((current) => {
+                        const next = new Set(current)
+                        next.has(r.id) ? next.delete(r.id) : next.add(r.id)
+                        return next
+                      })}
+                    />
+                  </td>
                   <td>{r.txn_date}{r.txn_time ? ` ${r.txn_time}` : ''}</td>
                   <td title={r.statement_period_start && r.statement_period_end
                     ? `${r.statement_period_start} → ${r.statement_period_end}` : undefined}>
@@ -410,7 +561,40 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
                     {r.reward_points ? <> <span className="pill">+{r.reward_points} pts</span></> : null}
                   </td>
                   <td>{r.merchant}</td>
-                  <td>{r.category}</td>
+                  <td>
+                    {editingCategory === r.id ? (
+                      <form className="category-editor" onSubmit={(event) => {
+                        event.preventDefault()
+                        void applyCategory([r.id], categoryDraft)
+                      }}>
+                        <input
+                          autoFocus list="card-category-options" maxLength={80}
+                          value={categoryDraft}
+                          onChange={(event) => setCategoryDraft(event.target.value)}
+                          aria-label={`Category for ${r.description}`}
+                        />
+                        <button className="btn primary" disabled={bulkBusy}>Save</button>
+                        {r.category_is_override && (
+                          <button type="button" className="btn" disabled={bulkBusy}
+                            title={`Restore automatic category: ${r.derived_category}`}
+                            onClick={() => void applyCategory([r.id], null)}>Automatic</button>
+                        )}
+                        <button type="button" className="btn" disabled={bulkBusy}
+                          onClick={() => setEditingCategory(null)}>Cancel</button>
+                      </form>
+                    ) : (
+                      <button
+                        className="category-value"
+                        title={r.category_is_override
+                          ? `Manually set; automatic category is ${r.derived_category}. Click to edit.`
+                          : 'Automatic category. Click to edit.'}
+                        onClick={() => { setEditingCategory(r.id); setCategoryDraft(r.category) }}
+                      >
+                        {r.category}
+                        {r.category_is_override && <span className="category-edited">edited</span>}
+                      </button>
+                    )}
+                  </td>
                   <td><i className="swatch" style={{ background: colourOf(r.card_id) }} /> {r.card}</td>
                   <td className={`num ${r.direction === 'credit' ? 'cre' : ''}`}>
                     {r.direction === 'credit' ? '+' : ''}{money2(r.amount)}
@@ -418,7 +602,7 @@ export default function Analytics({ boot }: { boot: Bootstrap | null }) {
                 </tr>
               ))}
               {!rows.length && (
-                <tr><td colSpan={7} className="empty">Nothing matches these filters.</td></tr>
+                <tr><td colSpan={8} className="empty">Nothing matches these filters.</td></tr>
               )}
             </tbody>
           </table>

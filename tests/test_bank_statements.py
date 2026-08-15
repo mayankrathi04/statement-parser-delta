@@ -2,8 +2,19 @@ import datetime as dt
 from decimal import Decimal
 
 from sparser import bank_pipeline, bank_store, pipeline, store
-from sparser.bank_parser import BankStatement, BankTransaction, _page_transactions
+from sparser.banks import BankStatement, BankTransaction
+from sparser.banks.hdfc import _page_transactions
 from sparser.schema import Check, TxnType
+
+
+def _word(text: str, x0: float, top: float) -> dict:
+    """A pdfplumber word for the hand-built pages below.
+
+    The parser reads both edges of a word — a narration ends where the reference
+    column starts — so a fixture that carried only x0 would exercise a page no
+    PDF can produce. The width is nominal; only the ordering it implies matters.
+    """
+    return {"text": text, "x0": x0, "x1": x0 + 6.0 * len(text), "top": top}
 
 
 def statement(closing: str = "1250.00") -> BankStatement:
@@ -122,13 +133,13 @@ def test_first_transaction_above_page_one_header_position_is_not_skipped():
 
         def extract_words(self, **_kwargs):
             return [
-                {"text": "UPI-TEST", "x0": 60.0, "top": 183.0},
-                {"text": "01/04/2025", "x0": 8.0, "top": 190.0},
-                {"text": "REF001", "x0": 226.0, "top": 190.0},
-                {"text": "01/04/2025", "x0": 320.0, "top": 190.0},
-                {"text": "100.00", "x0": 395.0, "top": 190.0},
-                {"text": "0.00", "x0": 462.0, "top": 190.0},
-                {"text": "900.00", "x0": 536.0, "top": 190.0},
+                _word("UPI-TEST", 60.0, 183.0),
+                _word("01/04/2025", 8.0, 190.0),
+                _word("REF001", 226.0, 190.0),
+                _word("01/04/2025", 320.0, 190.0),
+                _word("100.00", 395.0, 190.0),
+                _word("0.00", 462.0, 190.0),
+                _word("900.00", 536.0, 190.0),
             ]
 
     columns = {
@@ -155,13 +166,13 @@ def test_negative_withdrawal_is_normalized_as_positive_credit():
 
         def extract_words(self, **_kwargs):
             return [
-                {"text": "POS-REVERSAL", "x0": 60.0, "top": 183.0},
-                {"text": "24/07/2023", "x0": 8.0, "top": 190.0},
-                {"text": "REF002", "x0": 226.0, "top": 190.0},
-                {"text": "24/07/2023", "x0": 320.0, "top": 190.0},
-                {"text": "-21.37", "x0": 395.0, "top": 190.0},
-                {"text": "0.00", "x0": 462.0, "top": 190.0},
-                {"text": "1,120.37", "x0": 536.0, "top": 190.0},
+                _word("POS-REVERSAL", 60.0, 183.0),
+                _word("24/07/2023", 8.0, 190.0),
+                _word("REF002", 226.0, 190.0),
+                _word("24/07/2023", 320.0, 190.0),
+                _word("-21.37", 395.0, 190.0),
+                _word("0.00", 462.0, 190.0),
+                _word("1,120.37", 536.0, 190.0),
             ]
 
     columns = {
@@ -265,23 +276,23 @@ def test_current_layout_assigns_predate_narration_to_the_next_transaction():
 
         def extract_words(self, **_kwargs):
             return [
-                {"text": "INFO", "x0": 60.0, "top": 190.0},
-                {"text": "EDGE", "x0": 78.0, "top": 190.0},
-                {"text": "09/03/2026", "x0": 8.0, "top": 190.0},
-                {"text": "DIVREF", "x0": 226.0, "top": 190.0},
-                {"text": "09/03/2026", "x0": 320.0, "top": 190.0},
-                {"text": "0.00", "x0": 395.0, "top": 190.0},
-                {"text": "132.00", "x0": 462.0, "top": 190.0},
-                {"text": "1,132.00", "x0": 536.0, "top": 190.0},
-                {"text": "UPI-MID", "x0": 60.0, "top": 202.0},
-                {"text": "LAND", "x0": 88.0, "top": 202.0},
-                {"text": "09/03/2026", "x0": 8.0, "top": 206.0},
-                {"text": "UPIREF", "x0": 226.0, "top": 206.0},
-                {"text": "09/03/2026", "x0": 320.0, "top": 206.0},
-                {"text": "45.00", "x0": 395.0, "top": 206.0},
-                {"text": "0.00", "x0": 462.0, "top": 206.0},
-                {"text": "1,087.00", "x0": 536.0, "top": 206.0},
-                {"text": "BAKERS@YESBANK-UPI", "x0": 60.0, "top": 210.0},
+                _word("ACME", 60.0, 190.0),
+                _word("CORP", 78.0, 190.0),
+                _word("09/03/2026", 8.0, 190.0),
+                _word("DIVREF", 226.0, 190.0),
+                _word("09/03/2026", 320.0, 190.0),
+                _word("0.00", 395.0, 190.0),
+                _word("132.00", 462.0, 190.0),
+                _word("1,132.00", 536.0, 190.0),
+                _word("UPI-MID", 60.0, 202.0),
+                _word("LAND", 88.0, 202.0),
+                _word("09/03/2026", 8.0, 206.0),
+                _word("UPIREF", 226.0, 206.0),
+                _word("09/03/2026", 320.0, 206.0),
+                _word("45.00", 395.0, 206.0),
+                _word("0.00", 462.0, 206.0),
+                _word("1,087.00", 536.0, 206.0),
+                _word("BAKERS@YESBANK-UPI", 60.0, 210.0),
             ]
 
     columns = {
@@ -307,20 +318,20 @@ def test_legacy_layout_keeps_long_narration_with_the_preceding_date():
 
         def extract_words(self, **_kwargs):
             return [
-                {"text": "02/04/24", "x0": 32.0, "top": 236.0},
-                {"text": "UPI-MERCHANT", "x0": 68.0, "top": 236.0},
-                {"text": "REF1", "x0": 272.0, "top": 236.0},
-                {"text": "02/04/24", "x0": 341.0, "top": 236.0},
-                {"text": "100.00", "x0": 416.0, "top": 236.0},
-                {"text": "900.00", "x0": 559.0, "top": 236.0},
-                {"text": "SECOND", "x0": 68.0, "top": 252.0},
-                {"text": "THIRD", "x0": 68.0, "top": 268.0},
-                {"text": "03/04/24", "x0": 32.0, "top": 285.0},
-                {"text": "UPI-NEXT", "x0": 68.0, "top": 285.0},
-                {"text": "REF2", "x0": 272.0, "top": 285.0},
-                {"text": "03/04/24", "x0": 341.0, "top": 285.0},
-                {"text": "50.00", "x0": 416.0, "top": 285.0},
-                {"text": "850.00", "x0": 559.0, "top": 285.0},
+                _word("02/04/24", 32.0, 236.0),
+                _word("UPI-MERCHANT", 68.0, 236.0),
+                _word("REF1", 272.0, 236.0),
+                _word("02/04/24", 341.0, 236.0),
+                _word("100.00", 416.0, 236.0),
+                _word("900.00", 559.0, 236.0),
+                _word("SECOND", 68.0, 252.0),
+                _word("THIRD", 68.0, 268.0),
+                _word("03/04/24", 32.0, 285.0),
+                _word("UPI-NEXT", 68.0, 285.0),
+                _word("REF2", 272.0, 285.0),
+                _word("03/04/24", 341.0, 285.0),
+                _word("50.00", 416.0, 285.0),
+                _word("850.00", 559.0, 285.0),
             ]
 
     columns = {

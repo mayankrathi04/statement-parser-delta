@@ -1,0 +1,7 @@
+{
+  "name": "statement-parser-server",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "../.venv/bin/python server.py serve --db data/statements.db --port 8770 --no-browser --reload"
+  }
+}

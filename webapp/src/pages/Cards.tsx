@@ -1,8 +1,9 @@
-import { Fragment, useCallback, useEffect, useState } from 'react'
-import type { CardRow } from '../api'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import type { CardRow, Member } from '../api'
 import { api } from '../api'
 import { seriesVar } from '../components/Charts'
 import { money0 } from '../lib/format'
+import { importTarget } from '../lib/members'
 
 function PasswordCell({ card, onSaved }: { card: CardRow; onSaved: () => void }) {
   const [editing, setEditing] = useState(false)
@@ -154,7 +155,13 @@ function MailRules({ card, onSaved }: { card: CardRow; onSaved: () => void }) {
 
 /** The name and date of birth every issuer password convention is built from.
  *  Stored once, encrypted, so no run needs it passed in. */
-function ProfileCard({ onSaved }: { onSaved: () => void }) {
+function ProfileCard({
+  onSaved, members, selected,
+}: {
+  onSaved: () => void
+  members: Member[]
+  selected: Set<number>
+}) {
   const [name, setName] = useState('')
   const [dob, setDob] = useState('')
   const [derives, setDerives] = useState(0)
@@ -162,10 +169,15 @@ function ProfileCard({ onSaved }: { onSaved: () => void }) {
   const [confirmed, setConfirmed] = useState(false)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  const target = useMemo(() => importTarget(members, selected), [members, selected])
+  const [memberId, setMemberId] = useState(target.id)
+  // Narrowing the top-bar picker to one member switches this form to them; with a
+  // wider selection the dropdown below stays in charge.
+  useEffect(() => { if (target.explicit) setMemberId(target.id) }, [target])
 
   const load = useCallback(async () => {
     try {
-      const p = await api.profile()
+      const p = await api.profile(memberId)
       setName(p.full_name)
       setDob(p.dob)
       setDerives(p.derives)
@@ -173,7 +185,7 @@ function ProfileCard({ onSaved }: { onSaved: () => void }) {
     } catch (e) {
       setErr(String((e as Error).message))
     }
-  }, [])
+  }, [memberId])
 
   useEffect(() => { load() }, [load])
 
@@ -182,7 +194,7 @@ function ProfileCard({ onSaved }: { onSaved: () => void }) {
     setErr(null)
     setConfirmed(false)
     try {
-      const r = await api.saveProfile(name.trim(), dob.trim())
+      const r = await api.saveProfile(name.trim(), dob.trim(), memberId)
       setName(r.full_name)
       setDob(r.dob)
       setDerives(r.derives)
@@ -209,6 +221,9 @@ function ProfileCard({ onSaved }: { onSaved: () => void }) {
       </p>
 
       <div className="form-row" style={{ marginTop: 0 }}>
+        <select className="input" value={memberId ?? ''} onChange={(event) => setMemberId(Number(event.target.value))}>
+          {members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}
+        </select>
         <input
           className="input"
           placeholder="Full name (e.g. first and last)"
@@ -254,18 +269,24 @@ function ProfileCard({ onSaved }: { onSaved: () => void }) {
   )
 }
 
-export default function Cards() {
+export default function Cards({
+  roster, members,
+}: {
+  /** Every member, so a card can be reassigned to one not currently selected. */
+  roster: Member[]
+  members: Set<number>
+}) {
   const [cards, setCards] = useState<CardRow[]>([])
   const [open, setOpen] = useState<Record<number, boolean>>({})
   const [err, setErr] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
-      setCards((await api.cards()).cards)
+      setCards((await api.cards(members)).cards)
     } catch (e) {
       setErr(String((e as Error).message))
     }
-  }, [])
+  }, [members])
 
   useEffect(() => { load() }, [load])
 
@@ -278,7 +299,7 @@ export default function Cards() {
     <>
       {err && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{err}</div>}
 
-      <ProfileCard onSaved={load} />
+      <ProfileCard onSaved={load} members={roster} selected={members} />
 
       <section className="card">
         <h2>Cards</h2>
@@ -287,7 +308,13 @@ export default function Cards() {
           masked number, which is why re-importing a month replaces it instead of duplicating.
         </p>
 
-        {!cards.length && <p className="sub">No cards yet — import a statement first.</p>}
+        {!cards.length && (
+          <p className="sub">
+            {members.size && members.size < roster.length
+              ? 'No cards for the selected member. Widen the selector at the top to see the rest.'
+              : 'No cards yet — import a statement first.'}
+          </p>
+        )}
 
         {!!cards.length && (
           <div className="tbl-wrap">
@@ -295,6 +322,7 @@ export default function Cards() {
               <thead>
                 <tr>
                   <th>Card</th>
+                  <th>Member</th>
                   <th>Number</th>
                   <th style={{ textAlign: 'right' }}>Statements</th>
                   <th style={{ textAlign: 'right' }}>Txns</th>
@@ -317,6 +345,9 @@ export default function Cards() {
                         </button>
                         <i className="swatch" style={{ background: colourOf(c.id) }} /> {c.display_name}
                       </td>
+                      <td><select value={c.member_id ?? ''} onChange={async (event) => {
+                        await api.assignCardMember(c.id, Number(event.target.value)); void load()
+                      }}>{roster.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></td>
                       <td><code>{c.masked_number}</code></td>
                       <td className="num">{c.statements}</td>
                       <td className="num">{c.txn_count}</td>
@@ -325,7 +356,7 @@ export default function Cards() {
                     </tr>
                     {open[c.id] && (
                       <tr>
-                        <td colSpan={6} style={{ background: 'var(--surface-2)' }}>
+                        <td colSpan={7} style={{ background: 'var(--surface-2)' }}>
                           <MailRules card={c} onSaved={load} />
                           <div className="tile-l" style={{ marginBottom: 8 }}>
                             Statements already parsed and saved — newest first.

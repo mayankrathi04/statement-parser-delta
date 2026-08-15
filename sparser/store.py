@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+import shutil
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
@@ -188,7 +189,8 @@ CREATE INDEX IF NOT EXISTS ix_bank_txn_account ON bank_transactions(account_id);
 CREATE INDEX IF NOT EXISTS ix_bank_txn_cat ON bank_transactions(category);
 """
 
-DEFAULT_DB = Path("statements.db")
+DEFAULT_DB = Path("data/statements.db")
+LEGACY_DEFAULT_DB = Path("statements.db")
 
 
 def to_paise(value: Optional[Decimal]) -> Optional[int]:
@@ -205,7 +207,9 @@ _MIGRATIONS = {
     "cards": {
         "sender_ids_json": "TEXT DEFAULT '[]'",
         "subject_patterns_json": "TEXT DEFAULT '[]'",
+        "member_id": "INTEGER",
     },
+    "bank_accounts": {"member_id": "INTEGER"},
     "ingest_files": {
         "path": "TEXT",
         "statement_date": "TEXT",
@@ -214,10 +218,21 @@ _MIGRATIONS = {
         "duplicate_of": "INTEGER",
         "document_type": "TEXT DEFAULT 'credit_card'",
         "bank_account_id": "INTEGER",
+        # Which member this file was uploaded/fetched for. Recorded at scan time
+        # so approving weeks later still attributes it to the intended member
+        # rather than whoever happens to be the default.
+        "member_id": "INTEGER",
     },
     "transactions": {
         "spend_effect": "INTEGER NOT NULL DEFAULT 0",
         "payment_effect": "INTEGER NOT NULL DEFAULT 0",
+        # Manual category, kept separate from the derived one so re-applying the
+        # rules can never overwrite a decision the user made by hand.
+        "category_override": "TEXT",
+        # Exactly what the issuer printed, before any mapping. Kept so the
+        # Categories screen can list provider labels, and so re-applying rules can
+        # fall back to the issuer instead of losing the information.
+        "issuer_category": "TEXT",
     },
     "bank_transactions": {
         # Keep user corrections separate from parser-derived enrichment so a
@@ -342,11 +357,70 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 
 def connect(db_path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+    path = Path(db_path)
+    # Keep the default database out of the project root.  Existing installs are
+    # migrated once, including SQLite's WAL sidecars when they are present.
+    if path == DEFAULT_DB and not path.exists() and LEGACY_DEFAULT_DB.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(LEGACY_DEFAULT_DB), str(path))
+        for suffix in ("-wal", "-shm"):
+            legacy_sidecar = Path(f"{LEGACY_DEFAULT_DB}{suffix}")
+            if legacy_sidecar.exists():
+                shutil.move(str(legacy_sidecar), f"{path}{suffix}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     _migrate(conn)
+    # Identity tables live beside the financial tables so one backup remains a
+    # complete, portable portal. Imports are local to avoid module cycles.
+    from . import accounts, categories, portal
+    accounts.ensure_schema(conn)
+    portal.ensure_schema(conn)
+    categories.ensure_schema(conn)
     return conn
+
+
+#: Characters issuers use to hide the middle digits of a card number.
+_MASK_CHARS = "X*•·#"
+
+
+def mask_positions(mask: Optional[str]) -> str:
+    """One character per printed card-number position, ``*`` where hidden.
+
+    Separators are noise — "5394 94** **** 4321" and "539494XXXXXX4321" are the
+    same printed number — so only digits and masking marks survive.
+    """
+    return "".join(
+        ch if ch.isdigit() else "*"
+        for ch in (mask or "").upper()
+        if ch.isdigit() or ch in _MASK_CHARS
+    )
+
+
+def same_card(left: Optional[str], right: Optional[str]) -> bool:
+    """Do two masked numbers denote one card?
+
+    Issuers change *which* digits they print between statement eras: Axis moved
+    from "53346700****8765" to "533467******8765" mid-2021. Comparing the strings
+    files one physical card under two, splitting its history. So the numbers are
+    compared position by position, and only where both actually show a digit.
+
+    Deliberately strict about the last four, which every issuer prints: without
+    that, two masks whose visible windows do not overlap would vacuously agree.
+    """
+    if (left or "") == (right or ""):
+        return bool(left)
+    a, b = mask_positions(left), mask_positions(right)
+    if not a or len(a) != len(b) or a[-4:] != b[-4:] or "*" in a[-4:]:
+        return False
+    return all(x == y for x, y in zip(a, b) if x != "*" and y != "*")
+
+
+def find_card(conn: sqlite3.Connection, masked: str) -> Optional[sqlite3.Row]:
+    """The saved card this masked number belongs to, whatever era printed it."""
+    rows = conn.execute("SELECT * FROM cards").fetchall()
+    return next((row for row in rows if same_card(row["masked_number"], masked)), None)
 
 
 def find_statement(conn: sqlite3.Connection, stmt: Statement) -> Optional[dict]:
@@ -355,12 +429,14 @@ def find_statement(conn: sqlite3.Connection, stmt: Statement) -> Optional[dict]:
     Matched on the same key the importer uses, so the answer shown in the review
     list is precisely what will happen on import: a hit means replace, not add.
     """
-    masked = stmt.account_masked or f"{stmt.issuer}-unknown"
+    card = find_card(conn, stmt.account_masked or f"{stmt.issuer}-unknown")
+    if not card:
+        return None
     row = conn.execute(
         """SELECT s.id, s.source_file, s.imported_at, c.display_name AS card
            FROM statements s JOIN cards c ON c.id = s.card_id
-           WHERE c.masked_number = ? AND s.period_start IS ? AND s.period_end IS ?""",
-        (masked, _d(stmt.period_start), _d(stmt.period_end)),
+           WHERE s.card_id = ? AND s.period_start IS ? AND s.period_end IS ?""",
+        (card["id"], _d(stmt.period_start), _d(stmt.period_end)),
     ).fetchone()
     return dict(row) if row else None
 
@@ -376,22 +452,24 @@ def _card_display(stmt: Statement) -> str:
     return f"{label} ••{last4}" if last4 else label
 
 
-def upsert_card(conn: sqlite3.Connection, stmt: Statement) -> int:
+def upsert_card(conn: sqlite3.Connection, stmt: Statement, member_id: Optional[int] = None) -> int:
     masked = stmt.account_masked or f"{stmt.issuer}-unknown"
-    row = conn.execute("SELECT id FROM cards WHERE masked_number = ?", (masked,)).fetchone()
+    row = find_card(conn, masked)
     if row:
         return row["id"]
     cur = conn.execute(
-        "INSERT INTO cards (issuer, product, masked_number, last4, display_name)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (stmt.issuer, stmt.product, masked, masked[-4:], _card_display(stmt)),
+        "INSERT INTO cards (issuer, product, masked_number, last4, display_name, member_id)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (stmt.issuer, stmt.product, masked, masked[-4:], _card_display(stmt), member_id),
     )
     return int(cur.lastrowid)
 
 
-def import_statement(conn: sqlite3.Connection, stmt: Statement) -> tuple[int, int, bool]:
+def import_statement(
+    conn: sqlite3.Connection, stmt: Statement, member_id: Optional[int] = None
+) -> tuple[int, int, bool]:
     """Insert or replace one statement. Returns (statement_id, rows, replaced)."""
-    card_id = upsert_card(conn, stmt)
+    card_id = upsert_card(conn, stmt, member_id)
     # Keyed on the billing cycle — see _migrate for why not the statement date.
     key = (card_id, _d(stmt.period_start), _d(stmt.period_end))
 
@@ -400,7 +478,20 @@ def import_statement(conn: sqlite3.Connection, stmt: Statement) -> tuple[int, in
         key,
     ).fetchone()
     replaced = existing is not None
+    overrides: dict[tuple, str] = {}
     if replaced:
+        # Re-import replaces the rows, so carry manual categories across on fields
+        # that stay stable when parser or rule changes alter the derived ones.
+        overrides = {
+            (row["txn_date"], row["description"], row["amount"], row["direction"]):
+                row["category_override"]
+            for row in conn.execute(
+                """SELECT txn_date, description, amount, direction, category_override
+                   FROM transactions
+                   WHERE statement_id=? AND category_override IS NOT NULL""",
+                (existing["id"],),
+            ).fetchall()
+        }
         conn.execute("DELETE FROM statements WHERE id = ?", (existing["id"],))
 
     s = stmt.summary
@@ -424,18 +515,24 @@ def import_statement(conn: sqlite3.Connection, stmt: Statement) -> tuple[int, in
     )
     stmt_id = int(cur.lastrowid)
 
+    from . import categories as category_rules
+
+    rules = category_rules.rules_for(
+        conn, category_rules.resolve(conn, member_id), "cards"
+    )
     conn.executemany(
         """INSERT INTO transactions
            (statement_id, card_id, txn_date, txn_time, description, merchant, category,
-            amount, direction, signed, section, is_emi, reward_points,
+            issuer_category, amount, direction, signed, section, is_emi, reward_points,
             fcy_currency, fcy_amount, page, raw)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             (
                 stmt_id, card_id, t.date.isoformat(),
                 t.time.strftime("%H:%M") if t.time else None,
                 t.description, merchant_name(t.description),
-                categorize(t.description, t.category),
+                category_rules.categorize_card(t.description, t.category, rules),
+                t.category,
                 to_paise(t.amount), t.type.value, to_paise(t.signed), t.section,
                 1 if t.is_emi else 0, t.reward_points, t.fcy_currency,
                 to_paise(t.fcy_amount), t.page, t.raw,
@@ -443,11 +540,73 @@ def import_statement(conn: sqlite3.Connection, stmt: Statement) -> tuple[int, in
             for t in stmt.transactions
         ],
     )
+    if overrides:
+        conn.executemany(
+            "UPDATE transactions SET category_override=? WHERE id=?",
+            [
+                (override, row["id"])
+                for row in conn.execute(
+                    "SELECT id, txn_date, description, amount, direction FROM transactions"
+                    " WHERE statement_id=?",
+                    (stmt_id,),
+                ).fetchall()
+                if (override := overrides.get((
+                    row["txn_date"], row["description"], row["amount"], row["direction"],
+                ))) is not None
+            ],
+        )
     # Re-evaluate the complete card history: a conversion or cancellation may
     # arrive in a later statement than the original purchase.
     _refresh_emi_flags(conn, card_id)
     conn.commit()
     return stmt_id, len(stmt.transactions), replaced
+
+
+MAX_CATEGORY_LENGTH = 80
+
+
+def update_transaction_categories(
+    conn: sqlite3.Connection,
+    transaction_ids: Iterable[int],
+    category: Optional[str],
+    card_ids: Iterable[int] = (),
+) -> list[dict]:
+    """Set or clear the manual category on card rows.
+
+    ``card_ids`` restricts the update to cards the caller may see, so a request
+    cannot reach rows outside the signed-in user's members.
+    """
+    ids = sorted({int(value) for value in transaction_ids})
+    if not ids:
+        return []
+    override = " ".join((category or "").split()).strip() or None
+    if override and len(override) > MAX_CATEGORY_LENGTH:
+        raise ValueError(f"category must be at most {MAX_CATEGORY_LENGTH} characters")
+
+    allowed = list(card_ids)
+    scope = f" AND card_id IN ({','.join('?' * len(allowed))})" if allowed else ""
+    rows = conn.execute(
+        f"SELECT id, category FROM transactions WHERE id IN ({','.join('?' * len(ids))}){scope}",
+        [*ids, *allowed],
+    ).fetchall()
+    if not rows:
+        return []
+    found = [int(row["id"]) for row in rows]
+    conn.execute(
+        f"UPDATE transactions SET category_override=? WHERE id IN ({','.join('?' * len(found))})",
+        [override, *found],
+    )
+    conn.commit()
+    return [
+        {
+            "id": int(row["id"]),
+            "category": override or row["category"] or "Other",
+            "derived_category": row["category"] or "Other",
+            "category_override": override,
+            "category_is_override": override is not None,
+        }
+        for row in rows
+    ]
 
 
 def _d(value) -> Optional[str]:
@@ -456,15 +615,20 @@ def _d(value) -> Optional[str]:
 
 # ------------------------------------------------------------------ queries
 
-def cards(conn: sqlite3.Connection) -> list[dict]:
+def cards(conn: sqlite3.Connection, member_ids: Iterable[int] = ()) -> list[dict]:
+    ids = list(member_ids)
+    where = f"WHERE c.member_id IN ({','.join('?' * len(ids))})" if ids else ""
     rows = conn.execute(
         """SELECT c.id, c.issuer, c.product, c.masked_number, c.last4, c.display_name,
-                  c.sender_ids_json, c.subject_patterns_json,
+                  c.sender_ids_json, c.subject_patterns_json, c.member_id,
+                  m.name AS member_name,
                   COUNT(t.id) AS txn_count,
                   MIN(t.txn_date) AS first_txn,
                   MAX(t.txn_date) AS last_txn
-           FROM cards c LEFT JOIN transactions t ON t.card_id = c.id
-           GROUP BY c.id ORDER BY c.display_name"""
+           FROM cards c LEFT JOIN members m ON m.id=c.member_id
+           LEFT JOIN transactions t ON t.card_id = c.id
+           """ + where + " GROUP BY c.id ORDER BY c.display_name",
+        ids,
     ).fetchall()
     out = []
     for row in rows:
@@ -491,9 +655,23 @@ def date_bounds(conn: sqlite3.Connection) -> dict:
     return {"min": row["a"], "max": row["b"]}
 
 
+#: The one category a row counts under: the manual override when there is one,
+#: else what the parser derived, else 'Other'. Kept identical to what the
+#: listing and grouping queries select, so filtering by a label always matches
+#: the label the user is looking at.
+CATEGORY_SQL = "COALESCE(NULLIF(TRIM(t.category_override),''), t.category, 'Other')"
+
+
 def _filters(
-    card_ids, date_from, date_to, extra_sql="", params=None, date_column="t.txn_date"
+    card_ids, date_from, date_to, extra_sql="", params=None, date_column="t.txn_date",
+    categories=None,
 ):
+    """Build the shared WHERE clause.
+
+    ``categories`` of ``None`` means the caller is not filtering by category at
+    all. An empty sequence is different, and deliberate: the user unticked every
+    category, so nothing should match.
+    """
     where, args = ["1=1"], list(params or [])
     if card_ids:
         where.append(f"t.card_id IN ({','.join('?' * len(card_ids))})")
@@ -504,9 +682,31 @@ def _filters(
     if date_to:
         where.append(f"{date_column} <= ?")
         args.append(date_to)
+    if categories is not None:
+        names = list(categories)
+        where.append(
+            f"{CATEGORY_SQL} IN ({','.join('?' * len(names))})" if names else "0=1"
+        )
+        args += names
     if extra_sql:
         where.append(extra_sql)
     return " AND ".join(where), args
+
+
+def category_facets(conn: sqlite3.Connection, card_ids: Iterable[int] = ()) -> list[dict]:
+    """Every category present on the given cards, with its row count.
+
+    The category filter needs a list that does not shrink as it is applied, so
+    this is scoped by card only — never by the filter it feeds.
+    """
+    clause, args = _filters(list(card_ids), None, None)
+    rows = conn.execute(
+        f"""SELECT {CATEGORY_SQL} AS name, COUNT(*) AS n
+            FROM transactions t WHERE {clause}
+            GROUP BY name ORDER BY name COLLATE NOCASE""",
+        args,
+    ).fetchall()
+    return [{"name": row["name"], "n": row["n"]} for row in rows]
 
 
 def transactions(
@@ -515,16 +715,21 @@ def transactions(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 5000,
+    categories: Optional[Iterable[str]] = None,
 ) -> list[dict]:
-    clause, args = _filters(list(card_ids), date_from, date_to)
+    clause, args = _filters(list(card_ids), date_from, date_to, categories=categories)
     rows = conn.execute(
-        f"""SELECT t.id, t.txn_date, t.txn_time, t.description, t.merchant, t.category,
+        f"""SELECT t.id, t.txn_date, t.txn_time, t.description, t.merchant,
+                   t.category AS derived_category, t.category_override,
+                   COALESCE(NULLIF(TRIM(t.category_override),''), t.category, 'Other') AS category,
                    t.amount, t.direction, t.signed, t.is_emi, t.reward_points,
                    t.fcy_currency, t.fcy_amount, c.display_name AS card, t.card_id,
+                   c.member_id, m.name AS member_name,
                    s.statement_date, s.period_start AS statement_period_start,
                    s.period_end AS statement_period_end,
                    substr(COALESCE(s.period_end, s.statement_date),1,7) AS statement_month
             FROM transactions t JOIN cards c ON c.id = t.card_id
+            LEFT JOIN members m ON m.id=c.member_id
             JOIN statements s ON s.id = t.statement_id
             WHERE {clause}
             ORDER BY t.txn_date DESC, t.id DESC LIMIT ?""",
@@ -537,6 +742,8 @@ def transactions(
         d["signed"] = to_rupees(d["signed"])
         d["fcy_amount"] = to_rupees(d["fcy_amount"]) if d["fcy_amount"] else None
         d["is_emi"] = bool(d["is_emi"])
+        d["derived_category"] = d["derived_category"] or "Other"
+        d["category_is_override"] = d["category_override"] is not None
         out.append(d)
     return out
 
@@ -546,22 +753,24 @@ def analytics(
     card_ids: Iterable[int] = (),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    categories: Optional[Iterable[str]] = None,
 ) -> dict[str, Any]:
     """Every aggregate the dashboard needs, in exact integer paise."""
     ids = list(card_ids)
-    clause, args = _filters(ids, date_from, date_to)
+    names = None if categories is None else list(categories)
+    clause, args = _filters(ids, date_from, date_to, categories=names)
     purchase_clause, purchase_args = _filters(
-        ids, date_from, date_to, extra_sql="t.spend_effect > 0"
+        ids, date_from, date_to, extra_sql="t.spend_effect > 0", categories=names
     )
     refund_clause, refund_args = _filters(
         ids, date_from, date_to, extra_sql="t.spend_effect < 0",
-        date_column="COALESCE(s.period_end,t.txn_date)",
+        date_column="COALESCE(s.period_end,t.txn_date)", categories=names,
     )
     spend_clause = f"(({purchase_clause}) OR ({refund_clause}))"
     spend_args = purchase_args + refund_args
     payment_clause, payment_args = _filters(
         ids, date_from, date_to, extra_sql="t.payment_effect != 0",
-        date_column="COALESCE(s.period_end,t.txn_date)",
+        date_column="COALESCE(s.period_end,t.txn_date)", categories=names,
     )
 
     spend_totals = conn.execute(
@@ -606,7 +815,8 @@ def analytics(
     ).fetchall()
 
     by_category = conn.execute(
-        f"""SELECT category, SUM(spend_effect) AS total, COUNT(*) AS n
+        f"""SELECT COALESCE(NULLIF(TRIM(t.category_override),''), t.category, 'Other') AS category,
+                   SUM(spend_effect) AS total, COUNT(*) AS n
             FROM transactions t JOIN statements s ON s.id=t.statement_id
             WHERE {spend_clause}
             GROUP BY category ORDER BY total DESC""",
@@ -621,6 +831,17 @@ def analytics(
             WHERE {spend_clause}
             GROUP BY c.id ORDER BY total DESC""",
         spend_args,
+    ).fetchall()
+
+    by_member = conn.execute(
+        f"""SELECT m.id AS member_id, COALESCE(m.name,'Unassigned') AS member,
+                   SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) AS debits,
+                   SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END) AS credits,
+                   COUNT(*) AS n
+            FROM transactions t JOIN cards c ON c.id=t.card_id
+            LEFT JOIN members m ON m.id=c.member_id
+            WHERE {clause} GROUP BY c.member_id ORDER BY debits DESC""",
+        args,
     ).fetchall()
 
     merchants = conn.execute(
@@ -719,6 +940,14 @@ def analytics(
         "by_card": [
             {"card_id": r["card_id"], "label": r["card"], "value": to_rupees(r["total"]), "n": r["n"]}
             for r in by_card
+        ],
+        "by_member": [
+            {
+                "member_id": r["member_id"], "member": r["member"],
+                "debits": to_rupees(r["debits"]), "credits": to_rupees(r["credits"]),
+                "n": r["n"],
+            }
+            for r in by_member
         ],
         "top_merchants": [
             {"label": r["merchant"], "value": to_rupees(r["total"]), "n": r["n"]} for r in merchants

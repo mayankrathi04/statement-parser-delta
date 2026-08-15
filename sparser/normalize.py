@@ -58,13 +58,16 @@ def is_decimal_amount(token: str) -> bool:
     return bool(_DECIMAL_RE.search(token))
 
 
+def _without_currency(text: str) -> str:
+    t = text.replace(RUPEE, " ").replace("₨", " ").replace("`", " ")
+    return re.sub(r"\b(?:Rs\.?|INR)\b", " ", t, flags=re.I)
+
+
 def parse_amount(text: str) -> Optional[Decimal]:
     """Return magnitude as Decimal. Sign/direction is decided by the caller."""
     if not text:
         return None
-    t = text.replace(RUPEE, " ").replace("₨", " ").replace("`", " ")
-    t = re.sub(r"\b(?:Rs\.?|INR)\b", " ", t, flags=re.I)
-    m = _NUM_RE.search(t)
+    m = _NUM_RE.search(_without_currency(text))
     if not m:
         return None
     try:
@@ -73,17 +76,33 @@ def parse_amount(text: str) -> Optional[Decimal]:
         return None
 
 
+#: A minus immediately before the figure, allowing the hyphen, the true minus
+#: sign and the en dash issuers variously emit.
+_NEGATIVE_PREFIX = re.compile(r"[-−–]\s*$")
+
+
 def parse_signed_amount(text: str) -> Optional[Decimal]:
     """Balance fields carry a direction marker; magnitude alone loses it.
 
     A card can sit in credit after an overpayment, and the issuer prints that as
-    "6,627.00 CR". Treated as a positive due, every downstream reconciliation is
-    off by twice the balance, so the sign is captured here.
+    "6,627.00 CR" — or, on HDFC statements from 2023 on, as a plain "-7,253.23".
+    Treated as a positive due, every downstream reconciliation is off by twice
+    the balance, so the sign is captured here.
+
+    Deliberately narrower than ``is_credit_marker``: a leading minus counts only
+    for the balance fields that ask for a signed amount, never for transaction
+    rows, whose direction comes from the issuer's own Dr/Cr column.
     """
     amount = parse_amount(text)
     if amount is None:
         return None
-    return -amount if is_credit_marker(text) else amount
+    if is_credit_marker(text):
+        return -amount
+    stripped = _without_currency(text)
+    m = _NUM_RE.search(stripped)
+    if m and _NEGATIVE_PREFIX.search(stripped[: m.start()]):
+        return -amount
+    return amount
 
 
 def is_credit_marker(text: str) -> bool:

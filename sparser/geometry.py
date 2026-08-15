@@ -121,10 +121,36 @@ def amounts_row_below(
             continue
         if not (0 < ln.top - lab_line.top <= dy):
             continue
-        values = [t for t, _ in merged_tokens(ln) if predicate(t)]
+        values = _marked_values(merged_tokens(ln), predicate)
         if len(values) >= min_values:
             return values[index] if -len(values) <= index < len(values) else None
     return None
+
+
+#: A direction marker standing on its own, e.g. the "Cr" in "1.00 Cr".
+_LONE_MARKER = re.compile(r"^(?:Cr|Dr)\.?$", re.I)
+_TRAILING_MARKER = re.compile(r"(?:Cr|Dr)\.?$", re.I)
+
+
+def _marked_values(tokens: list[tuple[str, float]], predicate) -> list[str]:
+    """Values from a summary row, each carrying its own Dr/Cr marker.
+
+    Older Axis statements space the marker far enough from the figure that
+    ``merged_tokens`` keeps them apart ("553.00", "Dr"), so the direction was
+    dropped and a credit closing balance read as a positive amount due — every
+    reconciliation then came out wrong by twice the balance. The marker is
+    re-attached to the figure it follows; layouts that already kern the two
+    together are untouched.
+    """
+    values: list[str] = []
+    for i, (token, _) in enumerate(tokens):
+        if not predicate(token):
+            continue
+        nxt = tokens[i + 1][0].strip() if i + 1 < len(tokens) else ""
+        if _LONE_MARKER.match(nxt) and not _TRAILING_MARKER.search(token):
+            token = f"{token} {nxt}"
+        values.append(token)
+    return values
 
 
 def value_below(

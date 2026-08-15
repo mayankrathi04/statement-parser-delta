@@ -38,7 +38,9 @@ def _now() -> str:
 class Recorder:
     """Writes run/file/step rows as the pipeline advances."""
 
-    def __init__(self, db_path: Path, kind: str, note: str = ""):
+    def __init__(
+        self, db_path: Path, kind: str, note: str = "", member_id: Optional[int] = None
+    ):
         self.db_path = Path(db_path)
         self.conn = store.connect(self.db_path)
         cur = self.conn.execute(
@@ -48,6 +50,9 @@ class Recorder:
         self.run_id = int(cur.lastrowid)
         self.conn.commit()
         self.file_id: Optional[int] = None
+        # Stamped onto every file row. Callers that mix members in one run (a mail
+        # sweep across mailboxes, an approval of a batch) reassign this per file.
+        self.member_id = member_id
         self._seq = 0
         self._t0 = 0.0
         log.info("run #%s started: %s (%s)", self.run_id, kind, note or "no note")
@@ -55,8 +60,9 @@ class Recorder:
     # ---------------------------------------------------------- file scope
     def begin_file(self, filename: str) -> int:
         cur = self.conn.execute(
-            "INSERT INTO ingest_files (run_id, filename, status, started_at) VALUES (?,?,?,?)",
-            (self.run_id, filename, "running", _now()),
+            "INSERT INTO ingest_files (run_id, filename, status, started_at, member_id)"
+            " VALUES (?,?,?,?,?)",
+            (self.run_id, filename, "running", _now(), self.member_id),
         )
         self.file_id = int(cur.lastrowid)
         self._seq = 0
@@ -120,7 +126,7 @@ def ingest_file(
     force: bool,
     downloaded: bool = False,
     commit: bool = True,
-    allowed_card_masks: Optional[set[str]] = None,
+    card_filter: Optional["CardFilter"] = None,
 ) -> bool:
     """Run one PDF through every stage, recording each.
 
@@ -217,19 +223,21 @@ def ingest_file(
                  f"{len(stmt.transactions)} transactions, period "
                  f"{stmt.period_start} → {stmt.period_end}", parse_ms)
 
-        if allowed_card_masks is not None and _mask_key(stmt.account_masked) not in allowed_card_masks:
-            detail = f"{stmt.account_masked or 'unknown card'} was not selected for this scan"
-            rec.step("validate", "skipped", detail)
-            rec.step("store", "skipped", detail)
-            rec.end_file(
-                "skipped", issuer=stmt.issuer, product=stmt.product,
-                card=f"{stmt.issuer} {stmt.product or ''}".strip(),
-                template_id=stmt.template_id, encrypted=int(encrypted),
-                txn_count=len(stmt.transactions), confidence=stmt.confidence,
-                path=str(pdf), statement_date=str(stmt.statement_date or ""),
-                period_start=str(stmt.period_start or ""), period_end=str(stmt.period_end or ""),
-            )
-            return False
+        if card_filter is not None:
+            keep, why = card_filter.verdict(stmt.account_masked)
+            if not keep:
+                rec.step("validate", "skipped", why)
+                rec.step("store", "skipped", why)
+                rec.end_file(
+                    "skipped", issuer=stmt.issuer, product=stmt.product,
+                    card=f"{stmt.issuer} {stmt.product or ''}".strip(),
+                    template_id=stmt.template_id, encrypted=int(encrypted),
+                    txn_count=len(stmt.transactions), confidence=stmt.confidence,
+                    path=str(pdf), statement_date=str(stmt.statement_date or ""),
+                    period_start=str(stmt.period_start or ""), period_end=str(stmt.period_end or ""),
+                    error=why,
+                )
+                return False
 
         # --- validate ------------------------------------------------------
         errs = [c for c in stmt.checks if not c.passed and c.severity == "error"]
@@ -270,14 +278,30 @@ def ingest_file(
 
         # --- store ---------------------------------------------------------
         rec.timed()
+        requested_member = creds.get("_member_id")
         conn = store.connect(rec.db_path)
         try:
-            _, rows, replaced = store.import_statement(conn, stmt)
+            _, rows, replaced = store.import_statement(conn, stmt, requested_member)
+            owner = conn.execute(
+                """SELECT c.member_id, m.name FROM cards c
+                   LEFT JOIN members m ON m.id = c.member_id
+                   WHERE c.masked_number = ?""",
+                (stmt.account_masked,),
+            ).fetchone()
         finally:
             conn.close()
         rec.step("store", "ok",
                  f"{'replaced existing' if replaced else 'inserted'} statement, {rows} rows",
                  rec.elapsed_ms)
+        # A card keeps its owner across re-imports, so a statement for a card someone
+        # else already owns does not move it. Say so rather than reporting a plain
+        # success while the data lands under another member.
+        if owner and requested_member and owner["member_id"] not in (None, requested_member):
+            rec.step(
+                "attribute", "warning",
+                f"this card already belongs to {owner['name']}, so the statement was filed "
+                f"under them. Change the owner on the Cards tab if that is wrong.",
+            )
 
         # The card is only known after parsing, so a working password is recorded
         # here — next month this file opens on the first try instead of guessing.
@@ -310,7 +334,7 @@ def ingest_file(
 
 def run_import(db_path: Path, pdfs: Iterable[Path], creds: dict, force: bool = False) -> int:
     pdfs = list(pdfs)
-    rec = Recorder(db_path, "import", f"{len(pdfs)} file(s)")
+    rec = Recorder(db_path, "import", f"{len(pdfs)} file(s)", member_id=creds.get("_member_id"))
     ok = 0
     try:
         for pdf in pdfs:
@@ -341,8 +365,36 @@ def month_range_window(month_from: str, month_to: str) -> tuple[dt.date, dt.date
     return since, before
 
 
-def _mask_key(mask: Optional[str]) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", mask or "").upper()
+class CardFilter:
+    """Which parsed statements a scan is allowed to keep.
+
+    A scan filters on the card the *parser* found, not on the filename, so the
+    decision can only be made after extraction. Cards that are not saved yet are
+    tracked separately from cards that are saved but unticked: the first is a
+    statement the user has never seen and may well want, the second is one they
+    deliberately excluded.
+    """
+
+    def __init__(self, allowed: Iterable[str], known: Iterable[str], include_unrecognized: bool):
+        self.allowed = set(allowed)
+        self.known = set(known)
+        self.include_unrecognized = include_unrecognized
+
+    def verdict(self, mask: Optional[str]) -> tuple[bool, str]:
+        """(keep?, why) for a statement parsed from ``mask``."""
+        shown = mask or "an unreadable card number"
+        # Matched the way the importer matches, so a card whose mask changed
+        # format between statement eras is still recognised as itself.
+        if any(store.same_card(saved, mask) for saved in self.allowed):
+            return True, f"{shown} is selected for this scan"
+        if any(store.same_card(saved, mask) for saved in self.known):
+            return False, f"{shown} is a saved card that was not ticked for this scan"
+        if self.include_unrecognized:
+            return True, f"{shown} matches no saved card — kept as an unrecognized card"
+        return False, (
+            f"{shown} matches no saved card. Tick “Unrecognized cards” in the card "
+            f"filter to scan statements for cards you have not imported yet."
+        )
 
 
 def _scan_card_rule_groups(
@@ -350,35 +402,35 @@ def _scan_card_rule_groups(
     card_ids: Optional[list[int]],
     default_senders: Iterable[str],
     default_subjects: Iterable[str],
-) -> tuple[Optional[set[str]], list[tuple[set[str], set[str]]]]:
-    """Resolve strict and fallback sender/subject unions for selected cards.
+    include_unrecognized: bool = False,
+) -> tuple[Optional[CardFilter], list[tuple[set[str], set[str]]]]:
+    """Resolve the card filter and the sender/subject unions for selected cards.
 
     An empty ``card_ids`` list means every saved card.  Fully configured cards
     share one strict query. Cards missing either field share a separate fallback
     query, so their defaults cannot broaden the strict query.
     """
-    params: list[int] = []
-    where = ""
-    if card_ids:
-        where = f" WHERE id IN ({','.join('?' for _ in card_ids)})"
-        params = card_ids
-
     rows = conn.execute(
-        "SELECT masked_number, sender_ids_json, subject_patterns_json FROM cards" + where,
-        params,
+        "SELECT id, masked_number, sender_ids_json, subject_patterns_json FROM cards"
     ).fetchall()
-    allowed_masks = (
-        {_mask_key(row["masked_number"]) for row in rows}
-        if card_ids
-        else None
-    )
+    wanted = set(card_ids or [])
+    chosen = [row for row in rows if not wanted or row["id"] in wanted]
+
+    card_filter = None
+    if card_ids or include_unrecognized:
+        card_filter = CardFilter(
+            allowed={row["masked_number"] for row in chosen},
+            known={row["masked_number"] for row in rows},
+            include_unrecognized=include_unrecognized,
+        )
+
     default_sender_set = set(default_senders)
     default_subject_set = set(default_subjects)
     strict_senders: set[str] = set()
     strict_subjects: set[str] = set()
     fallback_senders: set[str] = set()
     fallback_subjects: set[str] = set()
-    for row in rows:
+    for row in chosen:
         card_senders = set(json.loads(row["sender_ids_json"] or "[]"))
         card_subjects = set(json.loads(row["subject_patterns_json"] or "[]"))
         if card_senders and card_subjects:
@@ -393,9 +445,15 @@ def _scan_card_rule_groups(
         groups.append((strict_senders, strict_subjects))
     if fallback_senders and fallback_subjects:
         groups.append((fallback_senders, fallback_subjects))
+    # A card nobody has imported has no saved mail rules to search by, so asking
+    # for unrecognized cards has to widen the mailbox query to the issuer
+    # defaults; without this the statement is never downloaded to be judged.
+    default_group = (default_sender_set, default_subject_set)
+    if include_unrecognized and default_group not in groups:
+        groups.append(default_group)
     if not groups:
-        groups.append((default_sender_set, default_subject_set))
-    return allowed_masks, groups
+        groups.append(default_group)
+    return card_filter, groups
 
 
 def run_scan(
@@ -408,6 +466,7 @@ def run_scan(
     month_to: Optional[str] = None,
     card_ids: Optional[list[int]] = None,
     connection_ids: Optional[list[int]] = None,
+    include_unrecognized_cards: bool = False,
 ) -> int:
     """Download and parse, but store nothing — builds the review list."""
     from . import mailbox
@@ -416,7 +475,7 @@ def run_scan(
         label = f"months {month_from} → {month_to}"
     else:
         label = f"month {month}" if month else f"last {months} month(s)"
-    rec = Recorder(db_path, "scan", label)
+    rec = Recorder(db_path, "scan", label, member_id=creds.get("_member_id"))
     try:
         conn = store.connect(db_path)
         try:
@@ -429,8 +488,9 @@ def run_scan(
                     ).fetchall()
                 }
                 accts = [acct for acct in accts if acct.address in selected_addresses]
-            allowed_masks, scan_rule_groups = _scan_card_rule_groups(
-                conn, card_ids, mailbox.STATEMENT_SENDERS, mailbox.SUBJECT_SEARCHES
+            card_filter, scan_rule_groups = _scan_card_rule_groups(
+                conn, card_ids, mailbox.STATEMENT_SENDERS, mailbox.SUBJECT_SEARCHES,
+                include_unrecognized_cards,
             )
         finally:
             conn.close()
@@ -449,6 +509,9 @@ def run_scan(
             since, before = dt.date.today() - dt.timedelta(days=31 * months), None
 
         found: list[Path] = []
+        # A sweep spans several mailboxes, each owned by a different member, so
+        # attribution is per file rather than per run.
+        member_of: dict[Path, Optional[int]] = {}
         from . import accounts as acct_store
 
         for acct in accts:
@@ -463,6 +526,8 @@ def run_scan(
                         subject_searches=scan_subjects,
                     )
                 found += account_found
+                for path in account_found:
+                    member_of.setdefault(path, acct.member_id)
                 acct_store.mark(conn, acct.address, "connected",
                                 f"{len(set(account_found))} attachment(s) for {label}", synced=True)
             except Exception as exc:
@@ -475,9 +540,11 @@ def run_scan(
 
         found = list(dict.fromkeys(found))
         for pdf in found:
+            owner = member_of.get(pdf)
+            rec.member_id = owner if owner is not None else creds.get("_member_id")
             ingest_file(
                 rec, pdf, creds, force=False, downloaded=True, commit=False,
-                allowed_card_masks=allowed_masks,
+                card_filter=card_filter,
             )
         pending_count = rec.conn.execute(
             "SELECT COUNT(*) FROM ingest_files WHERE run_id = ? AND status = 'pending'",
@@ -496,7 +563,9 @@ def run_scan(
 def run_scan_local(db_path: Path, pdfs: Iterable[Path], creds: dict) -> int:
     """Same review flow for PDFs already on disk."""
     pdfs = list(pdfs)
-    rec = Recorder(db_path, "scan", f"{len(pdfs)} local file(s)")
+    rec = Recorder(
+        db_path, "scan", f"{len(pdfs)} local file(s)", member_id=creds.get("_member_id")
+    )
     try:
         for pdf in pdfs:
             ingest_file(rec, Path(pdf), creds, force=False, commit=False)
@@ -521,19 +590,21 @@ def run_reevaluate(db_path: Path, file_ids: list[int], creds: dict) -> int:
             where += f" AND id IN ({','.join('?' * len(file_ids))})"
             args = file_ids
         rows = conn.execute(
-            f"SELECT id, path FROM ingest_files {where} ORDER BY id", args
+            f"SELECT id, path, member_id FROM ingest_files {where} ORDER BY id", args
         ).fetchall()
-        sources = [(int(r["id"]), Path(r["path"])) for r in rows if r["path"]]
+        sources = [(int(r["id"]), Path(r["path"]), r["member_id"]) for r in rows if r["path"]]
     finally:
         conn.close()
 
     rec = Recorder(db_path, "reevaluate", f"{len(sources)} pending statement(s)")
     refreshed = 0
     try:
-        for source_id, pdf in sources:
+        for source_id, pdf, source_member in sources:
             if not pdf.exists():
                 log.warning("pending file #%s no longer exists: %s", source_id, pdf)
                 continue
+            # A reparse must not relabel the statement; carry the original member.
+            rec.member_id = source_member
             ingest_file(rec, pdf, creds, force=False, commit=False)
             replacement_id = rec.file_id
             c2 = store.connect(db_path)
@@ -561,25 +632,30 @@ def run_approve(db_path: Path, file_ids: list[int], creds: dict, force: bool = F
     conn = store.connect(db_path)
     try:
         rows = conn.execute(
-            f"SELECT id, path, filename FROM ingest_files WHERE "
+            f"SELECT id, path, filename, member_id FROM ingest_files WHERE "
             f"COALESCE(document_type,'credit_card') != 'bank_account' AND id IN "
             f"({','.join('?' * len(file_ids))})",
             file_ids,
         ).fetchall()
-        paths = [(r["id"], Path(r["path"])) for r in rows if r["path"]]
+        paths = [(r["id"], Path(r["path"]), r["member_id"]) for r in rows if r["path"]]
     finally:
         conn.close()
 
     rec = Recorder(db_path, "import", f"{len(paths)} approved")
     ok = 0
     try:
-        for src_id, pdf in paths:
+        for src_id, pdf, src_member in paths:
+            # The member recorded when the file was scanned wins: approval can
+            # happen days later, with a different member selected in the UI.
+            member_id = src_member if src_member is not None else creds.get("_member_id")
+            rec.member_id = member_id
+            file_creds = {**creds, "_member_id": member_id}
             if not pdf.exists():
                 rec.begin_file(pdf.name)
                 rec.step("download", "failed", "file no longer on disk — re-scan")
                 rec.end_file("failed", error="missing file")
                 continue
-            ok += bool(ingest_file(rec, pdf, creds, force=force))
+            ok += bool(ingest_file(rec, pdf, file_creds, force=force))
             # The reviewed row is now resolved, so it drops out of the pending list.
             c2 = store.connect(db_path)
             try:
@@ -597,7 +673,7 @@ def run_fetch(db_path: Path, dest: Path, creds: dict, months: int = 1, force: bo
     """Download from every configured mailbox, then ingest what arrived."""
     from . import mailbox
 
-    rec = Recorder(db_path, "fetch", f"last {months} month(s)")
+    rec = Recorder(db_path, "fetch", f"last {months} month(s)", member_id=creds.get("_member_id"))
     try:
         from . import accounts as acct_store
 
@@ -617,12 +693,15 @@ def run_fetch(db_path: Path, dest: Path, creds: dict, months: int = 1, force: bo
 
         # Fetch per account so one bad mailbox cannot hide the others' results.
         new: list[Path] = []
+        member_of: dict[Path, Optional[int]] = {}
         since = dt.date.today() - dt.timedelta(days=31 * months)
         for acct in accounts:
             conn = store.connect(db_path)
             try:
                 got = mailbox.fetch_account(acct, Path(dest), since=since, verbose=False)
                 new += got
+                for path in got:
+                    member_of.setdefault(path, acct.member_id)
                 acct_store.mark(conn, acct.address, "connected",
                                 f"{len(got)} new attachment(s)", synced=True)
             except Exception as exc:
@@ -638,7 +717,12 @@ def run_fetch(db_path: Path, dest: Path, creds: dict, months: int = 1, force: bo
 
         ok = 0
         for pdf in new:
-            ok += bool(ingest_file(rec, pdf, creds, force=force, downloaded=True))
+            owner = member_of.get(pdf)
+            member_id = owner if owner is not None else creds.get("_member_id")
+            rec.member_id = member_id
+            ok += bool(ingest_file(
+                rec, pdf, {**creds, "_member_id": member_id}, force=force, downloaded=True,
+            ))
         rec.finish("done", f"{ok}/{len(new)} imported")
     except Exception as exc:
         rec.finish("failed", str(exc))
@@ -650,8 +734,9 @@ def run_fetch(db_path: Path, dest: Path, creds: dict, months: int = 1, force: bo
 def pending(conn) -> list[dict]:
     """Scanned statements still awaiting a decision, newest run first."""
     rows = conn.execute(
-        """SELECT f.*, r.kind, r.note FROM ingest_files f
+        """SELECT f.*, r.kind, r.note, m.name AS member_name FROM ingest_files f
            JOIN ingest_runs r ON r.id = f.run_id
+           LEFT JOIN members m ON m.id = f.member_id
            WHERE f.status = 'pending'
              AND COALESCE(f.document_type,'credit_card') != 'bank_account'
            ORDER BY f.id DESC"""

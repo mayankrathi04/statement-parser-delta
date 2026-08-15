@@ -2,7 +2,7 @@ import datetime as dt
 from decimal import Decimal
 
 from sparser import bank_store, mcp_server, store
-from sparser.bank_parser import BankStatement, BankTransaction
+from sparser.banks import BankStatement, BankTransaction
 from sparser.schema import Check, DocType, Statement, Summary, Transaction, TxnType
 
 
@@ -48,6 +48,39 @@ def test_read_only_mcp_analytics(tmp_path, monkeypatch):
     assert mcp_server.special_ledger("emi")["transactions"] == 0
     assert len(mcp_server.find_recurring_merchants(minimum_months=2)["merchants"]) == 1
     assert mcp_server.statement_health()["fully_reconciled"] == 3
+
+    # Statement-header figures, which no transaction tool can reach.
+    ledger = mcp_server.card_statement_ledger()
+    assert ledger["cycles"] == 3
+    assert [row["total_dues"] for row in ledger["statements"]] == [100.0, 120.0, 5000.0]
+    # No credit limit was parsed, so utilisation is unknown rather than 0%.
+    assert ledger["peak_utilisation_percent"] is None
+    assert ledger["cycles_missing_credit_limit"] == 3
+
+    schema = mcp_server.statements_schema()
+    assert schema["row_counts"]["card_transactions"] == 3
+    assert "card_secrets" not in schema["tables"]
+
+    grouped = mcp_server.statements_query(
+        "SELECT month, merchant, sum(spend_effect_paise)/100.0 AS spend "
+        "FROM card_transactions GROUP BY month, merchant ORDER BY month"
+    )
+    assert grouped["rows"][0] == {
+        "month": "2026-01", "merchant": "RECURRING SHOP", "spend": 100.0
+    }
+
+    # The secret tables are not merely blocked, they were never copied.
+    for bad, message in (
+        ("SELECT * FROM card_secrets", "no such table"),
+        ("DELETE FROM card_transactions", "only a single SELECT"),
+        ("SELECT 1; DROP TABLE cards", "only one statement"),
+    ):
+        try:
+            mcp_server.statements_query(bad)
+        except ValueError as error:
+            assert message in str(error)
+        else:
+            raise AssertionError(f"{bad!r} should have been rejected")
 
 
 def test_mcp_bank_analytics_and_scoped_category_override(tmp_path, monkeypatch):
@@ -95,6 +128,15 @@ def test_mcp_bank_analytics_and_scoped_category_override(tmp_path, monkeypatch):
     ]
     assert mcp_server.bank_statement_health()["fully_reconciled"] == 1
     assert mcp_server.bank_pipeline_status() == {"runs": [], "pending_review": []}
+
+    # Writes are opt-in: the default surface is analysis only.
+    try:
+        mcp_server.set_bank_transaction_category(debit_id, "Coffee & Snacks")
+    except PermissionError as error:
+        assert "read-only" in str(error)
+    else:
+        raise AssertionError("category override should be refused by default")
+    monkeypatch.setattr(mcp_server, "WRITES_ENABLED", True)
 
     saved = mcp_server.set_bank_transaction_category(debit_id, "Coffee & Snacks")
     assert saved["category"] == "Coffee & Snacks"

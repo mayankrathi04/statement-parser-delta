@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     last_error   TEXT,
     last_checked TEXT,
     last_sync    TEXT,
-    added_at     TEXT
+    added_at     TEXT,
+    member_id    INTEGER
 );
 """
 
@@ -75,18 +76,28 @@ def _fernet() -> Fernet:
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(mailboxes)").fetchall()}
+    if "member_id" not in have:
+        conn.execute("ALTER TABLE mailboxes ADD COLUMN member_id INTEGER")
+    conn.commit()
 
 
-def add(conn: sqlite3.Connection, address: str, app_password: str, provider: str = "gmail") -> int:
+def add(
+    conn: sqlite3.Connection,
+    address: str,
+    app_password: str,
+    provider: str = "gmail",
+    member_id: Optional[int] = None,
+) -> int:
     ensure_schema(conn)
     # App passwords are displayed in groups of four and pasted with the spaces.
     secret = _fernet().encrypt(app_password.replace(" ", "").encode())
     cur = conn.execute(
-        """INSERT INTO mailboxes (address, secret, provider, status, added_at)
-           VALUES (?,?,?,'unknown',?)
+        """INSERT INTO mailboxes (address, secret, provider, status, added_at, member_id)
+           VALUES (?,?,?,'unknown',?,?)
            ON CONFLICT(address) DO UPDATE SET secret = excluded.secret, status = 'unknown',
-             last_error = NULL""",
-        (address.strip(), secret, provider, dt.datetime.now().isoformat(timespec="seconds")),
+             last_error = NULL, member_id = COALESCE(excluded.member_id, mailboxes.member_id)""",
+        (address.strip(), secret, provider, dt.datetime.now().isoformat(timespec="seconds"), member_id),
     )
     conn.commit()
     row = conn.execute("SELECT id FROM mailboxes WHERE address = ?", (address.strip(),)).fetchone()
@@ -110,11 +121,17 @@ def secret_for(conn: sqlite3.Connection, address: str) -> Optional[str]:
         return None
 
 
-def listing(conn: sqlite3.Connection) -> list[dict]:
+def listing(conn: sqlite3.Connection, member_ids=()) -> list[dict]:
     """Never includes the secret — only whether one is present and usable."""
     ensure_schema(conn)
     out = []
-    for r in conn.execute("SELECT * FROM mailboxes ORDER BY address").fetchall():
+    ids = list(member_ids)
+    where = f"WHERE m.member_id IN ({','.join('?' * len(ids))})" if ids else ""
+    for r in conn.execute(
+        f"""SELECT m.*, mb.name AS member_name FROM mailboxes m
+            LEFT JOIN members mb ON mb.id=m.member_id {where} ORDER BY m.address""",
+        ids,
+    ).fetchall():
         d = dict(r)
         secret = d.pop("secret", None)
         try:
@@ -268,7 +285,7 @@ def card_secret_meta(conn: sqlite3.Connection) -> dict[str, dict]:
 
 # --------------------------------------------------------------- profile
 
-def set_profile(conn: sqlite3.Connection, full_name: str, dob: str) -> None:
+def set_profile(conn: sqlite3.Connection, full_name: str, dob: str, member_id: int = 0) -> None:
     """The name and date of birth used to derive statement passwords.
 
     Encrypted like every other secret here: a date of birth is exactly the kind
@@ -278,22 +295,39 @@ def set_profile(conn: sqlite3.Connection, full_name: str, dob: str) -> None:
     """
     ensure_schema(conn)
     f = _fernet()
-    conn.execute(
-        """INSERT INTO profile (id, full_name, dob, updated_at) VALUES (1,?,?,?)
-           ON CONFLICT(id) DO UPDATE SET full_name = excluded.full_name,
-             dob = excluded.dob, updated_at = excluded.updated_at""",
-        (
-            f.encrypt((full_name or "").encode()),
-            f.encrypt((dob or "").encode()),
-            dt.datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
+    if member_id:
+        conn.execute(
+            """INSERT INTO member_profiles (member_id,full_name,dob,updated_at) VALUES(?,?,?,?)
+               ON CONFLICT(member_id) DO UPDATE SET full_name=excluded.full_name,
+                 dob=excluded.dob, updated_at=excluded.updated_at""",
+            (
+                member_id,
+                f.encrypt((full_name or "").encode()),
+                f.encrypt((dob or "").encode()),
+                dt.datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO profile (id, full_name, dob, updated_at) VALUES (1,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET full_name = excluded.full_name,
+                 dob = excluded.dob, updated_at = excluded.updated_at""",
+            (
+                f.encrypt((full_name or "").encode()),
+                f.encrypt((dob or "").encode()),
+                dt.datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
     conn.commit()
 
 
-def get_profile(conn: sqlite3.Connection) -> dict:
+def get_profile(conn: sqlite3.Connection, member_id: int = 0) -> dict:
     ensure_schema(conn)
-    row = conn.execute("SELECT * FROM profile WHERE id = 1").fetchone()
+    row = conn.execute(
+        "SELECT * FROM member_profiles WHERE member_id=?" if member_id
+        else "SELECT * FROM profile WHERE id=1",
+        (member_id,) if member_id else (),
+    ).fetchone()
     if not row:
         return {"full_name": "", "dob": "", "updated_at": None}
     f = _fernet()

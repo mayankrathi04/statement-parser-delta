@@ -95,6 +95,81 @@ export function RankBars({
   )
 }
 
+/** Ranking bars for signed values, drawn against a zero baseline.
+ *
+ *  RankBars anchors every bar to the left edge, which silently mis-draws a
+ *  negative value: the width goes negative and the row collapses to the minimum
+ *  stub, so a large net outflow looks identical to a rounding error. Net figures
+ *  need a centre line instead — outflow grows left, inflow grows right — and one
+ *  shared scale over the largest magnitude so the two sides stay comparable.
+ */
+export function NetBars({
+  rows,
+  format = money0,
+  detail = (r) => `${r.n} transaction${r.n === 1 ? '' : 's'}`,
+  tipValue = money2,
+  empty = 'No activity in this range.',
+}: {
+  rows: Slice[]
+  format?: (v: number) => string
+  detail?: (r: Slice) => string
+  tipValue?: (v: number) => string
+  empty?: string
+}) {
+  const { tip, bind } = useTip()
+  if (!rows.length) return <p className="empty">{empty}</p>
+
+  const max = Math.max(...rows.map((r) => Math.abs(r.value))) || 1
+
+  return (
+    <>
+      <div className="rank">
+        {rows.map((r, i) => {
+          const inflow = r.value >= 0
+          return (
+            <div
+              className="rank-row"
+              key={r.label + i}
+              {...bind(
+                <>
+                  <div>{r.label}</div>
+                  <b>{tipValue(r.value)}</b>
+                  <div style={{ color: 'var(--muted)' }}>
+                    {inflow ? 'net inflow' : 'net outflow'} · {detail(r)}
+                  </div>
+                </>,
+              )}
+            >
+              <span className="rank-label" title={r.label}>{r.label}</span>
+              <span className="net-track">
+                <span className="net-half">
+                  {!inflow && (
+                    <span
+                      className="rank-fill net-out"
+                      style={{ width: `${Math.max(1.5, (-r.value / max) * 100)}%` }}
+                    />
+                  )}
+                </span>
+                <span className="net-zero" />
+                <span className="net-half net-right">
+                  {inflow && (
+                    <span
+                      className="rank-fill net-in"
+                      style={{ width: `${Math.max(1.5, (r.value / max) * 100)}%` }}
+                    />
+                  )}
+                </span>
+              </span>
+              <span className={`rank-value${inflow ? ' cre' : ''}`}>{format(r.value)}</span>
+            </div>
+          )
+        })}
+      </div>
+      <Tooltip tip={tip} />
+    </>
+  )
+}
+
 function niceStep(max: number): number {
   const raw = max / 4
   const mag = Math.pow(10, Math.floor(Math.log10(raw)))
@@ -115,13 +190,18 @@ export function MonthlyBars({
   const { tip, bind } = useTip()
   if (!rows.length) return <p className="empty">No data in this range.</p>
 
-  const W = 980, H = 300, padL = 66, padR = 12, padT = 14, padB = 40
+  const W = 980, H = 300, padL = 66, padR = 12, padT = 14
   const iw = W - padL - padR
+  const slot = iw / rows.length
+  // A month label runs to about 40px ("Apr '22"). Once a slot is narrower than
+  // that the horizontal labels start colliding, so they turn to read bottom-to-
+  // top and the bottom padding grows to make room for their new height.
+  const upright = slot < 46
+  const padB = upright ? 68 : 40
   const ih = H - padT - padB
   const max = Math.max(...rows.flatMap((r) => [r.spend, r.payments])) || 1
   const step = niceStep(max)
   const top = Math.ceil(max / step) * step
-  const slot = iw / rows.length
   const bw = Math.min(26, slot / 2.9)
   const y = (v: number) => padT + ih - (v / top) * ih
 
@@ -164,7 +244,18 @@ export function MonthlyBars({
               {/* 2px gap between adjacent fills keeps the pair readable */}
               <rect x={cx - bw - 1} y={padT + ih - hS} width={bw} height={hS} rx={4} fill="var(--s1)" />
               <rect x={cx + 1} y={padT + ih - hP} width={bw} height={hP} rx={4} fill="var(--s2)" />
-              <text className="ax" x={cx} y={H - 14} textAnchor="middle">{fmtMonth(r.month, i)}</text>
+              {/* Rotated about its own anchor, so the label hangs below the
+                  axis and stays centred on the pair it belongs to. */}
+              <text
+                className="ax"
+                x={cx}
+                y={upright ? padT + ih + 10 : H - 14}
+                textAnchor={upright ? 'end' : 'middle'}
+                dominantBaseline={upright ? 'central' : undefined}
+                transform={upright ? `rotate(-90 ${cx} ${padT + ih + 10})` : undefined}
+              >
+                {fmtMonth(r.month, i)}
+              </text>
             </g>
           )
         })}

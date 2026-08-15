@@ -28,8 +28,9 @@ table:
     amount: ["amount.x0 - 25", "amount.x1 + 35"]
 row:
   date_formats: ["%d/%m/%Y"]
-  # pdfplumber exposes a stray literal "null" before a few international rows.
-  date_pattern: '^\s*(?:null)?(\d{2}/\d{2}/\d{4})'
+  # pdfplumber exposes a stray literal "null" before a few international rows,
+  # kerned against the date in some statements and spaced off it in others.
+  date_pattern: '^\s*(?:null\s*)?(\d{2}/\d{2}/\d{4})'
   cardholder_pattern: '^[A-Z][A-Z. ]{4,40}$'
   emi_token: "__none__"
   fcy_pattern: '(?!x)x'
@@ -52,4 +53,4 @@ summary:
   available_credit: {below: "Available Credit Limit"}
   available_cash: {below: "Available Cash Limit"}
 date_formats: ["%d/%m/%Y"]
-validate: [cc_summary_reconcile, debits_match_purchases, credits_match_payments, transactions_reconcile_to_total, transactions_within_period]
+validate: [cc_summary_reconcile, hdfc_legacy_side_totals, transactions_reconcile_to_total, transactions_within_period]

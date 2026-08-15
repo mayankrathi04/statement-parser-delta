@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { api, type Bootstrap, type IngestFile, type Mailbox, type Pending, type Run, type Step } from '../api'
+import {
+  api, type Bootstrap, type IngestFile, type Mailbox, type Member, type Pending, type Run, type Step,
+} from '../api'
 import CardSelect from '../components/CardSelect'
 import { pct } from '../lib/format'
+import { importTarget, type ImportTarget } from '../lib/members'
 
 const STATUS_COLOUR: Record<string, string> = {
   ok: 'var(--good)',
@@ -24,6 +27,25 @@ const STEP_BLURB: Record<string, string> = {
   validate: 'Reconcile the rows against the issuer’s own totals',
   store: 'Write the statement into the database',
 }
+
+/** Where the statements come from. A mailbox is searched by billing period; a
+ *  path is read as given, so the period row is irrelevant and hidden for it. */
+type ScanSource = 'mail' | 'disk'
+
+/** Which billing window a mail scan covers; picks the date inputs to show. */
+type ScanMode = 'this' | 'month' | 'range' | 'last12'
+
+const SCAN_SOURCES: { value: ScanSource; label: string }[] = [
+  { value: 'mail', label: 'Scan from connection' },
+  { value: 'disk', label: 'Scan from file' },
+]
+
+const SCAN_MODES: { value: ScanMode; label: string }[] = [
+  { value: 'this', label: 'Scan this month' },
+  { value: 'month', label: 'Scan a specific month' },
+  { value: 'range', label: 'Scan a month range' },
+  { value: 'last12', label: 'Scan the last 12 months' },
+]
 
 function Dot({ status }: { status: string }) {
   return <span className="dot" style={{ background: STATUS_COLOUR[status] ?? 'var(--muted)' }} />
@@ -106,9 +128,11 @@ function FileCard({ file }: { file: IngestFile }) {
 function ReviewList({
   rows,
   onImported,
+  target,
 }: {
   rows: Pending[]
   onImported: () => void
+  target: ImportTarget
 }) {
   const importable = rows.filter((r) => r.confidence === 1)
   const [picked, setPicked] = useState<Set<number>>(new Set())
@@ -168,7 +192,7 @@ function ReviewList({
     setBusy(true)
     setErr(null)
     try {
-      await api.approve([...picked])
+      await api.approve([...picked], target.id)
       // Approval starts a background job. Wait for the backend lock—not an
       // arbitrary delay—before removing the review rows. Fast imports used to
       // race the 600 ms refresh and leave this button stuck on "Importing…".
@@ -188,7 +212,8 @@ function ReviewList({
           <p className="hint">
             These were downloaded and parsed but <b>nothing has been stored yet</b>. Tick what you
             want to keep. Anything already in the database is marked; importing it replaces that
-            statement rather than adding a second copy.
+            statement rather than adding a second copy. A new card is filed under the member
+            shown below; one you already have stays with whoever owns it.
           </p>
         </div>
         <span className="spacer" />
@@ -216,6 +241,7 @@ function ReviewList({
               <th style={{ width: 34 }}></th>
               <th>Statement</th>
               <th>Card</th>
+              <th>Member</th>
               <th>Period</th>
               <th style={{ textAlign: 'right' }}>Txns</th>
               <th>Result</th>
@@ -247,6 +273,7 @@ function ReviewList({
                   </a>
                 </td>
                 <td>{r.card ?? <span className="sub">unknown</span>}</td>
+                <td>{r.member_name ?? <span className="sub">{target.name}</span>}</td>
                 <td>{r.period_start && r.period_end ? `${r.period_start} → ${r.period_end}` : '—'}</td>
                 <td className="num">{r.txn_count ?? 0}</td>
                 <td>
@@ -270,7 +297,15 @@ function ReviewList({
   )
 }
 
-export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; onChanged: () => void }) {
+export default function Pipeline({
+  boot, onChanged, roster, members,
+}: {
+  boot: Bootstrap | null
+  onChanged: () => void
+  roster: Member[]
+  members: Set<number>
+}) {
+  const target = useMemo(() => importTarget(roster, members), [roster, members])
   const [runs, setRuns] = useState<Run[]>([])
   const [busy, setBusy] = useState(false)
   const [current, setCurrent] = useState<number | null>(null)
@@ -278,17 +313,26 @@ export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; 
   const [pending, setPending] = useState<Pending[]>([])
   const [msg, setMsg] = useState<string | null>(null)
   const [paths, setPaths] = useState('samples')
+  const [scanSource, setScanSource] = useState<ScanSource>('mail')
+  const [scanMode, setScanMode] = useState<ScanMode>('this')
   const [month, setMonth] = useState(() => new Date().toISOString().slice(0, 7))
   const [monthFrom, setMonthFrom] = useState(() => new Date().toISOString().slice(0, 7))
   const [monthTo, setMonthTo] = useState(() => new Date().toISOString().slice(0, 7))
   const [fetchCards, setFetchCards] = useState<Set<number>>(new Set())
+  const [fetchUnknownCards, setFetchUnknownCards] = useState(false)
   const [connections, setConnections] = useState<Mailbox[]>([])
   const [fetchConnections, setFetchConnections] = useState<Set<number>>(new Set())
 
   useEffect(() => {
-    if (boot?.cards.length) {
-      setFetchCards((current) => current.size ? current : new Set(boot.cards.map((card) => card.id)))
-    }
+    if (!boot?.cards.length) return
+    // `boot` is scoped to the selected members, so a card ticked here can vanish
+    // when the selection narrows. Keep the overlap, and fall back to everything
+    // visible rather than leaving the scan buttons disabled on an empty set.
+    setFetchCards((current) => {
+      const visible = boot.cards.map((card) => card.id)
+      const kept = visible.filter((id) => current.has(id))
+      return new Set(kept.length ? kept : visible)
+    })
   }, [boot])
 
   useEffect(() => {
@@ -345,13 +389,39 @@ export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; 
 
   const scanOptions = (extra: Record<string, unknown>) => ({
     ...extra,
-    card_ids: boot && fetchCards.size < boot.cards.length ? [...fetchCards] : [],
+    member_id: target.id,
+    // Always explicit: an empty list means "every card in the database" to the
+    // backend, which would reach past the members selected at the top.
+    card_ids: boot?.cards.length ? [...fetchCards] : [],
+    include_unrecognized_cards: fetchUnknownCards,
     connection_ids: fetchConnections.size < connections.length ? [...fetchConnections] : [],
   })
 
-  const noFetchCards = Boolean(boot?.cards.length && fetchCards.size === 0)
+  const noFetchCards = Boolean(boot?.cards.length && fetchCards.size === 0 && !fetchUnknownCards)
   const noFetchConnections = Boolean(connections.length && fetchConnections.size === 0)
-  const scanDisabled = busy || noFetchCards || noFetchConnections
+  const badWindow =
+    (scanMode === 'month' && !month) ||
+    (scanMode === 'range' && (!monthFrom || !monthTo || monthFrom > monthTo))
+  const scanDisabled =
+    busy ||
+    (scanSource === 'disk'
+      ? !paths.trim()
+      : noFetchCards || noFetchConnections || badWindow)
+
+  const scanWindow = (): Record<string, unknown> => {
+    if (scanMode === 'month') return { month }
+    if (scanMode === 'range') return { month_from: monthFrom, month_to: monthTo }
+    return { months: scanMode === 'last12' ? 12 : 1 }
+  }
+
+  const scan = () => start(() => (
+    scanSource === 'disk'
+      ? api.scanLocal({
+          paths: paths.split(',').map((s) => s.trim()).filter(Boolean),
+          member_id: target.id,
+        })
+      : api.scanMail(scanOptions(scanWindow()))
+  ))
 
   const toggleConnection = (id: number) => {
     const next = new Set(fetchConnections)
@@ -361,91 +431,137 @@ export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; 
 
   return (
     <>
-      <div className="filters">
-        <button className="btn primary" disabled={scanDisabled}
-          onClick={() => start(() => api.scanMail(scanOptions({ months: 1 })))}>
-          {busy ? 'Working…' : '↧ Scan this month'}
-        </button>
-
-        <span className="dates">
-          <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
-          <button className="btn" disabled={scanDisabled || !month}
-            onClick={() => start(() => api.scanMail(scanOptions({ month })))}>
-            Scan that month
-          </button>
-        </span>
-
-        <button className="btn" disabled={scanDisabled}
-          onClick={() => start(() => api.scanMail(scanOptions({ months: 12 })))}>
-          Scan last 12 months
-        </button>
-
-        <span className="spacer" />
-        <input
-          className="input"
-          style={{ minWidth: 170 }}
-          value={paths}
-          onChange={(e) => setPaths(e.target.value)}
-          placeholder="folder or glob"
-        />
-        <button className="btn" disabled={busy}
-          onClick={() => start(() => api.scanLocal({ paths: paths.split(',').map((s) => s.trim()) }))}>
-          Scan from disk
-        </button>
-      </div>
-
-      <div className="filters" style={{ marginTop: -8 }}>
-        <span className="sub">Fetch only</span>
-        {boot && (
-          <CardSelect
-            cards={boot.cards}
-            selected={fetchCards}
-            colourOf={(id) => `var(--s${(boot.cards.findIndex((card) => card.id === id) % 8) + 1})`}
-            onChange={setFetchCards}
-          />
-        )}
-        {connections.length > 0 && (
-          <details className="ms">
-            <summary className="ms-btn" style={{ cursor: 'pointer' }}>
-              {fetchConnections.size === connections.length
-                ? `All connections (${connections.length})`
-                : `${fetchConnections.size} of ${connections.length} connections`}
-            </summary>
-            <div className="ms-panel">
-              {connections.map((box) => (
-                <label className="ms-row" key={box.id}>
-                  <input
-                    type="checkbox"
-                    checked={fetchConnections.has(box.id)}
-                    onChange={() => toggleConnection(box.id)}
-                  />
-                  <span>{box.address}</span>
-                </label>
+      <div className="scan-bar">
+        <div className="scan-stack">
+          {/* Row 1 — where the statements come from. */}
+          <div className="scan-row">
+            <span className="sub">Source</span>
+            <select
+              className="select"
+              value={scanSource}
+              onChange={(e) => setScanSource(e.target.value as ScanSource)}
+              aria-label="Where to scan statements from"
+            >
+              {SCAN_SOURCES.map((s) => (
+                <option key={s.value} value={s.value}>{s.label}</option>
               ))}
-              <div className="ms-foot">
-                <button className="link" onClick={() => setFetchConnections(new Set(connections.map((box) => box.id)))}>
-                  Select all
-                </button>
-                <button className="link" onClick={() => setFetchConnections(new Set())}>Clear</button>
-              </div>
+            </select>
+          </div>
+
+          {/* Row 2 — when to scan. A path is read as given, so a billing window
+              means nothing for a disk scan and the row is dropped entirely. The
+              mode then decides which date inputs matter, so only those render. */}
+          {scanSource === 'mail' && (
+            <div className="scan-row">
+              <span className="sub">Period</span>
+              <select
+                className="select"
+                value={scanMode}
+                onChange={(e) => setScanMode(e.target.value as ScanMode)}
+                aria-label="Billing period to scan"
+              >
+                {SCAN_MODES.map((m) => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+              </select>
+              {scanMode === 'month' && (
+                <span className="dates">
+                  <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
+                </span>
+              )}
+              {scanMode === 'range' && (
+                <span className="dates">
+                  <input type="month" value={monthFrom} onChange={(e) => setMonthFrom(e.target.value)} />
+                  <span className="sub">to</span>
+                  <input type="month" value={monthTo} onChange={(e) => setMonthTo(e.target.value)} />
+                </span>
+              )}
+              {badWindow && (
+                <span className="sub" style={{ color: 'var(--crit)' }}>
+                  {scanMode === 'range'
+                    ? 'Pick a start month no later than the end month.'
+                    : 'Pick a month.'}
+                </span>
+              )}
             </div>
-          </details>
-        )}
-        <span className="dates">
-          <input type="month" value={monthFrom} onChange={(e) => setMonthFrom(e.target.value)} />
-          <span className="sub">to</span>
-          <input type="month" value={monthTo} onChange={(e) => setMonthTo(e.target.value)} />
-          <button
-            className="btn"
-            disabled={scanDisabled || !monthFrom || !monthTo || monthFrom > monthTo}
-            onClick={() => start(() => api.scanMail(scanOptions({ month_from: monthFrom, month_to: monthTo })))}
-          >
-            Scan range
-          </button>
-        </span>
-        {noFetchCards && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one card.</span>}
-        {noFetchConnections && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one connection.</span>}
+          )}
+
+          {/* Row 3 — what to scan for: the card and mailbox filters, or the path. */}
+          {scanSource === 'disk' ? (
+            <div className="scan-row">
+              <span className="sub">File</span>
+              <input
+                className="input"
+                value={paths}
+                onChange={(e) => setPaths(e.target.value)}
+                placeholder="file, folder or glob"
+                aria-label="File, folder or glob to scan"
+              />
+              <span className="sub">Separate several with commas.</span>
+            </div>
+          ) : (
+            <div className="scan-row">
+              <span className="sub">Fetch only</span>
+              {boot && (
+                <CardSelect
+                  cards={boot.cards}
+                  selected={fetchCards}
+                  colourOf={(id) => `var(--s${(boot.cards.findIndex((card) => card.id === id) % 8) + 1})`}
+                  onChange={setFetchCards}
+                  unrecognized={{ checked: fetchUnknownCards, onChange: setFetchUnknownCards }}
+                />
+              )}
+              {connections.length > 0 && (
+                <details className="ms">
+                  <summary className="ms-btn" style={{ cursor: 'pointer' }}>
+                    {fetchConnections.size === connections.length
+                      ? `All connections (${connections.length})`
+                      : `${fetchConnections.size} of ${connections.length} connections`}
+                  </summary>
+                  <div className="ms-panel">
+                    {connections.map((box) => (
+                      <label className="ms-row" key={box.id}>
+                        <input
+                          type="checkbox"
+                          checked={fetchConnections.has(box.id)}
+                          onChange={() => toggleConnection(box.id)}
+                        />
+                        <span>{box.address}</span>
+                      </label>
+                    ))}
+                    <div className="ms-foot">
+                      <button className="link" onClick={() => setFetchConnections(new Set(connections.map((box) => box.id)))}>
+                        Select all
+                      </button>
+                      <button className="link" onClick={() => setFetchConnections(new Set())}>Clear</button>
+                    </div>
+                  </div>
+                </details>
+              )}
+              {noFetchCards && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one card.</span>}
+              {fetchUnknownCards && (
+                <span className="sub">
+                  Including cards you have not imported yet — the mailbox search widens to every
+                  known issuer, so a scan takes longer.
+                </span>
+              )}
+              {noFetchConnections && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one connection.</span>}
+            </div>
+          )}
+        </div>
+
+        {/* Centred against the whole stack, however many rows it currently has. */}
+        <button className="btn primary scan-go" disabled={scanDisabled} onClick={scan}>
+          {busy ? 'Working…' : '↧ Scan'}
+        </button>
       </div>
+
+      <p className="hint" style={{ marginTop: -4 }}>
+        Statements fetched from a mailbox are filed under whoever owns that mailbox. Anything
+        else — a disk scan, a statement from an unowned mailbox — is filed under{' '}
+        <b>{target.name}</b>{target.explicit ? '' : ' (your default member)'}, which follows the
+        member selector at the top of the page.
+      </p>
 
       {msg && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{msg}</div>}
       {boot && !boot.mailboxes_configured && (
@@ -457,7 +573,11 @@ export default function Pipeline({ boot, onChanged }: { boot: Bootstrap | null; 
       )}
 
       {pending.length > 0 && (
-        <ReviewList rows={pending} onImported={() => { loadRuns(); loadPending(); onChanged() }} />
+        <ReviewList
+          rows={pending}
+          target={target}
+          onImported={() => { loadRuns(); loadPending(); onChanged() }}
+        />
       )}
 
       <div className="grid2" style={{ gridTemplateColumns: '260px 1fr', alignItems: 'start' }}>

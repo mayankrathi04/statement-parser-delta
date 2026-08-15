@@ -5,9 +5,12 @@ import {
   type BankBootstrap,
   type BankFilters,
   type BankTxn,
+  type CategoryFacet,
 } from '../api'
 import AccountSelect from '../components/AccountSelect'
-import { MonthlyBars, RankBars, seriesVar } from '../components/Charts'
+import CategorySelect from '../components/CategorySelect'
+import { MonthlyBars, NetBars, RankBars, seriesVar } from '../components/Charts'
+import { reconcileSelection, useCategoryOptions } from '../lib/categories'
 import { money0, money2, monthsBefore } from '../lib/format'
 
 const RANGES = [
@@ -16,19 +19,15 @@ const RANGES = [
   { label: '1Y', months: 12 }, { label: 'All', months: 0 },
 ]
 
-const DEFAULT_CATEGORIES = [
-  'Dividends', 'Salary & Income', 'Investments', 'Loans & EMI', 'Cash',
-  'Transfers', 'Food & Dining', 'Shopping', 'Travel', 'Bills & Utilities',
-  'Healthcare', 'Entertainment', 'Education', 'Fees & Charges', 'Tax', 'Other',
-]
-
 type SortKey =
   | 'txn_date' | 'value_date' | 'counterparty' | 'category' | 'account'
   | 'withdrawal' | 'deposit' | 'balance'
 
-export default function BankAnalysis() {
+export default function BankAnalysis({ members }: { members: Set<number> }) {
   const [boot, setBoot] = useState<BankBootstrap | null>(null)
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [facets, setFacets] = useState<CategoryFacet[]>([])
+  const [categories, setCategories] = useState<Set<string>>(new Set())
   const [range, setRange] = useState(0)
   const [from, setFrom] = useState<string | null>(null)
   const [to, setTo] = useState<string | null>(null)
@@ -41,19 +40,28 @@ export default function BankAnalysis() {
   const [editingCategory, setEditingCategory] = useState<number | null>(null)
   const [categoryDraft, setCategoryDraft] = useState('')
   const [savingCategory, setSavingCategory] = useState<number | null>(null)
+  const [picked, setPicked] = useState<Set<number>>(new Set())
+  const [bulkDraft, setBulkDraft] = useState('')
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const [bulkNote, setBulkNote] = useState<string | null>(null)
 
   useEffect(() => {
-    api.bankBootstrap().then((data) => {
+    // Scoped to the top-bar picker, so the account chips below never offer an
+    // account whose transactions the filtered analytics would exclude anyway.
+    api.bankBootstrap(members).then((data) => {
       setBoot(data)
       setSelected(new Set(data.accounts.map((account) => account.id)))
+      setFacets(data.categories)
+      setCategories(new Set(data.categories.map((category) => category.name)))
       setFrom(data.bounds.min)
       setTo(data.bounds.max)
     }).catch((caught) => setError(String((caught as Error).message)))
-  }, [])
+  }, [members])
 
   const filters: BankFilters = useMemo(() => ({
-    accounts: [...selected], allAccounts: boot?.accounts.length ?? 0, from, to,
-  }), [selected, boot?.accounts.length, from, to])
+    accounts: [...selected], allAccounts: boot?.accounts.length ?? 0, members: [...members], from, to,
+    categories: [...categories], allCategories: facets.length,
+  }), [selected, boot?.accounts.length, members, from, to, categories, facets.length])
 
   useEffect(() => {
     if (!boot?.accounts.length) return
@@ -78,11 +86,23 @@ export default function BankAnalysis() {
   }, [boot])
   const colourOf = (id: number) => seriesVar(colourIndex.get(id) ?? 0)
 
-  const categoryOptions = useMemo(() => [...new Set([
-    ...DEFAULT_CATEGORIES,
-    ...(analysis?.by_category ?? []).map((row) => row.label),
-    ...(analysis?.deposits_by_category ?? []).map((row) => row.label),
-  ])].sort(), [analysis])
+  // Sourced from the bootstrap facets, not from the analytics response: those
+  // are narrowed by the category filter, and the editor must keep offering the
+  // labels the filter is currently hiding.
+  const categoryOptions = useCategoryOptions(facets.map((category) => category.name))
+
+  /** Re-read the filter's options after an edit moved rows between categories:
+   *  a label invented in the editor has to become filterable, and the counts
+   *  beside each one have to stay true. */
+  const refreshFacets = async () => {
+    try {
+      const next = (await api.bankBootstrap(members)).categories
+      setCategories((current) => reconcileSelection(facets, current, next))
+      setFacets(next)
+    } catch {
+      // Leave the picker as it was: the filter still works on known labels.
+    }
+  }
 
   const saveCategory = async (row: BankTxn, category: string | null) => {
     setSavingCategory(row.id)
@@ -92,12 +112,42 @@ export default function BankAnalysis() {
         ? { ...item, ...updated }
         : item))
       setAnalysis(await api.bankAnalytics(filters))
+      await refreshFacets()
       setEditingCategory(null)
       setError(null)
     } catch (caught) {
       setError(String((caught as Error).message))
     } finally {
       setSavingCategory(null)
+    }
+  }
+
+  /** Apply one category to every ticked row. `null` restores the automatic one. */
+  const applyBulkCategory = async (category: string | null) => {
+    const ids = [...picked]
+    if (!ids.length) return
+    setBulkBusy(true)
+    setBulkNote(null)
+    try {
+      const { rows: updated } = await api.updateBankTransactionCategories(ids, category)
+      const byId = new Map(updated.map((row) => [row.id, row]))
+      setTransactions((current) => current.map((item) => {
+        const patch = byId.get(item.id)
+        return patch ? { ...item, ...patch } : item
+      }))
+      setAnalysis(await api.bankAnalytics(filters))
+      await refreshFacets()
+      setBulkNote(
+        `${updated.length} transaction${updated.length === 1 ? '' : 's'} `
+        + (category ? `set to ${category}.` : 'restored to their automatic category.'),
+      )
+      setPicked(new Set())
+      setBulkDraft('')
+      setError(null)
+    } catch (caught) {
+      setError(String((caught as Error).message))
+    } finally {
+      setBulkBusy(false)
     }
   }
 
@@ -140,10 +190,25 @@ export default function BankAnalysis() {
     })
   }, [transactions, query, sort])
 
-  useEffect(() => { setPage(0) }, [rows])
+  useEffect(() => {
+    // Selections follow the visible result set: narrowing the search must never
+    // leave rows ticked that the user can no longer see or check.
+    setPicked((current) => {
+      if (!current.size) return current
+      const visible = new Set(rows.map((row) => row.id))
+      const kept = [...current].filter((id) => visible.has(id))
+      return kept.length === current.size ? current : new Set(kept)
+    })
+  }, [rows])
+
+  // Paging restarts when the result set is rebuilt — a new filter, search or
+  // sort — but not when editing a category rewrites rows already on screen.
+  useEffect(() => { setPage(0) }, [filters, query, sort])
+
   const pageSize = 50
   const pages = Math.max(1, Math.ceil(rows.length / pageSize))
-  const shown = rows.slice(page * pageSize, (page + 1) * pageSize)
+  const pageIndex = Math.min(page, pages - 1)
+  const shown = rows.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize)
   const heading = (key: SortKey, label: string, right = false) => (
     <th
       style={{ cursor: 'pointer', textAlign: right ? 'right' : 'left' }}
@@ -177,6 +242,7 @@ export default function BankAnalysis() {
         <AccountSelect
           accounts={boot.accounts} selected={selected} colourOf={colourOf} onChange={setSelected}
         />
+        <CategorySelect categories={facets} selected={categories} onChange={setCategories} />
         {RANGES.map((item) => (
           <span
             key={item.label} className="chip" role="button"
@@ -207,6 +273,14 @@ export default function BankAnalysis() {
         ))}
       </div>
 
+      {members.size > 1 && !!analysis?.by_member.length && <section className="card">
+        <h2>Member-wise cash flow</h2>
+        <p className="hint">Combined view, with every deposit and withdrawal still attributed.</p>
+        <div className="tbl-wrap"><table><thead><tr><th>Member</th><th className="num">Withdrawals</th><th className="num">Deposits</th><th className="num">Transactions</th></tr></thead>
+          <tbody>{analysis.by_member.map((row) => <tr key={row.member_id}><td>{row.member}</td><td className="num">{money2(row.withdrawals)}</td><td className="num cre">{money2(row.deposits)}</td><td className="num">{row.n}</td></tr>)}</tbody>
+        </table></div>
+      </section>}
+
       <section className="card">
         <h2>Monthly cash flow</h2>
         <p className="hint">Withdrawals and deposits are kept separate; net cash flow is deposits minus withdrawals.</p>
@@ -233,6 +307,14 @@ export default function BankAnalysis() {
           <h2>Deposits by category</h2>
           <p className="hint">Income and incoming credits, including dividends and salary.</p>
           <RankBars rows={analysis?.deposits_by_category ?? []} empty="No deposits in this range." />
+        </section>
+        <section className="card">
+          <h2>Net by category</h2>
+          <p className="hint">
+            Deposits minus withdrawals. Right of the line is a net inflow, left is a net drain;
+            both sides share one scale, and categories are ordered by size of effect.
+          </p>
+          <NetBars rows={analysis?.net_by_category ?? []} empty="No activity in this range." />
         </section>
         <section className="card">
           <h2>Withdrawals by account</h2>
@@ -263,12 +345,67 @@ export default function BankAnalysis() {
             value={query} onChange={(event) => setQuery(event.target.value)}
           />
         </div>
+
+        <div className="bulk-bar">
+          <label className="bulk-check">
+            <input
+              type="checkbox"
+              checked={!!rows.length && picked.size === rows.length}
+              ref={(node) => {
+                if (node) node.indeterminate = picked.size > 0 && picked.size < rows.length
+              }}
+              disabled={!rows.length}
+              onChange={(event) => setPicked(
+                event.target.checked ? new Set(rows.map((row) => row.id)) : new Set(),
+              )}
+            />
+            <span>
+              {picked.size
+                ? `${picked.size} selected`
+                : `Select all ${rows.length} result${rows.length === 1 ? '' : 's'}`}
+            </span>
+          </label>
+
+          {picked.size > 0 && (
+            <form
+              className="bulk-actions"
+              onSubmit={(event) => {
+                event.preventDefault()
+                if (bulkDraft.trim()) void applyBulkCategory(bulkDraft.trim())
+              }}
+            >
+              <input
+                className="input" list="bank-category-options" maxLength={80}
+                placeholder="Set category to…"
+                value={bulkDraft}
+                onChange={(event) => setBulkDraft(event.target.value)}
+                aria-label={`Category for ${picked.size} selected transactions`}
+              />
+              <button className="btn primary" disabled={bulkBusy || !bulkDraft.trim()}>
+                {bulkBusy ? 'Applying…' : `Apply to ${picked.size}`}
+              </button>
+              <button
+                type="button" className="btn" disabled={bulkBusy}
+                title="Drop the manual override and use the automatic category again"
+                onClick={() => void applyBulkCategory(null)}
+              >
+                Automatic
+              </button>
+              <button type="button" className="btn" disabled={bulkBusy}
+                onClick={() => setPicked(new Set())}>
+                Clear
+              </button>
+            </form>
+          )}
+          {bulkNote && <span className="sub">{bulkNote}</span>}
+        </div>
         <div className="tbl-wrap tbl-scroll bank-tbl">
           <datalist id="bank-category-options">
             {categoryOptions.map((category) => <option key={category} value={category} />)}
           </datalist>
           <table>
             <thead><tr>
+              <th style={{ width: 30 }} aria-label="Select" />
               {heading('txn_date', 'Date')}{heading('value_date', 'Value date')}
               <th>Narration</th><th>Reference</th>{heading('counterparty', 'Counterparty')}
               {heading('category', 'Category')}{heading('account', 'Account')}
@@ -277,7 +414,19 @@ export default function BankAnalysis() {
             </tr></thead>
             <tbody>
               {shown.map((row) => (
-                <tr key={row.id}>
+                <tr key={row.id} className={picked.has(row.id) ? 'row-picked' : undefined}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={picked.has(row.id)}
+                      aria-label={`Select ${row.description}`}
+                      onChange={() => setPicked((current) => {
+                        const next = new Set(current)
+                        next.has(row.id) ? next.delete(row.id) : next.add(row.id)
+                        return next
+                      })}
+                    />
+                  </td>
                   <td>{row.txn_date}</td><td>{row.value_date ?? '—'}</td>
                   <td className="desc">{row.description}</td><td><code>{row.reference ?? '—'}</code></td>
                   <td>{row.counterparty}</td>
@@ -333,12 +482,12 @@ export default function BankAnalysis() {
         </div>
         <div className="table-pager">
           <span className="sub">
-            Rows {rows.length ? page * pageSize + 1 : 0}–{Math.min(rows.length, (page + 1) * pageSize)} of {rows.length}
+            Rows {rows.length ? pageIndex * pageSize + 1 : 0}–{Math.min(rows.length, (pageIndex + 1) * pageSize)} of {rows.length}
           </span>
           <span className="spacer" />
-          <button className="btn" disabled={page === 0} onClick={() => setPage(page - 1)}>← Previous</button>
-          <span className="sub">Page {page + 1} of {pages}</span>
-          <button className="btn" disabled={page + 1 >= pages} onClick={() => setPage(page + 1)}>Next →</button>
+          <button className="btn" disabled={pageIndex === 0} onClick={() => setPage(pageIndex - 1)}>← Previous</button>
+          <span className="sub">Page {pageIndex + 1} of {pages}</span>
+          <button className="btn" disabled={pageIndex + 1 >= pages} onClick={() => setPage(pageIndex + 1)}>Next →</button>
         </div>
       </section>
     </>

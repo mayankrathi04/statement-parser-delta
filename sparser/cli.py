@@ -1,9 +1,9 @@
 """Command line entry point.
 
     python -m sparser parse  statement.pdf -o out.xlsx
-    python -m sparser import samples/*.pdf --db statements.db
+    python -m sparser import samples/*.pdf --db data/statements.db
     python -m sparser fetch  --dest inbox --name "<your name>" --dob DD/MM/YYYY
-    python -m sparser serve  --db statements.db
+    python -m sparser serve  --db data/statements.db
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from .decrypt import DecryptError, candidate_passwords, decrypt_to, is_encrypted
 from .engine import NoTemplateMatch, parse_pdf
 from .output import WRITERS
 from .schema import Statement
+from .store import DEFAULT_DB
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
@@ -185,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("import", help="parse PDFs into the SQLite store")
     p.add_argument("pdfs", nargs="+", type=Path)
-    p.add_argument("--db", type=Path, default=Path("statements.db"))
+    p.add_argument("--db", type=Path, default=DEFAULT_DB)
     p.add_argument("--force", action="store_true", help="import even if validation fails")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--strict", action="store_true")
@@ -194,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("fetch", help="download statements from Gmail, then import")
     p.add_argument("--dest", type=Path, default=Path("inbox"))
-    p.add_argument("--db", type=Path, default=Path("statements.db"))
+    p.add_argument("--db", type=Path, default=DEFAULT_DB)
     p.add_argument("--months", type=int, default=12, help="how far back to search")
     p.add_argument("--no-import", action="store_true", help="download only")
     p.add_argument("--force", action="store_true")
@@ -204,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("serve", help="run the analytics dashboard")
-    p.add_argument("--db", type=Path, default=Path("statements.db"))
+    p.add_argument("--db", type=Path, default=DEFAULT_DB)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8770)
     p.add_argument("--no-browser", action="store_true")

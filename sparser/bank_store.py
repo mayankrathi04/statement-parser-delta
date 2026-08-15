@@ -8,7 +8,7 @@ import sqlite3
 from typing import Any, Iterable, Optional
 
 from . import store
-from .bank_parser import BankStatement
+from .banks import BankStatement
 from .enrich import categorize
 
 _ENRICHMENT_VERSION = "4"
@@ -48,8 +48,17 @@ def _counterparty(description: str) -> str:
     return (parts[0] if parts else text)[:80]
 
 
-def _category(description: str) -> str:
+def _category(description: str, rules=None) -> str:
+    """User rules first, then the built-in bank heuristics.
+
+    The rule list is shared with the card ledger, so one category means the same
+    thing on both sides of the app.
+    """
     text = description or ""
+    if rules:
+        matched = rules.match(text)
+        if matched:
+            return matched
     if re.search(r"^\s*ACH\s+C\s*-", text, re.I):
         return "Dividends"
     if re.search(r"\bincome\s+tax\b|\btax\b|\bgst\b", text, re.I):
@@ -105,7 +114,9 @@ def find_statement(conn: sqlite3.Connection, stmt: BankStatement) -> Optional[di
     return dict(row) if row else None
 
 
-def upsert_account(conn: sqlite3.Connection, stmt: BankStatement) -> int:
+def upsert_account(
+    conn: sqlite3.Connection, stmt: BankStatement, member_id: Optional[int] = None
+) -> int:
     row = conn.execute(
         "SELECT id FROM bank_accounts WHERE account_fingerprint = ?",
         (stmt.account_fingerprint,),
@@ -126,21 +137,26 @@ def upsert_account(conn: sqlite3.Connection, stmt: BankStatement) -> int:
     cur = conn.execute(
         """INSERT INTO bank_accounts
            (bank_code, bank_name, account_fingerprint, masked_number, last4,
-            account_holder, account_type, product, branch, display_name, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            account_holder, account_type, product, branch, display_name, created_at, member_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             stmt.bank_code, stmt.bank_name, stmt.account_fingerprint, stmt.masked_number,
             stmt.last4, stmt.account_holder, stmt.account_type, stmt.product, stmt.branch,
-            display_name(stmt), dt.datetime.now().isoformat(timespec="seconds"),
+            display_name(stmt), dt.datetime.now().isoformat(timespec="seconds"), member_id,
         ),
     )
     return int(cur.lastrowid)
 
 
-def import_statement(conn: sqlite3.Connection, stmt: BankStatement) -> tuple[int, int, bool, int]:
+def import_statement(
+    conn: sqlite3.Connection, stmt: BankStatement, member_id: Optional[int] = None
+) -> tuple[int, int, bool, int]:
     """Insert/replace a bank statement and return statement, rows, replaced, account."""
     _ensure_enrichment(conn)
-    account_id = upsert_account(conn, stmt)
+    from . import categories as category_rules
+
+    account_id = upsert_account(conn, stmt, member_id)
+    rules = category_rules.rules_for(conn, category_rules.resolve(conn, member_id), "bank")
     key = (account_id, stmt.period_start.isoformat(), stmt.period_end.isoformat())
     existing = conn.execute(
         """SELECT id FROM bank_statements
@@ -198,7 +214,7 @@ def import_statement(conn: sqlite3.Connection, stmt: BankStatement) -> tuple[int
                 statement_id, account_id, row.date.isoformat(),
                 row.value_date.isoformat() if row.value_date else None,
                 row.description, row.reference, _counterparty(row.description),
-                _category(row.description), store.to_paise(row.amount), row.type.value,
+                _category(row.description, rules), store.to_paise(row.amount), row.type.value,
                 store.to_paise(row.signed), store.to_paise(row.balance), row.page, row.raw,
             )
             for row in stmt.transactions
@@ -252,11 +268,67 @@ def update_transaction_category(
     }
 
 
+def update_transaction_categories(
+    conn: sqlite3.Connection,
+    transaction_ids: Iterable[int],
+    category: Optional[str],
+    account_ids: Iterable[int] = (),
+) -> list[dict]:
+    """Set or clear the manual override on many rows at once.
+
+    ``account_ids`` restricts the update to accounts the caller may see, so a
+    request cannot reach rows outside the signed-in user's members.
+    """
+    ids = sorted({int(value) for value in transaction_ids})
+    if not ids:
+        return []
+    override = " ".join((category or "").split()).strip() or None
+    if override and len(override) > MAX_CATEGORY_LENGTH:
+        raise ValueError(f"category must be at most {MAX_CATEGORY_LENGTH} characters")
+
+    allowed = list(account_ids)
+    scope = f" AND account_id IN ({','.join('?' * len(allowed))})" if allowed else ""
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT id, category FROM bank_transactions WHERE id IN ({marks}){scope}",
+        [*ids, *allowed],
+    ).fetchall()
+    if not rows:
+        return []
+    found = [int(row["id"]) for row in rows]
+    conn.execute(
+        f"UPDATE bank_transactions SET category_override=? WHERE id IN ({','.join('?' * len(found))})",
+        [override, *found],
+    )
+    conn.commit()
+    return [
+        {
+            "id": int(row["id"]),
+            "category": override or row["category"] or "Other",
+            "derived_category": row["category"] or "Other",
+            "category_override": override,
+            "category_is_override": override is not None,
+        }
+        for row in rows
+    ]
+
+
+#: The one category a row counts under — see the card ledger's twin constant.
+CATEGORY_SQL = "COALESCE(NULLIF(TRIM(t.category_override),''), t.category, 'Other')"
+
+
 def _where(
     account_ids: Iterable[int] = (),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    categories: Optional[Iterable[str]] = None,
 ) -> tuple[str, list[Any]]:
+    """Build the shared WHERE clause.
+
+    ``categories`` of ``None`` means no category filter. An empty sequence is
+    different, and deliberate: the user unticked every category, so nothing
+    should match.
+    """
     ids = list(account_ids)
     clauses = ["1=1"]
     args: list[Any] = []
@@ -269,7 +341,30 @@ def _where(
     if date_to:
         clauses.append("t.txn_date <= ?")
         args.append(date_to)
+    if categories is not None:
+        names = list(categories)
+        clauses.append(
+            f"{CATEGORY_SQL} IN ({','.join('?' * len(names))})" if names else "0=1"
+        )
+        args.extend(names)
     return " AND ".join(clauses), args
+
+
+def category_facets(conn: sqlite3.Connection, account_ids: Iterable[int] = ()) -> list[dict]:
+    """Every category present on the given accounts, with its row count.
+
+    The category filter needs a list that does not shrink as it is applied, so
+    this is scoped by account only — never by the filter it feeds.
+    """
+    _ensure_enrichment(conn)
+    clause, args = _where(account_ids)
+    rows = conn.execute(
+        f"""SELECT {CATEGORY_SQL} AS name, COUNT(*) AS n
+            FROM bank_transactions t WHERE {clause}
+            GROUP BY name ORDER BY name COLLATE NOCASE""",
+        args,
+    ).fetchall()
+    return [{"name": row["name"], "n": row["n"]} for row in rows]
 
 
 def date_bounds(conn: sqlite3.Connection) -> dict:
@@ -294,18 +389,21 @@ def statements(conn: sqlite3.Connection) -> list[dict]:
     return result
 
 
-def accounts(conn: sqlite3.Connection) -> list[dict]:
+def accounts(conn: sqlite3.Connection, member_ids: Iterable[int] = ()) -> list[dict]:
     _ensure_enrichment(conn)
+    ids = list(member_ids)
+    where = f"WHERE a.member_id IN ({','.join('?' * len(ids))})" if ids else ""
     rows = conn.execute(
-        """SELECT a.*,
+        """SELECT a.*, m.name AS member_name,
                   COUNT(DISTINCT s.id) AS statements,
                   COUNT(t.id) AS txn_count,
                   MIN(t.txn_date) AS first_txn,
                   MAX(t.txn_date) AS last_txn
-           FROM bank_accounts a
+           FROM bank_accounts a LEFT JOIN members m ON m.id=a.member_id
            LEFT JOIN bank_statements s ON s.account_id = a.id
            LEFT JOIN bank_transactions t ON t.statement_id = s.id
-           GROUP BY a.id ORDER BY a.display_name"""
+           """ + where + " GROUP BY a.id ORDER BY a.display_name",
+        ids,
     ).fetchall()
     history_rows = conn.execute(
         """SELECT s.*,
@@ -339,9 +437,10 @@ def transactions(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 5000,
+    categories: Optional[Iterable[str]] = None,
 ) -> list[dict]:
     _ensure_enrichment(conn)
-    clause, args = _where(account_ids, date_from, date_to)
+    clause, args = _where(account_ids, date_from, date_to, categories)
     rows = conn.execute(
         f"""SELECT t.id, t.txn_date, t.value_date, t.description, t.reference,
                    t.counterparty, t.category AS derived_category,
@@ -349,9 +448,11 @@ def transactions(
                    COALESCE(NULLIF(TRIM(t.category_override),''), t.category, 'Other') AS category,
                    t.amount, t.direction, t.signed,
                    t.balance, t.page, t.account_id, a.display_name AS account,
+                   a.member_id, m.name AS member_name,
                    s.period_start AS statement_period_start,
                    s.period_end AS statement_period_end
             FROM bank_transactions t JOIN bank_accounts a ON a.id=t.account_id
+            LEFT JOIN members m ON m.id=a.member_id
             JOIN bank_statements s ON s.id=t.statement_id
             WHERE {clause} ORDER BY t.txn_date DESC, t.id DESC LIMIT ?""",
         args + [limit],
@@ -371,9 +472,14 @@ def analytics(
     account_ids: Iterable[int] = (),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    categories: Optional[Iterable[str]] = None,
 ) -> dict:
     _ensure_enrichment(conn)
-    clause, args = _where(account_ids, date_from, date_to)
+    clause, args = _where(account_ids, date_from, date_to, categories)
+    # Balances are a property of the account, not of a category: a running
+    # balance read from a subset of the rows is meaningless. The opening and
+    # closing figures therefore ignore the category filter.
+    ledger_clause, ledger_args = _where(account_ids, date_from, date_to)
     totals = conn.execute(
         f"""SELECT
               COALESCE(SUM(CASE WHEN direction='debit' THEN amount ELSE 0 END),0) withdrawals,
@@ -405,11 +511,32 @@ def analytics(
             GROUP BY label ORDER BY total DESC""",
         args,
     ).fetchall()
+    # Net is deposits minus withdrawals per category, so a category can land on
+    # either side of zero. Ordered by magnitude rather than value: the biggest
+    # drains matter as much as the biggest earners, and a plain DESC would bury
+    # them at the bottom of the card.
+    net_categories = conn.execute(
+        f"""SELECT COALESCE(NULLIF(TRIM(category_override),''), category, 'Other') label,
+                   SUM(signed) total, COUNT(*) n
+            FROM bank_transactions t WHERE {clause}
+            GROUP BY label ORDER BY ABS(SUM(signed)) DESC""",
+        args,
+    ).fetchall()
     by_account = conn.execute(
         f"""SELECT t.account_id, a.display_name label, SUM(t.amount) total, COUNT(*) n
             FROM bank_transactions t JOIN bank_accounts a ON a.id=t.account_id
             WHERE {clause} AND t.direction='debit'
             GROUP BY t.account_id ORDER BY total DESC""",
+        args,
+    ).fetchall()
+    by_member = conn.execute(
+        f"""SELECT m.id AS member_id, COALESCE(m.name,'Unassigned') AS member,
+                   SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) withdrawals,
+                   SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END) deposits,
+                   COUNT(*) n
+            FROM bank_transactions t JOIN bank_accounts a ON a.id=t.account_id
+            LEFT JOIN members m ON m.id=a.member_id
+            WHERE {clause} GROUP BY a.member_id ORDER BY withdrawals DESC""",
         args,
     ).fetchall()
     counterparties = conn.execute(
@@ -420,8 +547,8 @@ def analytics(
     ).fetchall()
     ledger = conn.execute(
         f"""SELECT account_id, amount, direction, balance
-            FROM bank_transactions t WHERE {clause} ORDER BY txn_date, id""",
-        args,
+            FROM bank_transactions t WHERE {ledger_clause} ORDER BY txn_date, id""",
+        ledger_args,
     ).fetchall()
     first: dict[int, sqlite3.Row] = {}
     last: dict[int, sqlite3.Row] = {}
@@ -461,10 +588,22 @@ def analytics(
             {"label": row["label"], "value": store.to_rupees(row["total"]), "n": row["n"]}
             for row in deposit_categories
         ],
+        "net_by_category": [
+            {"label": row["label"], "value": store.to_rupees(row["total"]), "n": row["n"]}
+            for row in net_categories
+        ],
         "by_account": [
             {"account_id": row["account_id"], "label": row["label"],
              "value": store.to_rupees(row["total"]), "n": row["n"]}
             for row in by_account
+        ],
+        "by_member": [
+            {
+                "member_id": row["member_id"], "member": row["member"],
+                "withdrawals": store.to_rupees(row["withdrawals"]),
+                "deposits": store.to_rupees(row["deposits"]), "n": row["n"],
+            }
+            for row in by_member
         ],
         "top_counterparties": [
             {"label": row["label"] or "Unknown", "value": store.to_rupees(row["total"]),

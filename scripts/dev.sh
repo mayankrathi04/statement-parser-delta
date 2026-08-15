@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DB="${SPARSER_DB:-statements.db}"
+DB="${SPARSER_DB:-data/statements.db}"
 PY="${PYTHON:-.venv/bin/python}"
 
 # uvicorn's own "Address already in use" says nothing about who holds the port,

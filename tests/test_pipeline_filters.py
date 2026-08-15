@@ -4,6 +4,7 @@ import pytest
 
 from sparser import accounts, mailbox, store
 from sparser.pipeline import _scan_card_rule_groups, month_range_window, run_scan
+from sparser.store import same_card
 from sparser.schema import DocType, Statement, Transaction, TxnType
 from sparser.validate import run_checks, transactions_within_period
 
@@ -59,10 +60,10 @@ def test_scan_all_cards_unions_every_saved_mail_rule(tmp_path):
             "VALUES ('Blank', 'XX00', 'Blank 00')"
         )
 
-        masks, groups = _scan_card_rule_groups(
+        card_filter, groups = _scan_card_rule_groups(
             conn, [], ["default.example"], ["default statement"]
         )
-        assert masks is None
+        assert card_filter is None
         assert groups == [
             (
                 {"axis.example", "icici.example"},
@@ -71,10 +72,11 @@ def test_scan_all_cards_unions_every_saved_mail_rule(tmp_path):
             ({"default.example"}, {"default statement"}),
         ]
 
-        masks, groups = _scan_card_rule_groups(
+        card_filter, groups = _scan_card_rule_groups(
             conn, [first], ["default.example"], ["default statement"]
         )
-        assert masks == {"XX97"}
+        assert card_filter.allowed == {"XX97"}
+        assert card_filter.known == {"XX97", "XX07", "XX00"}
         assert groups == [({"axis.example"}, {"axis card statement"})]
     finally:
         conn.close()
@@ -87,10 +89,10 @@ def test_scan_card_rules_fall_back_only_when_no_saved_rules_exist(tmp_path):
             "INSERT INTO cards (issuer, masked_number, display_name) "
             "VALUES ('Blank', 'XX00', 'Blank 00')"
         )
-        masks, groups = _scan_card_rule_groups(
+        card_filter, groups = _scan_card_rule_groups(
             conn, [], ["default.example"], ["default statement"]
         )
-        assert masks is None
+        assert card_filter is None
         assert groups == [({"default.example"}, {"default statement"})]
     finally:
         conn.close()
@@ -104,11 +106,87 @@ def test_incomplete_card_uses_saved_field_and_defaults_only_missing_field(tmp_pa
             "(issuer, masked_number, display_name, sender_ids_json, subject_patterns_json) "
             "VALUES ('Axis', 'XX97', 'Axis 97', '[\"axis.example\"]', '[]')"
         )
-        masks, groups = _scan_card_rule_groups(
+        card_filter, groups = _scan_card_rule_groups(
             conn, [], ["default.example"], ["default statement"]
         )
-        assert masks is None
+        assert card_filter is None
         assert groups == [({"axis.example"}, {"default statement"})]
+    finally:
+        conn.close()
+
+
+def test_same_card_ignores_masking_style_and_separators():
+    # The same card printed by two of its issuer's own templates.
+    assert same_card("5394 94** **** 4321", "539494XXXXXX4321")
+    # Axis widened the mask mid-2021; one physical card, two printed forms.
+    assert same_card("53346700****8765", "533467******8765")
+    # Two real cards sharing a BIN must not collapse into one.
+    assert not same_card("485498XXXXXX1111", "485498XXXXXX2222")
+    # Non-overlapping visible windows must not vacuously agree.
+    assert not same_card("533467**********", "**********008765")
+    # Different issuers' PAN lengths never match.
+    assert not same_card("3561XXXXXXX1234", "3561XXXXXXXX1234")
+    # The unknown-card fallback keys stay exact-match only.
+    assert same_card("HDFC Bank-unknown", "HDFC Bank-unknown")
+    assert not same_card("HDFC Bank-unknown", "Axis Bank-unknown")
+    assert not same_card(None, None)
+
+
+def test_unrecognized_cards_are_kept_only_when_asked_for(tmp_path):
+    conn = store.connect(tmp_path / "unknown-card-scan.db")
+    try:
+        conn.execute(
+            "INSERT INTO cards (issuer, masked_number, display_name) "
+            "VALUES ('HDFC', '485498XXXXXX2222', 'HDFC Regalia 2222')"
+        )
+        saved = conn.execute("SELECT id FROM cards").fetchone()[0]
+
+        strict, _ = _scan_card_rule_groups(
+            conn, [saved], ["default.example"], ["default statement"]
+        )
+        kept, why = strict.verdict("485498XXXXXX1111")
+        assert not kept
+        assert "Unrecognized cards" in why
+        assert strict.verdict("5394 94** **** 4321")[0] is False
+
+        widened, groups = _scan_card_rule_groups(
+            conn, [saved], ["default.example"], ["default statement"],
+            include_unrecognized=True,
+        )
+        assert widened.verdict("485498XXXXXX1111")[0] is True
+        # A statement with no readable card number is unrecognized too.
+        assert widened.verdict(None)[0] is True
+        # A saved card left unticked stays excluded either way.
+        assert widened.verdict("485498XXXXXX2222")[0] is True
+        # Unimported cards have no saved mail rules, so the issuer defaults have
+        # to be searched or the statement is never downloaded to be judged.
+        assert ({"default.example"}, {"default statement"}) in groups
+    finally:
+        conn.close()
+
+
+def test_untouched_saved_card_is_excluded_without_the_unrecognized_hint(tmp_path):
+    conn = store.connect(tmp_path / "unticked-card-scan.db")
+    try:
+        conn.execute(
+            "INSERT INTO cards (issuer, masked_number, display_name) "
+            "VALUES ('HDFC', '485498XXXXXX2222', 'HDFC Regalia 2222')"
+        )
+        conn.execute(
+            "INSERT INTO cards (issuer, masked_number, display_name) "
+            "VALUES ('Axis', '539494******4321', 'Airtel Axis 4321')"
+        )
+        ticked = conn.execute(
+            "SELECT id FROM cards WHERE masked_number = '485498XXXXXX2222'"
+        ).fetchone()[0]
+
+        card_filter, _ = _scan_card_rule_groups(
+            conn, [ticked], ["default.example"], ["default statement"],
+            include_unrecognized=True,
+        )
+        kept, why = card_filter.verdict("539494XXXXXX4321")
+        assert not kept
+        assert "not ticked" in why
     finally:
         conn.close()
 
@@ -249,6 +327,50 @@ def _axis_summary_glitch_statement(payment_description="BBPS PAYMENT RECEIVED - 
             ),
         ],
     )
+
+
+def _hdfc_offsetting_statement(credit_amount="1000.00"):
+    """Summary counts ₹10.22 in both Purchase and Payments that no row prints."""
+    return Statement(
+        template_id="hdfc_cc_legacy_v1",
+        issuer="HDFC Bank",
+        doc_type=DocType.CREDIT_CARD,
+        period_start=dt.date(2023, 8, 16),
+        period_end=dt.date(2023, 9, 15),
+        summary={
+            "previous_dues": "500.00",
+            "payments_credits": "1010.22",
+            "purchases_debits": "2010.22",
+            "finance_charges": "0",
+            "total_dues": "1500.00",
+        },
+        transactions=[
+            Transaction(
+                date=dt.date(2023, 8, 20), description="RAZ*NAAMO Hyderabad",
+                amount="2000.00", type=TxnType.DEBIT,
+            ),
+            Transaction(
+                date=dt.date(2023, 8, 25), description="IMPS PMT",
+                amount=credit_amount, type=TxnType.CREDIT,
+            ),
+        ],
+    )
+
+
+def test_hdfc_offsetting_summary_pair_passes_when_the_balance_reconciles():
+    check = run_checks(_hdfc_offsetting_statement(), ["hdfc_legacy_side_totals"])[0]
+
+    assert check.passed
+    assert "10.22" in check.detail
+    assert "the imported ledger is complete" in check.detail
+
+
+def test_hdfc_one_sided_shortfall_remains_an_error():
+    # A dropped credit row moves one side only, so the offset no longer cancels.
+    check = run_checks(_hdfc_offsetting_statement("900.00"), ["hdfc_legacy_side_totals"])[0]
+
+    assert not check.passed
+    assert check.severity == "error"
 
 
 def test_axis_legacy_proven_summary_glitch_is_visible_warning():

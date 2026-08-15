@@ -6,6 +6,10 @@ build/
 dist/
 *.egg-info/
 
+.claude/
+.codex-plugin/
+.pytest_cache/
+
 # Real statements are financial PII. Keep them out of version control; the
 # golden corpus is generated locally from whatever sits in samples/.
 samples/*.pdf
@@ -14,6 +18,9 @@ samples/*.pdf
 statements.db
 statements.db-wal
 statements.db-shm
+data/*.db
+data/*.db-wal
+data/*.db-shm
 inbox/
 
 # Frontend
@@ -28,6 +35,11 @@ tests/*
 !tests/test_mailbox_collision.py
 !tests/test_pipeline_filters.py
 !tests/test_bank_statements.py
+!tests/test_bank_corpus.py
+!tests/test_portal_members.py
+!tests/corpus.py
 
 graphify-out/
 .graphify_*
+.env
+*.bak

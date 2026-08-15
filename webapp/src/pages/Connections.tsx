@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, type Mailbox } from '../api'
+import { api, type Mailbox, type Member } from '../api'
 
 const DOT: Record<string, string> = {
   connected: 'var(--good)',
@@ -7,12 +7,13 @@ const DOT: Record<string, string> = {
   unknown: 'var(--muted)',
 }
 
-export default function Connections({ onChanged }: { onChanged: () => void }) {
+export default function Connections({ onChanged, members }: { onChanged: () => void; members: Member[] }) {
   const [boxes, setBoxes] = useState<Mailbox[]>([])
   const [keyFile, setKeyFile] = useState('')
   const [envConfigured, setEnv] = useState(false)
   const [address, setAddress] = useState('')
   const [secret, setSecret] = useState('')
+  const [memberId, setMemberId] = useState<number | undefined>(members[0]?.id)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
 
@@ -33,7 +34,7 @@ export default function Connections({ onChanged }: { onChanged: () => void }) {
     setBusy(true)
     setMsg(null)
     try {
-      const d = await api.addMailbox(address.trim(), secret)
+      const d = await api.addMailbox(address.trim(), secret, memberId)
       setMsg({ ok: true, text: `${address} — ${d.detail}` })
       setAddress('')
       setSecret('')
@@ -82,6 +83,7 @@ export default function Connections({ onChanged }: { onChanged: () => void }) {
             <span className="dot" style={{ background: DOT[m.status], marginTop: 0 }} />
             <span>
               <div className="conn-addr">{m.address}</div>
+              <div className="step-detail">Member: {m.member_name ?? 'Unassigned'}</div>
               <div className="step-detail">
                 {m.status === 'connected' && m.last_sync
                   ? `last sync ${m.last_sync.replace('T', ' ')}`
@@ -93,6 +95,9 @@ export default function Connections({ onChanged }: { onChanged: () => void }) {
               </div>
             </span>
             <span className="spacer" />
+            <select className="input" value={m.member_id ?? ''} onChange={async (event) => {
+              await api.assignMailboxMember(m.id, Number(event.target.value)); void load()
+            }}>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>
             {!m.secret_ok && (
               <span className="badge" style={{ color: 'var(--crit)' }}>
                 secret unreadable — re-add
@@ -107,6 +112,9 @@ export default function Connections({ onChanged }: { onChanged: () => void }) {
         ))}
 
         <div className="form-row">
+          <select className="input" value={memberId ?? ''} onChange={(event) => setMemberId(Number(event.target.value))}>
+            {members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}
+          </select>
           <input
             className="input"
             placeholder="you@gmail.com"

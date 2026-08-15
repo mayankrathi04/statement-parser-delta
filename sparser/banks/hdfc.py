@@ -1,101 +1,30 @@
-"""Parsers and canonical models for deposit-account statements.
+"""HDFC Bank savings/current account statements (current and legacy layouts).
 
-Bank accounts deliberately use a separate model from credit cards. A bank row has
-a value date, cheque/reference number and running balance; forcing those fields
-through the card schema would make both storage formats less honest.
+HDFC draws no column rules, so the columns are measured from the table's own
+header row and the rows from the dates in the first column.
 """
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
-from typing import Optional
 
 import pdfplumber
-from pydantic import BaseModel, ConfigDict, Field
 
-from .schema import Check, TxnType
-
-
-class UnsupportedBankStatement(RuntimeError):
-    """Raised when a bank statement has no installed parser."""
-
-
-class BankTransaction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    date: dt.date
-    value_date: Optional[dt.date] = None
-    description: str
-    reference: Optional[str] = None
-    amount: Decimal = Field(description="Positive transaction magnitude")
-    type: TxnType
-    balance: Decimal
-    page: int = 0
-    raw: str = ""
-
-    @property
-    def signed(self) -> Decimal:
-        """Credits increase a bank balance; debits decrease it."""
-        return self.amount if self.type is TxnType.CREDIT else -self.amount
-
-
-class BankStatement(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    parser_id: str
-    bank_code: str
-    bank_name: str
-    account_holder: Optional[str] = None
-    account_number: str = Field(exclude=True, repr=False)
-    account_type: Optional[str] = None
-    product: Optional[str] = None
-    branch: Optional[str] = None
-    period_start: dt.date
-    period_end: dt.date
-    currency: str = "INR"
-    transactions: list[BankTransaction] = Field(default_factory=list)
-    checks: list[Check] = Field(default_factory=list)
-    source_file: str = ""
-
-    @property
-    def account_fingerprint(self) -> str:
-        raw = f"{self.bank_code}:{re.sub(r'\D', '', self.account_number)}"
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    @property
-    def last4(self) -> str:
-        return re.sub(r"\D", "", self.account_number)[-4:]
-
-    @property
-    def masked_number(self) -> str:
-        return f"•••• {self.last4}"
-
-    @property
-    def confidence(self) -> float:
-        if not self.checks:
-            return 0.0
-        weights = {"error": 1.0, "warning": 0.3}
-        total = sum(weights.get(c.severity, 1.0) for c in self.checks)
-        got = sum(weights.get(c.severity, 1.0) for c in self.checks if c.passed)
-        return round(got / total, 4) if total else 0.0
-
-    @property
-    def opening_balance(self) -> Optional[Decimal]:
-        if not self.transactions:
-            return None
-        first = self.transactions[0]
-        return first.balance - first.signed
-
-    @property
-    def closing_balance(self) -> Optional[Decimal]:
-        return self.transactions[-1].balance if self.transactions else None
-
+from ..schema import TxnType
+from .base import (
+    MONEY,
+    BankStatement,
+    BankTransaction,
+    UnsupportedBankStatement,
+    checks,
+    line_groups,
+    line_text,
+    money,
+)
 
 _DATE = re.compile(r"^\d{2}/\d{2}/(?:\d{4}|\d{2})$")
-_MONEY = re.compile(r"^-?[\d,]+\.\d{2}$")
 
 
 def _date(value: str) -> dt.date:
@@ -105,13 +34,6 @@ def _date(value: str) -> dt.date:
         except ValueError:
             pass
     raise ValueError(f"invalid statement date {value!r}")
-
-
-def _money(value: str) -> Decimal:
-    try:
-        return Decimal(value.replace(",", "").strip())
-    except InvalidOperation as exc:
-        raise ValueError(f"invalid statement amount {value!r}") from exc
 
 
 def _match(text: str, pattern: str, label: str) -> str:
@@ -127,9 +49,11 @@ def _metadata(page_text: str) -> dict:
         r"Account\s*(?:number|No\.?)[ \t]*:[ \t]*([0-9][0-9 ]{5,})",
         "account number",
     )
+    # Some HDFC layouts print "From : 01/08/2025 To 31/08/2025" with no colon
+    # after "To", so the separator is optional.
     period = re.search(
         r"(?:Statement\s+)?From\s*:\s*(\d{2}/\d{2}/(?:\d{4}|\d{2}))"
-        r"\s+(?:TO|To)\s*:\s*(\d{2}/\d{2}/(?:\d{4}|\d{2}))",
+        r"\s+(?:TO|To)\s*:?\s*(\d{2}/\d{2}/(?:\d{4}|\d{2}))",
         page_text,
         re.I,
     )
@@ -158,20 +82,9 @@ def _metadata(page_text: str) -> dict:
     }
 
 
-def _line_groups(words: list[dict], tolerance: float = 2.0) -> list[list[dict]]:
-    lines: list[list[dict]] = []
-    for word in sorted(words, key=lambda w: (w["top"], w["x0"])):
-        line = next((row for row in reversed(lines[-4:]) if abs(row[0]["top"] - word["top"]) <= tolerance), None)
-        if line is None:
-            lines.append([word])
-        else:
-            line.append(word)
-    return lines
-
-
 def _columns(first_page) -> dict[str, float]:
     words = first_page.extract_words(x_tolerance=1, y_tolerance=2)
-    for line in _line_groups(words):
+    for line in line_groups(words):
         labels = " ".join(w["text"] for w in line).lower()
         if "narration" not in labels or "closing" not in labels:
             continue
@@ -211,14 +124,7 @@ def _columns(first_page) -> dict[str, float]:
     raise UnsupportedBankStatement("HDFC transaction table header was not found")
 
 
-def _words_text(words: list[dict]) -> str:
-    if not words:
-        return ""
-    rows = _line_groups(words)
-    text = " ".join(
-        " ".join(w["text"] for w in sorted(row, key=lambda item: item["x0"]))
-        for row in rows
-    )
+def _repair(text: str) -> str:
     # The newer PDF breaks rail names exactly at the column edge ("H DFC" and
     # "UP I"). Repair only these unmistakable fragments; ordinary names keep
     # their spaces.
@@ -227,8 +133,100 @@ def _words_text(words: list[dict]) -> str:
     return " ".join(text.split()).strip()
 
 
+def _words_text(words: list[dict]) -> str:
+    if not words:
+        return ""
+    return _repair(" ".join(line_text(row) for row in line_groups(words)))
+
+
+#: HDFC chops a narration into fixed-width chunks before the PDF lays them out,
+#: so a chunk boundary can fall inside a token.
+_NARRATION_WRAP = 40
+
+
+def _narration_text(words: list[dict]) -> str:
+    """Rejoin a narration that was wrapped across several printed lines.
+
+    The narration is cut into 40-character chunks first; only then may the PDF
+    break a chunk over more than one printed line, and it does that at a space.
+    Joining every printed line with a space therefore invents a space wherever a
+    chunk boundary landed mid-token ("…@OKHDFCBA NK-HDFC0004821…" for what the
+    bank actually sent as "…@OKHDFCBANK-HDFC0004821…"). Rebuild the chunks, then
+    concatenate: a chunk that reassembles to exactly 40 characters was cut
+    mid-token and abuts the next one, while 39 means the 40th character was a
+    space the layout dropped. Anything else is a chunk this rule does not
+    explain — a lone space is the safe join there.
+    """
+    if not words:
+        return ""
+    chunks: list[str] = []
+    buffer = ""
+    for row in line_groups(words):
+        line = line_text(row)
+        buffer = f"{buffer} {line}" if buffer else line
+        if len(buffer) >= _NARRATION_WRAP - 1:
+            chunks.append(buffer)
+            buffer = ""
+    if buffer:
+        chunks.append(buffer)
+
+    text = ""
+    for index, chunk in enumerate(chunks):
+        if index and len(chunks[index - 1]) != _NARRATION_WRAP:
+            text += " "
+        text += chunk
+    return _repair(text)
+
+
+#: Every HDFC layout closes its transaction pages with the same disclaimer block.
+#: Matched against a whole printed line, so a merchant named after one of these
+#: phrases cannot trip it.
+_FOOTER_MARKERS = re.compile(
+    r"closing\s+balance\s+includes\s+funds"
+    r"|contents\s+of\s+this\s+statement"
+    r"|registered\s+office\s+address"
+    r"|gstin\s+number\s+details"
+    r"|state\s+account\s+branch\s+gst"
+    r"|generation\s+date\s*:"
+    r"|^hdfc\s+bank\s+limited$",
+    re.I,
+)
+
+
+def _body_bottom(page, words: list[dict]) -> float:
+    """Y coordinate where the transaction table ends and the page footer begins.
+
+    The last dated row on a page has no following row to close its band, so the
+    band runs on into the disclaimer block and the narration column collects
+    "BANK LIMITED balance includes funds earmarked for hold and uncleared funds".
+    Three independent bounds, whichever is highest: the table's bottom rule, the
+    first footer line, and the original blind margin as a floor.
+    """
+    height = float(page.height)
+    limits = [height - 45]
+    # The bottom rule is a hint, not a requirement: one layout draws the table
+    # without ruling lines at all, and the footer text alone bounds those pages.
+    rules = [
+        float(rect["top"]) for rect in getattr(page, "rects", ())
+        if abs(float(rect["bottom"]) - float(rect["top"])) < 2
+        and float(rect["x1"]) - float(rect["x0"]) > float(page.width) * 0.7
+    ]
+    if rules:
+        limits.append(max(rules))
+    # Only the lower half is searched: page one prints the bank's own name and
+    # address above the table, and that is not a footer.
+    footer = [w for w in words if float(w["top"]) > height * 0.5]
+    limits.extend(
+        float(row[0]["top"]) for row in line_groups(footer)
+        if _FOOTER_MARKERS.search(line_text(row).strip())
+    )
+    return min(limits)
+
+
 def _page_transactions(page, page_number: int, columns: dict[str, float]) -> list[BankTransaction]:
     words = page.extract_words(x_tolerance=1, y_tolerance=2)
+    bottom = _body_bottom(page, words)
+    words = [w for w in words if float(w["top"]) < bottom]
     date_words = [
         w for w in words
         if _DATE.match(w["text"]) and float(w["x0"]) < columns["narration_left"]
@@ -251,20 +249,24 @@ def _page_transactions(page, page_number: int, columns: dict[str, float]) -> lis
             )
             upper = (
                 (top + float(date_words[index + 1]["top"])) / 2
-                if index + 1 < len(date_words) else min(float(page.height) - 45, top + 80)
+                if index + 1 < len(date_words) else min(bottom, top + 80)
             )
         else:
             lower = top - 2.5
             upper = (
                 float(date_words[index + 1]["top"]) - 2.5
-                if index + 1 < len(date_words) else min(float(page.height) - 45, top + 100)
+                if index + 1 < len(date_words) else min(bottom, top + 100)
             )
         band = [w for w in words if lower <= float(w["top"]) < upper]
         on_line = [w for w in band if abs(float(w["top"]) - top) <= 2.5]
 
-        narrative = _words_text([
+        # A long reference can start a hair left of the narration's right edge,
+        # so a word must also *end* before the reference column to count as
+        # narration. Testing x0 alone appends "…0000CMS0000000000" to the text.
+        narrative = _narration_text([
             w for w in band
             if columns["narration_left"] <= float(w["x0"]) < columns["narration_right"]
+            and float(w["x1"]) <= columns["reference"]
         ])
         reference = _words_text([
             w for w in band
@@ -279,9 +281,9 @@ def _page_transactions(page, page_number: int, columns: dict[str, float]) -> lis
         def amount_between(left: float, right: float) -> Decimal:
             word = next((
                 w for w in on_line
-                if left <= float(w["x0"]) < right and _MONEY.match(w["text"])
+                if left <= float(w["x0"]) < right and MONEY.match(w["text"])
             ), None)
-            return _money(word["text"]) if word else Decimal("0")
+            return money(word["text"]) if word else Decimal("0")
 
         withdrawal = amount_between(columns["value_right"], columns["withdrawal_right"])
         deposit = amount_between(columns["withdrawal_right"], columns["deposit_right"])
@@ -317,48 +319,46 @@ def _page_transactions(page, page_number: int, columns: dict[str, float]) -> lis
     return result
 
 
-def _checks(stmt: BankStatement) -> list[Check]:
-    txns = stmt.transactions
-    balance_errors = 0
-    checked_transitions = 0
-    for previous, current in zip(txns, txns[1:]):
-        # Mini PDFs may contain selected page ranges from a much larger parent
-        # statement. A printed-page gap is not a failed balance transition.
-        if current.page not in (previous.page, previous.page + 1):
-            continue
-        checked_transitions += 1
-        if previous.balance + current.signed != current.balance:
-            balance_errors += 1
-    dates_in_period = all(stmt.period_start <= row.date <= stmt.period_end for row in txns)
-    directions_valid = all(row.amount > 0 for row in txns)
-    return [
-        Check(name="account identity", passed=bool(stmt.account_number and stmt.last4),
-              detail=f"HDFC account ending {stmt.last4}"),
-        Check(name="transactions found", passed=bool(txns),
-              detail=f"{len(txns)} transaction rows extracted"),
-        Check(name="transaction directions", passed=directions_valid,
-              detail="each row has exactly one positive withdrawal or deposit"),
-        Check(name="statement period", passed=dates_in_period,
-              detail=f"rows fall within {stmt.period_start} → {stmt.period_end}"),
-        Check(name="running balance", passed=balance_errors == 0,
-              detail=(f"all {checked_transitions} available adjacent balance transitions reconcile"
-                      if not balance_errors
-                      else f"{balance_errors} adjacent balance transition(s) do not reconcile")),
-    ]
+#: Enough to identify the issuer. The IFSC prefix is bank-assigned, so it holds on
+#: layouts that never spell the bank's name out — but it is only accepted as the
+#: account's *own* IFSC label, never a bare HDFC0… that could be a counterparty's
+#: code quoted inside another bank's statement.
+_HDFC_MARKERS = (r"HDFCBANKLIMITED", r"IFSC[:\s]*HDFC0\d{6}", r"HDFCBANK\.COM")
+
+#: Only the front matter is searched for the account header; beyond this the
+#: document is transaction pages and a miss is a genuine miss.
+_HEADER_SEARCH_PAGES = 5
 
 
-def parse_hdfc_bank_pdf(path: str | Path) -> BankStatement:
+def _anchor_page(document) -> int:
+    """Index of the page carrying the account header.
+
+    Statements that lead with an account-relationship summary put the header on
+    page 2, so it is found rather than assumed to be first.
+    """
+    for index, page in enumerate(document.pages[:_HEADER_SEARCH_PAGES]):
+        text = page.extract_text() or ""
+        has_account = re.search(r"Account\s*(?:number|No\.?)[ \t]*:[ \t]*[0-9]", text, re.I)
+        has_period = re.search(r"From\s*:\s*\d{2}/\d{2}/\d{2,4}\s+To\s*:?\s*\d{2}/\d{2}/\d{2,4}", text, re.I)
+        if has_account and has_period:
+            return index
+    return 0
+
+
+def parse(path: str | Path) -> BankStatement:
     """Parse the digital-text HDFC savings/current-account layouts in the samples."""
     source = Path(path)
     with pdfplumber.open(source) as document:
         if not document.pages:
             raise UnsupportedBankStatement("empty PDF")
-        first_text = document.pages[0].extract_text() or ""
+        anchor = _anchor_page(document)
+        first_text = document.pages[anchor].extract_text() or ""
         compact = re.sub(r"\s+", "", first_text.upper())
-        if "HDFCBANKLIMITED" not in compact or not re.search(r"ACCOUNT(?:NO|NUMBER)", compact):
-            raise UnsupportedBankStatement("only HDFC bank account statements are supported for now")
+        issuer = any(re.search(marker, compact) for marker in _HDFC_MARKERS)
+        if not issuer or not re.search(r"ACCOUNT(?:NO|NUMBER)", compact):
+            raise UnsupportedBankStatement("not an HDFC bank account statement")
         metadata = _metadata(first_text)
-        columns = _columns(document.pages[0])
+        columns = _columns(document.pages[anchor])
         transactions = []
         for physical_page, page in enumerate(document.pages, 1):
             page_text = page.extract_text() or ""
@@ -381,21 +381,5 @@ def parse_hdfc_bank_pdf(path: str | Path) -> BankStatement:
         source_file=source.name,
         **metadata,
     )
-    statement.checks = _checks(statement)
+    statement.checks = checks(statement)
     return statement
-
-
-# Bank dispatch is intentionally independent of the credit-card YAML engine.
-# Register the next bank here; a failed fingerprint falls through without
-# changing any card configuration or extraction code.
-BANK_PARSERS = (parse_hdfc_bank_pdf,)
-
-
-def parse_bank_pdf(path: str | Path) -> BankStatement:
-    errors: list[str] = []
-    for parser in BANK_PARSERS:
-        try:
-            return parser(path)
-        except UnsupportedBankStatement as exc:
-            errors.append(str(exc))
-    raise UnsupportedBankStatement("; ".join(errors) or "no bank statement parser matched")

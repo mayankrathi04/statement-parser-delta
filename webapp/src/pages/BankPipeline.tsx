@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
-import { api, type IngestFile, type Pending, type Run, type Step } from '../api'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { api, type IngestFile, type Member, type Pending, type Run, type Step } from '../api'
+import { importTarget } from '../lib/members'
 
 const COLOUR: Record<string, string> = {
   ok: 'var(--good)', done: 'var(--good)', failed: 'var(--crit)',
@@ -54,7 +55,14 @@ function Result({ file }: { file: IngestFile }) {
   )
 }
 
-export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
+export default function BankPipeline({
+  onChanged, roster, members,
+}: {
+  onChanged: () => void
+  roster: Member[]
+  members: Set<number>
+}) {
+  const target = useMemo(() => importTarget(roster, members), [roster, members])
   const [uploads, setUploads] = useState<File[]>([])
   const [password, setPassword] = useState('')
   const [runs, setRuns] = useState<Run[]>([])
@@ -63,6 +71,7 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
   const [pending, setPending] = useState<Pending[]>([])
   const [picked, setPicked] = useState<Set<number>>(new Set())
   const [busy, setBusy] = useState(false)
+  const [followLatest, setFollowLatest] = useState(false)
   const [sending, setSending] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -73,12 +82,20 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
       setRuns(state.runs)
       setPending(review.pending)
       setBusy(state.busy)
-      setCurrent((selected) => selected ?? state.runs[0]?.id ?? null)
-      if (!state.busy) onChanged()
+      // After starting work, track the newest run until the pipeline goes idle: the
+      // run row often does not exist yet the moment the request returns, and a plain
+      // `selected ?? newest` would then pin the view to the *previous* run forever.
+      setCurrent((selected) => (
+        followLatest ? state.runs[0]?.id ?? selected : selected ?? state.runs[0]?.id ?? null
+      ))
+      if (!state.busy) {
+        setFollowLatest(false)
+        onChanged()
+      }
     } catch (caught) {
       setError(String((caught as Error).message))
     }
-  }, [onChanged])
+  }, [onChanged, followLatest])
 
   useEffect(() => {
     setPicked((current) => {
@@ -97,7 +114,11 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
   useEffect(() => {
     if (current == null) { setResults([]); return }
     api.bankRun(current).then((detail) => setResults(detail.files))
-      .catch((caught) => setError(String((caught as Error).message)))
+      .catch((caught) => {
+        // Drop the previous run's files rather than showing them under this one.
+        setResults([])
+        setError(String((caught as Error).message))
+      })
   }, [current, busy])
 
   const upload = async () => {
@@ -105,11 +126,14 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
     setError(null)
     setMessage(null)
     try {
-      const response = await api.uploadBankStatements(uploads, password)
-      setMessage(`${response.files.length} statement${response.files.length === 1 ? '' : 's'} uploaded. Parsing has started.`)
+      const response = await api.uploadBankStatements(uploads, password, target.id)
+      setMessage(
+        `${response.files.length} statement${response.files.length === 1 ? '' : 's'} uploaded `
+        + `for ${target.name}. Parsing has started.`,
+      )
       setUploads([])
       setBusy(true)
-      setCurrent(null)
+      setFollowLatest(true)
       await refresh()
     } catch (caught) {
       setError(String((caught as Error).message))
@@ -127,10 +151,10 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
   const approve = async () => {
     setError(null)
     try {
-      await api.approveBankStatements([...picked], password)
+      await api.approveBankStatements([...picked], password, target.id)
       setMessage(`${picked.size} selected statement${picked.size === 1 ? '' : 's'} approved for import.`)
       setBusy(true)
-      setCurrent(null)
+      setFollowLatest(true)
       setPassword('')
       await refresh()
     } catch (caught) {
@@ -144,7 +168,7 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
       await api.reevaluateBankPending([], password)
       setMessage('Re-evaluating all pending bank statements with the current parser.')
       setBusy(true)
-      setCurrent(null)
+      setFollowLatest(true)
       await refresh()
     } catch (caught) {
       setError(String((caught as Error).message))
@@ -167,7 +191,8 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
       <section className="card">
         <h2>Upload bank statements</h2>
         <p className="hint">
-          This pipeline accepts digital-text HDFC account-statement PDFs. Files are classified,
+          This pipeline accepts digital-text HDFC, ICICI, IndusInd and IDFC FIRST
+          account-statement PDFs. Files are classified,
           parsed and balance-validated first. Nothing enters the bank ledger until you review the
           confidence and checks below and explicitly approve it.
         </p>
@@ -196,6 +221,15 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
             {sending ? 'Uploading…' : busy ? 'Pipeline busy…' : 'Upload and review'}
           </button>
         </div>
+        <p className="hint" style={{ marginBottom: 0 }}>
+          Filing under <b>{target.name}</b>
+          {target.explicit
+            ? ' — the member selected at the top of the page.'
+            : ' (your default member). To file these under someone else, pick that one member'
+              + ' in the selector at the top of the page before uploading.'}
+          {' '}A new account keeps this member; statements for an account you already
+          have stay with whoever owns it.
+        </p>
         {message && <div className="banner upload-message">{message}</div>}
         {error && <div className="banner upload-error">{error}</div>}
       </section>
@@ -230,7 +264,7 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
           <div className="tbl-wrap" style={{ marginTop: 12 }}>
             <table>
               <thead><tr>
-                <th style={{ width: 34 }}></th><th>Statement</th><th>Account</th>
+                <th style={{ width: 34 }}></th><th>Statement</th><th>Account</th><th>Member</th>
                 <th>Statement period</th><th style={{ textAlign: 'right' }}>Txns</th><th>Validation</th>
               </tr></thead>
               <tbody>
@@ -248,6 +282,7 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
                         {row.filename}{row.encrypted && <> <span className="pill">encrypted</span></>}
                       </td>
                       <td>{row.card ?? 'Unknown account'}</td>
+                      <td>{row.member_name ?? <span className="sub">{target.name}</span>}</td>
                       <td>{row.period_start && row.period_end ? `${row.period_start} → ${row.period_end}` : '—'}</td>
                       <td className="num">{row.txn_count ?? 0}</td>
                       <td>
@@ -307,7 +342,11 @@ export default function BankPipeline({ onChanged }: { onChanged: () => void }) {
         <section className="pipeline-detail">
           {busy && <div className="banner">A statement pipeline is running. Results refresh automatically.</div>}
           {results.map((file) => <Result key={file.id} file={file} />)}
-          {current != null && !results.length && <p className="empty">Waiting for file results…</p>}
+          {current != null && !results.length && (
+            <p className="empty">
+              {busy ? 'Waiting for file results…' : 'This run recorded no files.'}
+            </p>
+          )}
         </section>
       </div>
     </>

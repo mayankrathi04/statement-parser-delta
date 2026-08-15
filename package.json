@@ -1,0 +1,8 @@
+{
+  "name": "sparser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "./startServer.sh"
+  }
+}

@@ -85,6 +85,9 @@ def _gmail_search_query(
 class Account:
     address: str
     password: str
+    #: Household member this mailbox belongs to; statements fetched from it are
+    #: attributed to them. ``None`` for env-configured mailboxes, which have no owner.
+    member_id: Optional[int] = None
 
     @property
     def label(self) -> str:
@@ -128,7 +131,7 @@ def accounts_from_store(conn) -> list[Account]:
             continue
         secret = store_accounts.secret_for(conn, row["address"])
         if secret:
-            out.append(Account(row["address"], secret))
+            out.append(Account(row["address"], secret, row["member_id"]))
             seen.add(row["address"])
     for acct in accounts_from_env():
         if acct.address not in seen:

@@ -6,14 +6,22 @@ you can keep adding to. Every extraction is **proved by arithmetic** before it i
 Every statement in the regression corpus parses at 100% confidence, with every
 reconciliation check passing to the paisa.
 
+**`samples/` and `inbox/` hold different things.** `inbox/` is the archive: every PDF
+exactly as the mailbox delivered it, encrypted as the issuer sent it, named
+`YYYYMM_<mailbox>_<issuer's own attachment name>.pdf`. `samples/` is the regression
+corpus, and its files carry that same name so a statement is recognisable in both —
+but decrypted, because the golden tests must run without your PDF passwords or your
+database. Some card statements therefore exist in both folders, same
+name, same statement, one of them openable.
+
 ## Quick start
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e .
 cd webapp && npm install && npm run build && cd ..     # build the UI once
 
-.venv/bin/python -m sparser import samples --db statements.db
-.venv/bin/python -m sparser serve  --db statements.db   # → http://127.0.0.1:8770
+.venv/bin/python -m sparser import samples --db data/statements.db
+.venv/bin/python -m sparser serve  --db data/statements.db   # → http://127.0.0.1:8770
 ```
 
 ## Running it
@@ -53,7 +61,8 @@ confidence, and whether it is already in the database — then tick what to impo
 or discard. Every PDF's journey is recorded step by step:
 
 ```
-statement.pdf  Example Bank Card   hdfc_cc_v1   42 txns   100% confidence
+202501_mailbox_Credit_Card_Statement.pdf
+  Example Bank Card   hdfc_cc_v1   42 txns   100% confidence
   1. download     skipped  already on disk
   2. decrypt      skipped  not password protected
   3. classify     ok       3 pages, 7,168 chars — digital text layer
@@ -76,11 +85,11 @@ copied into account records: identity uses a one-way fingerprint and display use
 the last four digits. Expanded rows show every imported statement's declared period,
 transaction coverage, totals, balances and source file.
 
-**Bank Pipeline** — upload-only for now. HDFC digital-text account statements are
-classified, reconstructed from PDF geometry, checked against every adjacent running
-balance, then held for review with confidence, checks, period, row count and duplicate
-status. Only selected statements are written to the bank ledger. Its run history is
-separate from card runs.
+**Bank Pipeline** — upload-only for now. Digital-text account statements from **HDFC,
+ICICI, IndusInd and IDFC FIRST** are classified, reconstructed from PDF geometry, checked
+against every adjacent running balance, then held for review with confidence, checks,
+period, row count and duplicate status. Only selected statements are written to the
+bank ledger. Its run history is separate from card runs.
 
 **Nothing ever duplicates.** A card statement is keyed by card and billing cycle;
 a bank statement by account fingerprint and statement period. Re-fetching a cycle
@@ -131,6 +140,20 @@ overrides, deliberately).
 - **Optional columns** — `"rewards?"` plus `||` band fallbacks let one template cover
   a card family whose members print different columns.
 - **Settlement lag** — a card bills on posting date but prints transaction date.
+- **Hard-wrapped narrations** — IndusInd cuts a UPI string at the column edge,
+  mid-token; joining those lines with a space invents a handle nobody typed. A line
+  that stops short of the edge ended on its own, and only that break was a space.
+- **Permanently masked account numbers** — IndusInd never prints more than
+  `50XXXXXXX123`. Stripping the mask out would splice the leading digits onto the
+  trailing ones and show an ending the customer has never seen, so only the visible
+  tail is used.
+- **Consolidated statements** — one IDFC FIRST PDF can carry several accounts; rows
+  are read only from the section belonging to the account being imported.
+- **Remarks that start above their own date** — ICICI sizes each row to its remark and
+  prints the dated line five points below the band's top, so proximity to a date hands
+  the first line to the row above. Its ruled row boxes settle it instead.
+- **A balance of exactly 0.00** — a real balance on an account emptied to the paisa, so
+  a row is judged on whether the figure was *printed*, never on its value.
 - **Marketing copy stealing anchors** — label matching is case-sensitive, or "For
   hassle free *payments*…" hijacks the `Payments` anchor.
 
@@ -149,7 +172,12 @@ sparser/
 ├── enrich.py     merchant names and categories
 ├── pipeline.py   ingest orchestration + recorded audit trail
 ├── store.py      SQLite; money as integer paise
-├── bank_parser.py   HDFC bank geometry parser + bank models
+├── banks/        one module per bank + shared bank models and geometry
+│   ├── base.py       canonical bank row, the checks, ruled-table primitives
+│   ├── hdfc.py       columns measured from the header row (no rules drawn)
+│   ├── indusind.py   ruled columns; masked account number; hard-wrapped narrations
+│   ├── idfc.py       fully ruled table; consolidated multi-account statements
+│   └── icici.py      fully ruled table; remarks start above their own dated line
 ├── bank_pipeline.py upload-only bank ingest, separate from card templates
 ├── bank_store.py    bank accounts/statements/transactions + cash-flow analytics
 ├── api.py        FastAPI
@@ -182,6 +210,25 @@ bands:
   amount:      ["rewards.x1 + 8 || amount.x0 - 30", "pi.x0 - 4"]
 ```
 
+### Adding a bank
+
+Deposit accounts do **not** go through the YAML engine, and that is deliberate: a
+card statement is a summary table the issuer reconciles for you, while a bank
+statement is a running ledger whose only proof is that every row moves the printed
+balance exactly as stated. So each bank gets a module in `sparser/banks/`, exporting
+one `parse(path)` that recognises its own statements and raises
+`UnsupportedBankStatement` for everything else — then it is added to `BANK_PARSERS`,
+which tries each parser in turn. Nothing else in the app changes; the models, the
+five checks and the ruled-table geometry come from `banks/base.py`.
+
+The layouts differ more than card templates do. HDFC draws no column rules, so its
+columns are measured from the table's header. IndusInd, IDFC FIRST and ICICI draw
+them, so their cells are cut on the bank's own lines — exact where a midpoint between
+two headings is not, since right-aligned amounts drift left as they gain digits. Where
+a bank rules its rows too, a row's cell *is* the transaction; columns are named by the
+header word printed inside them, so a layout can add a serial-number or cheque column
+without renumbering everything after it.
+
 ### The fallback ladder
 
 ```
@@ -198,9 +245,9 @@ issuer. Its output is always flagged, since it has no issuer totals to reconcile
 
 ```bash
 python -m sparser parse  stmt.pdf -o out.xlsx        # xlsx / csv / json
-python -m sparser import samples --db statements.db  # into the store
+python -m sparser import samples --db data/statements.db  # into the store
 python -m sparser fetch  --months 1                  # Gmail → parse → store
-python -m sparser serve  --db statements.db          # dashboard + API
+python -m sparser serve  --db data/statements.db          # dashboard + API
 ```
 
 Encrypted statements: `--password SECRET`, or derive them with
@@ -233,7 +280,7 @@ accept this stdio server shape:
       "command": "/ABSOLUTE/PATH/statement-parser-delta/.venv/bin/python",
       "args": ["-m", "sparser.mcp_server"],
       "env": {
-        "SPARSER_DB": "/ABSOLUTE/PATH/statement-parser-delta/statements.db"
+        "SPARSER_DB": "/ABSOLUTE/PATH/statement-parser-delta/data/statements.db"
       }
     }
   }
@@ -248,7 +295,7 @@ command = "/ABSOLUTE/PATH/statement-parser-delta/.venv/bin/python"
 args = ["-m", "sparser.mcp_server"]
 
 [mcp_servers.statement-analytics.env]
-SPARSER_DB = "/ABSOLUTE/PATH/statement-parser-delta/statements.db"
+SPARSER_DB = "/ABSOLUTE/PATH/statement-parser-delta/data/statements.db"
 ```
 
 The repository's [.mcp.json](.mcp.json) is ready for clients launched from the
