@@ -3,14 +3,14 @@ import { api, type IngestFile, type Member, type Pending, type Run, type Step } 
 import { importTarget } from '../lib/members'
 
 const COLOUR: Record<string, string> = {
-  ok: 'var(--good)', done: 'var(--good)', failed: 'var(--crit)',
-  skipped: 'var(--axis)', pending: 'var(--warn)', warning: 'var(--warn)', running: 'var(--warn)',
+  ok: 'var(--success-fill)', done: 'var(--success-fill)', failed: 'var(--critical)',
+  skipped: 'var(--baseline)', pending: 'var(--warning)', warning: 'var(--warning)', running: 'var(--warning)',
 }
 
 function StepRow({ step }: { step: Step }) {
   return (
     <div className="step-row">
-      <span className="dot" style={{ background: COLOUR[step.status] ?? 'var(--muted)' }} />
+      <span className="dot" style={{ background: COLOUR[step.status] ?? 'var(--text-muted)' }} />
       <span className="step-name">{step.name}</span>
       <span className="step-detail">
         {step.detail}{step.ms != null && step.ms > 0 ? ` · ${step.ms} ms` : ''}
@@ -24,7 +24,7 @@ function Result({ file }: { file: IngestFile }) {
   return (
     <div className="card" style={{ marginBottom: 10 }}>
       <div className="file-head" onClick={() => setOpen((value) => !value)}>
-        <span className="dot" style={{ background: COLOUR[file.status] ?? 'var(--muted)' }} />
+        <span className="dot" style={{ background: COLOUR[file.status] ?? 'var(--text-muted)' }} />
         <span className="file-name">{file.filename}</span>
         {file.card && <span className="badge">{file.card}</span>}
         {file.template_id && <span className="badge">{file.template_id}</span>}
@@ -235,7 +235,7 @@ export default function BankPipeline({
       </section>
 
       {!!pending.length && (
-        <section className="card" style={{ borderColor: 'var(--warn)' }}>
+        <section className="card" style={{ borderColor: 'var(--warning)' }}>
           <div className="section-head">
             <div>
               <h2>
@@ -289,8 +289,8 @@ export default function BankPipeline({
                         <span
                           className="badge"
                           style={{
-                            color: row.confidence === 1 ? 'var(--good-ink)' : 'var(--crit)',
-                            borderColor: row.confidence === 1 ? 'var(--good)' : 'var(--crit)',
+                            color: row.confidence === 1 ? 'var(--success)' : 'var(--critical)',
+                            borderColor: row.confidence === 1 ? 'var(--success-fill)' : 'var(--critical)',
                           }}
                         >
                           {row.confidence == null ? 'failed' : `${Math.round(row.confidence * 100)}%`} ·{' '}
@@ -327,7 +327,7 @@ export default function BankPipeline({
               className={`run-row ${current === run.id ? 'selected' : ''}`}
               key={run.id} onClick={() => setCurrent(run.id)}
             >
-              <span className="dot" style={{ background: COLOUR[run.status] ?? 'var(--muted)' }} />
+              <span className="dot" style={{ background: COLOUR[run.status] ?? 'var(--text-muted)' }} />
               <span>
                 <b>Run #{run.id}</b><br />
                 <span className="sub">{run.started_at.replace('T', ' ')} · {run.note}</span>

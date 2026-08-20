@@ -4,7 +4,7 @@ import { money0, money2 } from '../lib/format'
 
 /* Categorical slots in fixed order — a series' colour follows the entity, never
    its rank, so filtering never repaints the survivors. */
-export const SERIES = ['--s1', '--s2', '--s3', '--s4', '--s5', '--s6', '--s7', '--s8']
+export const SERIES = ['--series-1', '--series-2', '--series-3', '--series-4', '--series-5', '--series-6', '--series-7', '--series-8']
 export const seriesVar = (i: number) => `var(${SERIES[i % SERIES.length]})`
 
 type TipState = { html: ReactNode; x: number; y: number } | null
@@ -72,7 +72,7 @@ export function RankBars({
               <>
                 <div>{r.label}</div>
                 <b>{tipValue(r.value)}</b>
-                <div style={{ color: 'var(--muted)' }}>{detail(r)}</div>
+                <div style={{ color: 'var(--text-muted)' }}>{detail(r)}</div>
               </>,
             )}
           >
@@ -82,7 +82,7 @@ export function RankBars({
                 className="rank-fill"
                 style={{
                   width: `${Math.max(1.5, (r.value / max) * 100)}%`,
-                  background: colour ? colour(r, i) : 'var(--s1)',
+                  background: colour ? colour(r, i) : 'var(--series-1)',
                 }}
               />
             </span>
@@ -134,7 +134,7 @@ export function NetBars({
                 <>
                   <div>{r.label}</div>
                   <b>{tipValue(r.value)}</b>
-                  <div style={{ color: 'var(--muted)' }}>
+                  <div style={{ color: 'var(--text-muted)' }}>
                     {inflow ? 'net inflow' : 'net outflow'} · {detail(r)}
                   </div>
                 </>,
@@ -236,14 +236,14 @@ export function MonthlyBars({
               {...bind(
                 <>
                   <div style={{ marginBottom: 4 }}>{r.month}</div>
-                  <div><i className="swatch" style={{ background: 'var(--s1)' }} /> {leftLabel} <b>{money2(r.spend)}</b></div>
-                  <div><i className="swatch" style={{ background: 'var(--s2)' }} /> {rightLabel} <b>{money2(r.payments)}</b></div>
+                  <div><i className="swatch" style={{ background: 'var(--series-1)' }} /> {leftLabel} <b>{money2(r.spend)}</b></div>
+                  <div><i className="swatch" style={{ background: 'var(--series-2)' }} /> {rightLabel} <b>{money2(r.payments)}</b></div>
                 </>,
               )}
             >
               {/* 2px gap between adjacent fills keeps the pair readable */}
-              <rect x={cx - bw - 1} y={padT + ih - hS} width={bw} height={hS} rx={4} fill="var(--s1)" />
-              <rect x={cx + 1} y={padT + ih - hP} width={bw} height={hP} rx={4} fill="var(--s2)" />
+              <rect x={cx - bw - 1} y={padT + ih - hS} width={bw} height={hS} rx={4} fill="var(--series-1)" />
+              <rect x={cx + 1} y={padT + ih - hP} width={bw} height={hP} rx={4} fill="var(--series-2)" />
               {/* Rotated about its own anchor, so the label hangs below the
                   axis and stays centred on the pair it belongs to. */}
               <text
@@ -259,7 +259,7 @@ export function MonthlyBars({
             </g>
           )
         })}
-        <line x1={padL} x2={W - padR} y1={padT + ih} y2={padT + ih} stroke="var(--axis)" />
+        <line x1={padL} x2={W - padR} y1={padT + ih} y2={padT + ih} stroke="var(--baseline)" />
       </svg>
       <Tooltip tip={tip} />
     </>

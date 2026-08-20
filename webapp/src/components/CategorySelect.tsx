@@ -73,7 +73,7 @@ export default function CategorySelect({
                 onChange={toggleAll}
               />
               <b>Select all</b>
-              <span style={{ marginLeft: 'auto', color: 'var(--muted)', fontSize: 12 }}>
+              <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 12 }}>
                 {selected.size}/{categories.length}
               </span>
             </label>
@@ -86,7 +86,7 @@ export default function CategorySelect({
                 onChange={() => toggle(category.name)}
               />
               <span>{category.name}</span>
-              <span style={{ marginLeft: 'auto', color: 'var(--muted)', fontSize: 12 }}>
+              <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 12 }}>
                 {category.n}
               </span>
             </label>

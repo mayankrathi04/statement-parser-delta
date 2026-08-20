@@ -4,6 +4,7 @@ import {
 } from '../api'
 import CardSelect from '../components/CardSelect'
 import CategorySelect from '../components/CategorySelect'
+import IconButton from '../components/IconButton'
 import { MonthlyBars, RankBars, seriesVar } from '../components/Charts'
 import { reconcileSelection, useCategoryOptions } from '../lib/categories'
 import { money0, money2, monthsBefore } from '../lib/format'
@@ -17,7 +18,8 @@ const RANGES: { label: string; months: number }[] = [
   { label: 'All', months: 0 },
 ]
 
-type SortKey = 'txn_date' | 'statement_month' | 'amount' | 'merchant' | 'category' | 'card'
+type SortKey =
+  | 'txn_date' | 'statement_month' | 'debit' | 'credit' | 'merchant' | 'category' | 'card'
 type ForeignSortKey = 'original' | 'billed'
 type PageSize = 25 | 50 | 75 | 'all'
 
@@ -153,8 +155,18 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
       : txns
     const { key, dir } = sort
     return [...filtered].sort((a, b) => {
-      const x = key === 'amount' ? a.amount : String(a[key] ?? '')
-      const y = key === 'amount' ? b.amount : String(b[key] ?? '')
+      if (key === 'debit' || key === 'credit') {
+        // Rows of the other direction have no value in this column, so they sink
+        // to the bottom whichever way the column is sorted.
+        const amount = (row: Txn) => (row.direction === key ? row.amount : null)
+        const left = amount(a)
+        const right = amount(b)
+        if (left == null) return right == null ? 0 : 1
+        if (right == null) return -1
+        return (left - right) * dir
+      }
+      const x = String(a[key] ?? '')
+      const y = String(b[key] ?? '')
       return (x < y ? -1 : x > y ? 1 : 0) * dir
     })
   }, [txns, q, sort])
@@ -236,8 +248,9 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
   const fcyPager = usePagination(fcyRows, JSON.stringify([filters, foreignSort]))
   const txnPager = usePagination(rows, JSON.stringify([filters, q, sort]))
 
-  const head = (key: SortKey, label: string, right = false) => (
+  const head = (key: SortKey, label: string, right = false, wrapped = false) => (
     <th
+      className={wrapped ? 'wrapped' : undefined}
       style={{ cursor: 'pointer', textAlign: right ? 'right' : 'left' }}
       onClick={() => setSort((s) => ({ key, dir: s.key === key && s.dir === -1 ? 1 : -1 }))}
     >
@@ -316,8 +329,8 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
           EMI principal and conversion bookkeeping are excluded, so a purchase counts once.
         </p>
         <div className="legend">
-          <span><i className="swatch" style={{ background: 'var(--s1)' }} />Spend</span>
-          <span><i className="swatch" style={{ background: 'var(--s2)' }} />Payments &amp; credits</span>
+          <span><i className="swatch" style={{ background: 'var(--series-1)' }} />Spend</span>
+          <span><i className="swatch" style={{ background: 'var(--series-2)' }} />Payments &amp; credits</span>
         </div>
         <MonthlyBars rows={data?.monthly ?? []} />
       </section>
@@ -344,40 +357,51 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
       {/* Reward points, EMIs and foreign-currency legs are separate ledgers from
           rupee spend — folding them into the same totals would be nonsense, so
           each gets its own section. */}
+      {/* The per-card ranking and the month-by-month ledger are two readings of
+          the same points, so they sit side by side rather than stacked — the
+          section costs one screen of height instead of two. */}
       {!!data?.rewards.by_card.length && (
-        <section className="card">
-          <h2>
-            Reward points <span className="pill">{data.rewards.total_points.toLocaleString('en-IN')} pts</span>
-          </h2>
-          <p className="hint">
-            Points printed on the statement, earned across {data.rewards.earning_txns} transactions.
-            Programmes differ per card, so points are never summed into a rupee value.
-          </p>
-          <RankBars
-            rows={data.rewards.by_card.map((r) => ({
-              label: r.label, value: r.points, n: r.n, card_id: r.card_id,
-            }))}
-            colour={(r) => colourOf(r.card_id ?? 0)}
-            format={(v) => `${v.toLocaleString('en-IN')} pts`}
-            tipValue={(v) => `${v.toLocaleString('en-IN')} points`}
-            detail={(r) => `${r.n} earning transaction${r.n === 1 ? '' : 's'}`}
-            empty="No reward points in this range."
-          />
-          <div className="tbl-wrap tbl-scroll" style={{ marginTop: 12 }}>
-            <table>
-              <thead><tr><th>Month</th><th style={{ textAlign: 'right' }}>Points earned</th></tr></thead>
-              <tbody>
-                {rewardPager.rows.map((m) => (
-                  <tr key={m.month}>
-                    <td>{m.month}</td>
-                    <td className="num">{m.points.toLocaleString('en-IN')}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <TablePager count={rewardRows.length} {...rewardPager} />
-        </section>
+        <div className="grid2">
+          <section className="card">
+            <h2>
+              Reward points <span className="pill">{data.rewards.total_points.toLocaleString('en-IN')} pts</span>
+            </h2>
+            <p className="hint">
+              Points printed on the statement, earned across {data.rewards.earning_txns} transactions.
+              Programmes differ per card, so points are never summed into a rupee value.
+            </p>
+            <RankBars
+              rows={data.rewards.by_card.map((r) => ({
+                label: r.label, value: r.points, n: r.n, card_id: r.card_id,
+              }))}
+              colour={(r) => colourOf(r.card_id ?? 0)}
+              format={(v) => `${v.toLocaleString('en-IN')} pts`}
+              tipValue={(v) => `${v.toLocaleString('en-IN')} points`}
+              detail={(r) => `${r.n} earning transaction${r.n === 1 ? '' : 's'}`}
+              empty="No reward points in this range."
+            />
+          </section>
+          <section className="card">
+            <h2>Points by month</h2>
+            <p className="hint">
+              Grouped by the month of the earning transaction, oldest first.
+            </p>
+            <div className="tbl-wrap tbl-scroll">
+              <table>
+                <thead><tr><th>Month</th><th style={{ textAlign: 'right' }}>Points earned</th></tr></thead>
+                <tbody>
+                  {rewardPager.rows.map((m) => (
+                    <tr key={m.month}>
+                      <td>{m.month}</td>
+                      <td className="num">{m.points.toLocaleString('en-IN')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <TablePager count={rewardRows.length} {...rewardPager} />
+          </section>
+        </div>
       )}
 
       {!!data?.emi.count && (
@@ -462,12 +486,15 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <div>
             <h2>All transactions <span className="pill">{rows.length} rows</span></h2>
-            <p className="hint">Every line behind the totals above. Click a heading to sort.</p>
+            <p className="hint">
+            Every line behind the totals above, with debits and credits in separate columns.
+            Click a heading to sort.
+          </p>
           </div>
           <span className="spacer" />
           <input
             className="dates"
-            style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', minWidth: 200 }}
+            style={{ background: 'var(--surface-1)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', minWidth: 200 }}
             placeholder="Search description, merchant…"
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -526,12 +553,13 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
               <tr>
                 <th style={{ width: 30 }} aria-label="Select" />
                 {head('txn_date', 'Date')}
-                {head('statement_month', 'Applied statement')}
+                {head('statement_month', 'Applied statement', false, true)}
                 <th>Description</th>
-                {head('merchant', 'Merchant')}
+                {head('merchant', 'Merchant', false, true)}
                 {head('category', 'Category')}
-                {head('card', 'Card')}
-                {head('amount', 'Amount', true)}
+                {head('card', 'Card', false, true)}
+                {head('debit', 'Debit', true)}
+                {head('credit', 'Credit', true)}
               </tr>
             </thead>
             <tbody>
@@ -550,7 +578,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
                     />
                   </td>
                   <td>{r.txn_date}{r.txn_time ? ` ${r.txn_time}` : ''}</td>
-                  <td title={r.statement_period_start && r.statement_period_end
+                  <td className="wrapped" title={r.statement_period_start && r.statement_period_end
                     ? `${r.statement_period_start} → ${r.statement_period_end}` : undefined}>
                     {r.statement_month ?? '—'}
                   </td>
@@ -560,7 +588,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
                     {r.fcy_currency && <> <span className="pill">{r.fcy_currency} {r.fcy_amount}</span></>}
                     {r.reward_points ? <> <span className="pill">+{r.reward_points} pts</span></> : null}
                   </td>
-                  <td>{r.merchant}</td>
+                  <td className="wrapped">{r.merchant}</td>
                   <td>
                     {editingCategory === r.id ? (
                       <form className="category-editor" onSubmit={(event) => {
@@ -573,14 +601,16 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
                           onChange={(event) => setCategoryDraft(event.target.value)}
                           aria-label={`Category for ${r.description}`}
                         />
-                        <button className="btn primary" disabled={bulkBusy}>Save</button>
+                        <IconButton label="Save" icon="save" type="submit" disabled={bulkBusy} />
                         {r.category_is_override && (
-                          <button type="button" className="btn" disabled={bulkBusy}
+                          <IconButton
+                            label="Automatic" icon="automatic" disabled={bulkBusy}
                             title={`Restore automatic category: ${r.derived_category}`}
-                            onClick={() => void applyCategory([r.id], null)}>Automatic</button>
+                            onClick={() => void applyCategory([r.id], null)}
+                          />
                         )}
-                        <button type="button" className="btn" disabled={bulkBusy}
-                          onClick={() => setEditingCategory(null)}>Cancel</button>
+                        <IconButton label="Cancel" icon="cancel" disabled={bulkBusy}
+                          onClick={() => setEditingCategory(null)} />
                       </form>
                     ) : (
                       <button
@@ -595,14 +625,15 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
                       </button>
                     )}
                   </td>
-                  <td><i className="swatch" style={{ background: colourOf(r.card_id) }} /> {r.card}</td>
-                  <td className={`num ${r.direction === 'credit' ? 'cre' : ''}`}>
-                    {r.direction === 'credit' ? '+' : ''}{money2(r.amount)}
+                  <td className="wrapped">
+                    <i className="swatch" style={{ background: colourOf(r.card_id) }} /> {r.card}
                   </td>
+                  <td className="num">{r.direction === 'debit' ? money2(r.amount) : '—'}</td>
+                  <td className="num cre">{r.direction === 'credit' ? money2(r.amount) : '—'}</td>
                 </tr>
               ))}
               {!rows.length && (
-                <tr><td colSpan={8} className="empty">Nothing matches these filters.</td></tr>
+                <tr><td colSpan={9} className="empty">Nothing matches these filters.</td></tr>
               )}
             </tbody>
           </table>

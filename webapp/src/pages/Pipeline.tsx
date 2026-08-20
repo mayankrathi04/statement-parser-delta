@@ -4,18 +4,19 @@ import {
   api, type Bootstrap, type IngestFile, type Mailbox, type Member, type Pending, type Run, type Step,
 } from '../api'
 import CardSelect from '../components/CardSelect'
+import { IconLink } from '../components/IconButton'
 import { pct } from '../lib/format'
 import { importTarget, type ImportTarget } from '../lib/members'
 
 const STATUS_COLOUR: Record<string, string> = {
-  ok: 'var(--good)',
-  approved: 'var(--good)',
-  running: 'var(--warn)',
-  pending: 'var(--warn)',
-  warning: 'var(--warn)',
-  skipped: 'var(--muted)',
-  failed: 'var(--crit)',
-  done: 'var(--good)',
+  ok: 'var(--success-fill)',
+  approved: 'var(--success-fill)',
+  running: 'var(--warning)',
+  pending: 'var(--warning)',
+  warning: 'var(--warning)',
+  skipped: 'var(--text-muted)',
+  failed: 'var(--critical)',
+  done: 'var(--success-fill)',
 }
 
 const STEP_BLURB: Record<string, string> = {
@@ -48,7 +49,7 @@ const SCAN_MODES: { value: ScanMode; label: string }[] = [
 ]
 
 function Dot({ status }: { status: string }) {
-  return <span className="dot" style={{ background: STATUS_COLOUR[status] ?? 'var(--muted)' }} />
+  return <span className="dot" style={{ background: STATUS_COLOUR[status] ?? 'var(--text-muted)' }} />
 }
 
 function StepRow({ step }: { step: Step }) {
@@ -58,7 +59,7 @@ function StepRow({ step }: { step: Step }) {
       <span className="step-name">{step.name}</span>
       <span className="step-detail">
         {step.detail || STEP_BLURB[step.name] || ''}
-        {step.ms != null && step.ms > 0 && <span style={{ color: 'var(--axis)' }}> · {step.ms} ms</span>}
+        {step.ms != null && step.ms > 0 && <span style={{ color: 'var(--baseline)' }}> · {step.ms} ms</span>}
       </span>
     </div>
   )
@@ -82,8 +83,8 @@ function FileCard({ file }: { file: IngestFile }) {
           <span
             className="badge"
             style={{
-              color: file.confidence === 1 ? 'var(--good-ink)' : 'var(--ink-2)',
-              borderColor: file.confidence === 1 ? 'var(--good)' : 'var(--border)',
+              color: file.confidence === 1 ? 'var(--success)' : 'var(--text-secondary)',
+              borderColor: file.confidence === 1 ? 'var(--success-fill)' : 'var(--border)',
             }}
           >
             {pct(file.confidence)} confidence
@@ -107,14 +108,14 @@ function FileCard({ file }: { file: IngestFile }) {
                   <Dot status={c.passed ? 'ok' : c.severity === 'error' ? 'failed' : 'warning'} />
                   <span className="step-name">{c.passed ? 'pass' : c.severity}</span>
                   <span className="step-detail">
-                    <b style={{ color: 'var(--ink-2)' }}>{c.name}</b> — {c.detail}
+                    <b style={{ color: 'var(--text-secondary)' }}>{c.name}</b> — {c.detail}
                   </span>
                 </div>
               ))}
             </div>
           )}
           {file.error && (
-            <pre style={{ color: 'var(--crit)', fontSize: 12.5, whiteSpace: 'pre-wrap', marginTop: 10 }}>
+            <pre style={{ color: 'var(--critical)', fontSize: 12.5, whiteSpace: 'pre-wrap', marginTop: 10 }}>
               {file.error}
             </pre>
           )}
@@ -205,7 +206,7 @@ function ReviewList({
   }
 
   return (
-    <section className="card" style={{ marginBottom: 16, borderColor: 'var(--warn)' }}>
+    <section className="card" style={{ marginBottom: 16, borderColor: 'var(--warning)' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <div>
           <h2>Found {rows.length} statement{rows.length === 1 ? '' : 's'} — review before importing</h2>
@@ -232,7 +233,7 @@ function ReviewList({
         </button>
       </div>
 
-      {err && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{err}</div>}
+      {err && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{err}</div>}
 
       <div className="tbl-wrap" style={{ marginTop: 12 }}>
         <table>
@@ -253,7 +254,7 @@ function ReviewList({
                 <td>
                   <input
                     type="checkbox"
-                    style={{ accentColor: 'var(--s1)', width: 15, height: 15 }}
+                    style={{ accentColor: 'var(--series-1)', width: 15, height: 15 }}
                     checked={picked.has(r.id)}
                     onChange={() => toggle(r.id)}
                   />
@@ -262,15 +263,11 @@ function ReviewList({
                   {r.filename}
                   {r.encrypted && <> <span className="pill">🔒 decrypted</span></>}
                   {' '}
-                  <a
-                    className="link"
-                    href={api.pendingPdfUrl(r.id)}
-                    target="_blank"
-                    rel="noreferrer"
-                    title="Open this statement PDF in a new tab"
-                  >
-                    View PDF ↗
-                  </a>
+                  <IconLink
+                    label="View PDF" icon="open"
+                    title="View PDF — opens this statement in a new tab"
+                    href={api.pendingPdfUrl(r.id)} target="_blank" rel="noreferrer"
+                  />
                 </td>
                 <td>{r.card ?? <span className="sub">unknown</span>}</td>
                 <td>{r.member_name ?? <span className="sub">{target.name}</span>}</td>
@@ -278,11 +275,11 @@ function ReviewList({
                 <td className="num">{r.txn_count ?? 0}</td>
                 <td>
                   {r.confidence === 1 ? (
-                    <span className="badge" style={{ color: 'var(--good-ink)', borderColor: 'var(--good)' }}>
+                    <span className="badge" style={{ color: 'var(--success)', borderColor: 'var(--success-fill)' }}>
                       100% — reconciled
                     </span>
                   ) : (
-                    <span className="badge" style={{ color: 'var(--crit)', borderColor: 'var(--crit)' }}>
+                    <span className="badge" style={{ color: 'var(--critical)', borderColor: 'var(--critical)' }}>
                       {r.confidence != null ? pct(r.confidence) : 'failed'} — check it
                     </span>
                   )}
@@ -477,7 +474,7 @@ export default function Pipeline({
                 </span>
               )}
               {badWindow && (
-                <span className="sub" style={{ color: 'var(--crit)' }}>
+                <span className="sub" style={{ color: 'var(--critical)' }}>
                   {scanMode === 'range'
                     ? 'Pick a start month no later than the end month.'
                     : 'Pick a month.'}
@@ -506,7 +503,7 @@ export default function Pipeline({
                 <CardSelect
                   cards={boot.cards}
                   selected={fetchCards}
-                  colourOf={(id) => `var(--s${(boot.cards.findIndex((card) => card.id === id) % 8) + 1})`}
+                  colourOf={(id) => `var(--series-${(boot.cards.findIndex((card) => card.id === id) % 8) + 1})`}
                   onChange={setFetchCards}
                   unrecognized={{ checked: fetchUnknownCards, onChange: setFetchUnknownCards }}
                 />
@@ -538,14 +535,14 @@ export default function Pipeline({
                   </div>
                 </details>
               )}
-              {noFetchCards && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one card.</span>}
+              {noFetchCards && <span className="sub" style={{ color: 'var(--critical)' }}>Select at least one card.</span>}
               {fetchUnknownCards && (
                 <span className="sub">
                   Including cards you have not imported yet — the mailbox search widens to every
                   known issuer, so a scan takes longer.
                 </span>
               )}
-              {noFetchConnections && <span className="sub" style={{ color: 'var(--crit)' }}>Select at least one connection.</span>}
+              {noFetchConnections && <span className="sub" style={{ color: 'var(--critical)' }}>Select at least one connection.</span>}
             </div>
           )}
         </div>
@@ -563,7 +560,7 @@ export default function Pipeline({
         member selector at the top of the page.
       </p>
 
-      {msg && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{msg}</div>}
+      {msg && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{msg}</div>}
       {boot && !boot.mailboxes_configured && (
         <div className="banner">
           No mailbox connected yet — add your Gmail accounts on the{' '}

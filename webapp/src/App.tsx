@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { NavLink, Route, Routes } from 'react-router-dom'
+import { Link, NavLink, Route, Routes, useLocation } from 'react-router-dom'
+import { applyTheme, resolvedTheme, type Theme } from '@delta/theme/theme'
 import { ApiError, api, type Bootstrap, type PortalUser } from './api'
 import MemberSelect from './components/MemberSelect'
 import ProfileMenu from './components/ProfileMenu'
@@ -12,6 +13,80 @@ import Categories from './pages/Categories'
 import Connections from './pages/Connections'
 import Members from './pages/Members'
 import Pipeline from './pages/Pipeline'
+
+/** Nine destinations in one row read as a wall. They divide cleanly into three
+ *  subjects, so the top row names the subject and the row under it holds only
+ *  that subject's pages. */
+const GROUPS = [
+  {
+    key: 'cards',
+    label: 'Cards',
+    tabs: [
+      { to: '/', label: 'Card Analysis', end: true },
+      { to: '/cards', label: 'Cards' },
+      { to: '/pipeline', label: 'Card Pipeline' },
+    ],
+  },
+  {
+    key: 'bank',
+    label: 'Bank',
+    tabs: [
+      { to: '/bank', label: 'Bank Analysis', end: true },
+      { to: '/bank-accounts', label: 'Bank Accounts' },
+      { to: '/bank-pipeline', label: 'Bank Pipeline' },
+    ],
+  },
+  {
+    key: 'settings',
+    label: 'Settings',
+    tabs: [
+      { to: '/categories', label: 'Categories' },
+      { to: '/connections', label: 'Connections' },
+      { to: '/members', label: 'Members' },
+    ],
+  },
+] as const
+
+/** Which subject the current URL belongs to, so a reload or a deep link opens
+ *  with the right row of tabs already showing. */
+function useActiveGroup() {
+  const { pathname } = useLocation()
+  return GROUPS.find((group) => group.tabs.some((tab) => (
+    tab.to === '/' ? pathname === '/' : pathname.startsWith(tab.to)
+  ))) ?? GROUPS[0]
+}
+
+/** The subject picker, which shares the first line with the app name. */
+function GroupTabs() {
+  const active = useActiveGroup()
+  return (
+    <nav className="nav nav-groups">
+      {GROUPS.map((group) => (
+        // The subject tab opens its first page: the row below it would
+        // otherwise show tabs while the page still belongs to another subject.
+        <Link key={group.key} to={group.tabs[0].to}
+          className={group.key === active.key ? 'on' : ''}>
+          {group.label}
+        </Link>
+      ))}
+    </nav>
+  )
+}
+
+/** Only the selected subject's pages, on the line under it. */
+function SubTabs() {
+  const active = useActiveGroup()
+  return (
+    <nav className="nav nav-sub">
+      {active.tabs.map((tab) => (
+        <NavLink key={tab.to} to={tab.to} end={'end' in tab ? tab.end : undefined}
+          className={({ isActive }) => isActive ? 'on' : ''}>
+          {tab.label}
+        </NavLink>
+      ))}
+    </nav>
+  )
+}
 
 function Auth({ onAuthenticated }: { onAuthenticated: (user: PortalUser) => void }) {
   const [registering, setRegistering] = useState(false)
@@ -52,7 +127,7 @@ function Auth({ onAuthenticated }: { onAuthenticated: (user: PortalUser) => void
         placeholder="Password (8+ characters)" value={password}
         onChange={(event) => setPassword(event.target.value)}
         onKeyDown={(event) => event.key === 'Enter' && void submit()} />
-      {error && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{error}</div>}
+      {error && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>}
       <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
         <button className="btn primary" disabled={busy || !username || password.length < 8 || (registering && !name)}
           onClick={() => void submit()}>{busy ? 'Please wait…' : registering ? 'Create private portal' : 'Sign in'}</button>
@@ -68,7 +143,10 @@ export default function App() {
   const [user, setUser] = useState<PortalUser | null>(null)
   const [checked, setChecked] = useState(false)
   const [boot, setBoot] = useState<Bootstrap | null>(null)
-  const [theme, setTheme] = useState<'light' | 'dark' | null>(null)
+  // Seeded from what is actually on screen, OS included — starting at null made
+  // the menu read "Light" on a dark-OS machine, and the first click of the
+  // toggle then set 'dark' and appeared to do nothing.
+  const [theme, setTheme] = useState<Theme>(() => resolvedTheme())
   /** Set when the session could not be checked because the API was unreachable. */
   const [offline, setOffline] = useState<string | null>(null)
   const [selectedMembers, setSelectedMembers] = useState<Set<number>>(new Set())
@@ -108,7 +186,7 @@ export default function App() {
     api.bootstrap(selectedMembers).then(setBoot).catch(() => setBoot(null))
   }, [user, selectedMembers])
   useEffect(reload, [reload])
-  useEffect(() => { if (theme) document.documentElement.setAttribute('data-theme', theme) }, [theme])
+  useEffect(() => { applyTheme(theme) }, [theme])
 
   // The Members tab owns the roster, so a change there has to reach the top-bar
   // selector — and drop any member the selection still points at. Identity must be
@@ -133,7 +211,7 @@ export default function App() {
     return <div className="wrap" style={{ maxWidth: 520, paddingTop: 80 }}>
       <section className="card">
         <h1 style={{ marginTop: 0 }}>Statement Analyser</h1>
-        <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{offline}</div>
+        <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{offline}</div>
         <p className="hint">
           You are still signed in — this only means the app could not reach the API just now.
         </p>
@@ -157,26 +235,19 @@ export default function App() {
 
   return <>
     <div className="topbar"><div className="topbar-in">
-      <span className="brand">Statement Analyser</span>
-      <nav className="nav">
-        <NavLink to="/" end className={({ isActive }) => isActive ? 'on' : ''}>Card Analysis</NavLink>
-        <NavLink to="/cards" className={({ isActive }) => isActive ? 'on' : ''}>Cards</NavLink>
-        <NavLink to="/pipeline" className={({ isActive }) => isActive ? 'on' : ''}>Card Pipeline</NavLink>
-        <NavLink to="/bank" className={({ isActive }) => isActive ? 'on' : ''}>Bank Analysis</NavLink>
-        <NavLink to="/bank-accounts" className={({ isActive }) => isActive ? 'on' : ''}>Bank Accounts</NavLink>
-        <NavLink to="/bank-pipeline" className={({ isActive }) => isActive ? 'on' : ''}>Bank Pipeline</NavLink>
-        <NavLink to="/categories" className={({ isActive }) => isActive ? 'on' : ''}>Categories</NavLink>
-        <NavLink to="/connections" className={({ isActive }) => isActive ? 'on' : ''}>Connections</NavLink>
-        <NavLink to="/members" className={({ isActive }) => isActive ? 'on' : ''}>Members</NavLink>
-      </nav>
-      <span className="spacer" />
-      <MemberSelect members={user.members} selected={selectedMembers} onChange={setSelectedMembers} />
-      <ProfileMenu
-        user={user}
-        theme={theme}
-        onToggleTheme={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}
-        onSignOut={logout}
-      />
+      <div className="topbar-row">
+        <span className="brand"><span className="brand-mark" aria-hidden="true">▤</span>Statement Analyser</span>
+        <GroupTabs />
+        <span className="spacer" />
+        <MemberSelect members={user.members} selected={selectedMembers} onChange={setSelectedMembers} />
+        <ProfileMenu
+          user={user}
+          theme={theme}
+          onToggleTheme={() => setTheme((value) => (value === 'dark' ? 'light' : 'dark'))}
+          onSignOut={logout}
+        />
+      </div>
+      <SubTabs />
     </div></div>
     <div className="wrap"><Routes>
       <Route path="/" element={<Analytics boot={boot} members={selectedMembers} />} />

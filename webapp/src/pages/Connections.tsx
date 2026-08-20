@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, type Mailbox, type Member } from '../api'
+import IconButton from '../components/IconButton'
 
 const DOT: Record<string, string> = {
-  connected: 'var(--good)',
-  failed: 'var(--crit)',
-  unknown: 'var(--muted)',
+  connected: 'var(--success-fill)',
+  failed: 'var(--critical)',
+  unknown: 'var(--text-muted)',
 }
 
 export default function Connections({ onChanged, members }: { onChanged: () => void; members: Member[] }) {
@@ -99,15 +100,17 @@ export default function Connections({ onChanged, members }: { onChanged: () => v
               await api.assignMailboxMember(m.id, Number(event.target.value)); void load()
             }}>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>
             {!m.secret_ok && (
-              <span className="badge" style={{ color: 'var(--crit)' }}>
+              <span className="badge" style={{ color: 'var(--critical)' }}>
                 secret unreadable — re-add
               </span>
             )}
             <span className="badge" style={{ color: DOT[m.status] }}>{m.status}</span>
-            <button className="btn" disabled={busy} onClick={() => test(m.id)}>Test</button>
-            <button className="btn" disabled={busy} onClick={() => remove(m.id, m.address)}>
-              Disconnect
-            </button>
+            <span className="row-actions">
+              <IconButton label="Test" icon="test" disabled={busy}
+                title="Test this connection" onClick={() => test(m.id)} />
+              <IconButton label="Disconnect" icon="disconnect" danger disabled={busy}
+                title="Disconnect this mailbox" onClick={() => remove(m.id, m.address)} />
+            </span>
           </div>
         ))}
 
@@ -143,7 +146,7 @@ export default function Connections({ onChanged, members }: { onChanged: () => v
         {msg && (
           <div
             className="banner"
-            style={{ borderLeftColor: msg.ok ? 'var(--good)' : 'var(--crit)', marginTop: 14 }}
+            style={{ borderLeftColor: msg.ok ? 'var(--success-fill)' : 'var(--critical)', marginTop: 14 }}
           >
             {msg.text}
           </div>
@@ -153,7 +156,7 @@ export default function Connections({ onChanged, members }: { onChanged: () => v
       <section className="card">
         <h2>How to get an app password</h2>
         <p className="hint">Gmail rejects your normal password over IMAP; it needs a per-app one.</p>
-        <ol style={{ margin: 0, paddingLeft: 20, color: 'var(--ink-2)', fontSize: 13.5, lineHeight: 1.9 }}>
+        <ol style={{ margin: 0, paddingLeft: 20, color: 'var(--text-secondary)', fontSize: 13.5, lineHeight: 1.9 }}>
           <li>Turn on 2-Step Verification for the account.</li>
           <li>
             Visit{' '}

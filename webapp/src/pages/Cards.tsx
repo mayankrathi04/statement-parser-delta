@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import type { CardRow, Member } from '../api'
 import { api } from '../api'
 import { seriesVar } from '../components/Charts'
+import IconButton from '../components/IconButton'
 import { money0 } from '../lib/format'
 import { importTarget } from '../lib/members'
 
@@ -56,9 +57,12 @@ function PasswordCell({ card, onSaved }: { card: CardRow; onSaved: () => void })
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && value && save()}
         />
-        <button className="btn primary" disabled={busy || !value} onClick={save}>Save</button>
-        <button className="btn" onClick={() => { setEditing(false); setErr(null) }}>Cancel</button>
-        {err && <span style={{ color: 'var(--crit)', fontSize: 12.5 }}>{err}</span>}
+        <span className="row-actions">
+          <IconButton label="Save" icon="save" disabled={busy || !value} onClick={save} />
+          <IconButton label="Cancel" icon="cancel"
+            onClick={() => { setEditing(false); setErr(null) }} />
+        </span>
+        {err && <span style={{ color: 'var(--critical)', fontSize: 12.5 }}>{err}</span>}
       </span>
     )
   }
@@ -73,19 +77,26 @@ function PasswordCell({ card, onSaved }: { card: CardRow; onSaved: () => void })
               learned
             </span>
           )}
-          <button className="link" onClick={() => (shown ? setShown(null) : reveal())}>
-            {shown ? 'hide' : 'show'}
-          </button>
-          <button className="link" onClick={() => setEditing(true)}>edit</button>
-          <button className="link" onClick={clear}>forget</button>
+          <span className="row-actions">
+            <IconButton
+              label={shown ? 'Hide' : 'Show'} icon={shown ? 'hide' : 'show'}
+              title={shown ? 'Hide the stored password' : 'Show the stored password'}
+              onClick={() => (shown ? setShown(null) : reveal())}
+            />
+            <IconButton label="Edit" icon="edit" title="Edit the stored password"
+              onClick={() => setEditing(true)} />
+            <IconButton label="Forget" icon="forget" danger title="Forget the stored password"
+              onClick={clear} />
+          </span>
         </>
       ) : (
         <>
           <span className="sub">not stored — derived from name/DOB at parse time</span>
-          <button className="link" onClick={() => setEditing(true)}>set</button>
+          <IconButton label="Set" icon="set" title="Store a statement password"
+            onClick={() => setEditing(true)} />
         </>
       )}
-      {err && <span style={{ color: 'var(--crit)', fontSize: 12.5 }}>{err}</span>}
+      {err && <span style={{ color: 'var(--critical)', fontSize: 12.5 }}>{err}</span>}
     </span>
   )
 }
@@ -256,7 +267,7 @@ function ProfileCard({
         </div>
       )}
       {err && (
-        <div className="banner" style={{ borderLeftColor: 'var(--crit)', marginTop: 12 }}>{err}</div>
+        <div className="banner" style={{ borderLeftColor: 'var(--critical)', marginTop: 12 }}>{err}</div>
       )}
 
       <p className="hint" style={{ marginTop: 12, marginBottom: 0 }}>
@@ -297,7 +308,7 @@ export default function Cards({
 
   return (
     <>
-      {err && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{err}</div>}
+      {err && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{err}</div>}
 
       <ProfileCard onSaved={load} members={roster} selected={members} />
 
@@ -335,14 +346,14 @@ export default function Cards({
                   <Fragment key={c.id}>
                     <tr>
                       <td>
-                        <button
-                          className="link"
-                          style={{ marginRight: 8 }}
+                        <IconButton
+                          label={open[c.id] ? 'Collapse' : 'Expand'}
+                          icon={open[c.id] ? 'collapse' : 'expand'}
+                          title={open[c.id]
+                            ? 'Hide the months already parsed'
+                            : 'Show the months already parsed'}
                           onClick={() => setOpen((o) => ({ ...o, [c.id]: !o[c.id] }))}
-                          title="Show the months already parsed"
-                        >
-                          {open[c.id] ? '▾' : '▸'}
-                        </button>
+                        />{' '}
                         <i className="swatch" style={{ background: colourOf(c.id) }} /> {c.display_name}
                       </td>
                       <td><select value={c.member_id ?? ''} onChange={async (event) => {
@@ -388,7 +399,7 @@ export default function Cards({
                                     <td>
                                       {h.imported_at?.replace('T', ' ') ?? '—'}
                                       {h.confidence === 1 && (
-                                        <> <span className="pill" style={{ color: 'var(--good-ink)' }}>100%</span></>
+                                        <> <span className="pill" style={{ color: 'var(--success)' }}>100%</span></>
                                       )}
                                     </td>
                                   </tr>

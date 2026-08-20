@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
+import type { Theme } from '@delta/theme/theme'
 import type { PortalUser } from '../api'
 
 /** Two initials from a display name — "Ada Lovelace" → "AL", "ada" → "AD". */
@@ -14,7 +15,7 @@ export default function ProfileMenu({
   user, theme, onToggleTheme, onSignOut,
 }: {
   user: PortalUser
-  theme: 'light' | 'dark' | null
+  theme: Theme
   onToggleTheme: () => void
   onSignOut: () => void
 }) {

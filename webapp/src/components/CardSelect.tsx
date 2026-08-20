@@ -70,7 +70,7 @@ export default function CardSelect({
               />
               <i className="swatch" style={{ background: colourOf(c.id) }} />
               <span>{c.display_name}</span>
-              <span style={{ marginLeft: 'auto', color: 'var(--muted)', fontSize: 12 }}>
+              <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 12 }}>
                 {c.txn_count}
               </span>
             </label>
@@ -86,7 +86,7 @@ export default function CardSelect({
                 checked={unrecognized.checked}
                 onChange={() => unrecognized.onChange(!unrecognized.checked)}
               />
-              <i className="swatch" style={{ background: 'var(--muted)' }} />
+              <i className="swatch" style={{ background: 'var(--text-muted)' }} />
               <span>Unrecognized cards</span>
             </label>
           )}

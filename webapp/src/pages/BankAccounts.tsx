@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
 import { api, type BankAccount, type Member } from '../api'
 import { seriesVar } from '../components/Charts'
+import IconButton from '../components/IconButton'
 import { money2 } from '../lib/format'
 
 export default function BankAccounts({
@@ -30,7 +31,7 @@ export default function BankAccounts({
 
   return (
     <>
-      {error && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{error}</div>}
+      {error && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>}
       <section className="card">
         <h2>Bank accounts</h2>
         <p className="hint">
@@ -59,16 +60,16 @@ export default function BankAccounts({
                   <Fragment key={account.id}>
                     <tr>
                       <td>
-                        <button
-                          className="link"
-                          style={{ marginRight: 8 }}
+                        <IconButton
+                          label={open[account.id] ? 'Collapse' : 'Expand'}
+                          icon={open[account.id] ? 'collapse' : 'expand'}
+                          title={open[account.id]
+                            ? 'Hide imported statements'
+                            : 'Show imported statements'}
                           onClick={() => setOpen((current) => ({
                             ...current, [account.id]: !current[account.id],
                           }))}
-                          title="Show imported statements"
-                        >
-                          {open[account.id] ? '▾' : '▸'}
-                        </button>
+                        />{' '}
                         <i className="swatch" style={{ background: colourOf(account.id) }} />{' '}
                         {account.display_name}
                       </td>
@@ -117,7 +118,7 @@ export default function BankAccounts({
                                   <td>
                                     {statement.imported_at.replace('T', ' ')}{' '}
                                     {statement.confidence === 1 && (
-                                      <span className="pill" style={{ color: 'var(--good-ink)' }}>100%</span>
+                                      <span className="pill" style={{ color: 'var(--success)' }}>100%</span>
                                     )}
                                   </td>
                                 </tr>

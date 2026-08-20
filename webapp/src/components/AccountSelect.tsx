@@ -61,7 +61,7 @@ export default function AccountSelect({
               />
               <i className="swatch" style={{ background: colourOf(account.id) }} />
               <span>{account.display_name}</span>
-              <span style={{ marginLeft: 'auto', color: 'var(--muted)', fontSize: 12 }}>
+              <span style={{ marginLeft: 'auto', color: 'var(--text-muted)', fontSize: 12 }}>
                 {account.txn_count}
               </span>
             </label>

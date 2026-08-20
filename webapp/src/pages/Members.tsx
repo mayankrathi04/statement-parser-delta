@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, type MemberDetail } from '../api'
+import IconButton from '../components/IconButton'
 
 function AddMember({ onAdded }: { onAdded: () => void }) {
   const [name, setName] = useState('')
@@ -41,7 +42,7 @@ function AddMember({ onAdded }: { onAdded: () => void }) {
         </button>
       </div>
       {error && (
-        <div className="banner" style={{ borderLeftColor: 'var(--crit)', marginTop: 12 }}>{error}</div>
+        <div className="banner" style={{ borderLeftColor: 'var(--critical)', marginTop: 12 }}>{error}</div>
       )}
     </section>
   )
@@ -105,35 +106,28 @@ function MemberRow({
         <td className="num">{member.mailboxes}</td>
         <td>{member.created_at?.slice(0, 10) ?? '—'}</td>
         <td>
-          <span style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+          <span className="row-actions">
             {editing ? (
               <>
-                <button
-                  className="link"
-                  disabled={busy || !name.trim()}
+                <IconButton
+                  label="Save" icon="save" disabled={busy || !name.trim()}
                   onClick={() => void run(() => api.renameMember(member.id, name.trim()))}
-                >
-                  save
-                </button>
-                <button className="link" onClick={() => { setEditing(false); setName(member.name) }}>
-                  cancel
-                </button>
+                />
+                <IconButton label="Cancel" icon="cancel"
+                  onClick={() => { setEditing(false); setName(member.name) }} />
               </>
             ) : (
-              <button className="link" onClick={() => setEditing(true)}>rename</button>
+              <IconButton label="Rename" icon="edit" onClick={() => setEditing(true)} />
             )}
             {!member.is_default && (
-              <button
-                className="link"
-                disabled={busy}
+              <IconButton
+                label="Make default" icon="default" disabled={busy}
+                title="Make default — imports fall back to this member when the selector names no single one"
                 onClick={() => void run(() => api.setDefaultMember(member.id))}
-                title="Imports fall back to this member when the selector names no single one"
-              >
-                make default
-              </button>
+              />
             )}
             {!member.is_default && total > 1 && attached === 0 && (
-              <button className="link" disabled={busy} onClick={remove}>remove</button>
+              <IconButton label="Remove" icon="delete" danger disabled={busy} onClick={remove} />
             )}
           </span>
         </td>
@@ -141,7 +135,7 @@ function MemberRow({
       {error && (
         <tr>
           <td colSpan={6}>
-            <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{error}</div>
+            <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>
           </td>
         </tr>
       )}
@@ -167,7 +161,7 @@ export default function Members({ onChanged }: { onChanged: () => void }) {
 
   return (
     <>
-      {error && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{error}</div>}
+      {error && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>}
 
       <AddMember onAdded={load} />
 

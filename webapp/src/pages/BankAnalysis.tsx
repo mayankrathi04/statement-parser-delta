@@ -9,6 +9,7 @@ import {
 } from '../api'
 import AccountSelect from '../components/AccountSelect'
 import CategorySelect from '../components/CategorySelect'
+import IconButton from '../components/IconButton'
 import { MonthlyBars, NetBars, RankBars, seriesVar } from '../components/Charts'
 import { reconcileSelection, useCategoryOptions } from '../lib/categories'
 import { money0, money2, monthsBefore } from '../lib/format'
@@ -209,8 +210,9 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
   const pages = Math.max(1, Math.ceil(rows.length / pageSize))
   const pageIndex = Math.min(page, pages - 1)
   const shown = rows.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize)
-  const heading = (key: SortKey, label: string, right = false) => (
+  const heading = (key: SortKey, label: string, right = false, wrapped = false) => (
     <th
+      className={wrapped ? 'wrapped' : undefined}
       style={{ cursor: 'pointer', textAlign: right ? 'right' : 'left' }}
       onClick={() => setSort((current) => ({
         key, dir: current.key === key && current.dir === -1 ? 1 : -1,
@@ -237,7 +239,7 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
 
   return (
     <>
-      {error && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{error}</div>}
+      {error && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>}
       <div className="filters">
         <AccountSelect
           accounts={boot.accounts} selected={selected} colourOf={colourOf} onChange={setSelected}
@@ -285,8 +287,8 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
         <h2>Monthly cash flow</h2>
         <p className="hint">Withdrawals and deposits are kept separate; net cash flow is deposits minus withdrawals.</p>
         <div className="legend">
-          <span><i className="swatch" style={{ background: 'var(--s1)' }} />Withdrawals</span>
-          <span><i className="swatch" style={{ background: 'var(--s2)' }} />Deposits</span>
+          <span><i className="swatch" style={{ background: 'var(--series-1)' }} />Withdrawals</span>
+          <span><i className="swatch" style={{ background: 'var(--series-2)' }} />Deposits</span>
         </div>
         <MonthlyBars
           rows={(analysis?.monthly ?? []).map((row) => ({
@@ -407,8 +409,9 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
             <thead><tr>
               <th style={{ width: 30 }} aria-label="Select" />
               {heading('txn_date', 'Date')}{heading('value_date', 'Value date')}
-              <th>Narration</th><th>Reference</th>{heading('counterparty', 'Counterparty')}
-              {heading('category', 'Category')}{heading('account', 'Account')}
+              <th>Narration</th><th className="wrapped">Reference</th>
+              {heading('counterparty', 'Counterparty', false, true)}
+              {heading('category', 'Category')}{heading('account', 'Account', false, true)}
               {heading('withdrawal', 'Withdrawal', true)}
               {heading('deposit', 'Deposit', true)}{heading('balance', 'Balance', true)}
             </tr></thead>
@@ -428,8 +431,9 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
                     />
                   </td>
                   <td>{row.txn_date}</td><td>{row.value_date ?? '—'}</td>
-                  <td className="desc">{row.description}</td><td><code>{row.reference ?? '—'}</code></td>
-                  <td>{row.counterparty}</td>
+                  <td className="desc">{row.description}</td>
+                  <td className="wrapped"><code>{row.reference ?? '—'}</code></td>
+                  <td className="wrapped">{row.counterparty}</td>
                   <td>
                     {editingCategory === row.id ? (
                       <form className="category-editor" onSubmit={(event) => {
@@ -442,18 +446,17 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
                           onChange={(event) => setCategoryDraft(event.target.value)}
                           aria-label={`Category for ${row.description}`}
                         />
-                        <button className="btn primary" disabled={savingCategory === row.id}>Save</button>
+                        <IconButton label="Save" icon="save" type="submit"
+                          disabled={savingCategory === row.id} />
                         {row.category_is_override && (
-                          <button
-                            type="button" className="btn" disabled={savingCategory === row.id}
+                          <IconButton
+                            label="Automatic" icon="automatic" disabled={savingCategory === row.id}
                             title={`Restore automatic category: ${row.derived_category}`}
                             onClick={() => void saveCategory(row, null)}
-                          >Automatic</button>
+                          />
                         )}
-                        <button
-                          type="button" className="btn" disabled={savingCategory === row.id}
-                          onClick={() => setEditingCategory(null)}
-                        >Cancel</button>
+                        <IconButton label="Cancel" icon="cancel" disabled={savingCategory === row.id}
+                          onClick={() => setEditingCategory(null)} />
                       </form>
                     ) : (
                       <button
@@ -471,7 +474,9 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
                       </button>
                     )}
                   </td>
-                  <td><i className="swatch" style={{ background: colourOf(row.account_id) }} /> {row.account}</td>
+                  <td className="wrapped">
+                    <i className="swatch" style={{ background: colourOf(row.account_id) }} /> {row.account}
+                  </td>
                   <td className="num">{row.direction === 'debit' ? money2(row.amount) : '—'}</td>
                   <td className="num cre">{row.direction === 'credit' ? money2(row.amount) : '—'}</td>
                   <td className="num">{money2(row.balance)}</td>

@@ -814,12 +814,16 @@ def analytics(
         purchase_args + refund_args + payment_args,
     ).fetchall()
 
+    # Aliased `label`, never `category`: SQLite resolves a GROUP BY name against
+    # the input columns before the result aliases, so `GROUP BY category` would
+    # bind to `t.category` and quietly group on the derived label — collapsing
+    # every manual override back into the bucket it was moved out of.
     by_category = conn.execute(
-        f"""SELECT COALESCE(NULLIF(TRIM(t.category_override),''), t.category, 'Other') AS category,
+        f"""SELECT {CATEGORY_SQL} AS label,
                    SUM(spend_effect) AS total, COUNT(*) AS n
             FROM transactions t JOIN statements s ON s.id=t.statement_id
             WHERE {spend_clause}
-            GROUP BY category ORDER BY total DESC""",
+            GROUP BY label ORDER BY total DESC""",
         spend_args,
     ).fetchall()
 
@@ -935,7 +939,7 @@ def analytics(
             for r in monthly
         ],
         "by_category": [
-            {"label": r["category"], "value": to_rupees(r["total"]), "n": r["n"]} for r in by_category
+            {"label": r["label"], "value": to_rupees(r["total"]), "n": r["n"]} for r in by_category
         ],
         "by_card": [
             {"card_id": r["card_id"], "label": r["card"], "value": to_rupees(r["total"]), "n": r["n"]}

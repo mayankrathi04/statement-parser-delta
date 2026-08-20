@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, type Category, type MajorCategory, type ProviderCategory } from '../api'
+import IconButton from '../components/IconButton'
 
 const SCOPES: { value: Category['applies_to']; label: string }[] = [
   { value: 'both', label: 'Cards & bank' },
@@ -39,7 +40,7 @@ function MajorPicker({
   return (
     <select
       className="input" disabled={busy} value={category.major_id ?? ''}
-      style={category.major_id ? undefined : { borderColor: 'var(--warn, #b8860b)' }}
+      style={category.major_id ? undefined : { borderColor: 'var(--warning, #b8860b)' }}
       onChange={(event) => void pick(event.target.value)}
     >
       <option value="">— not filed —</option>
@@ -109,7 +110,7 @@ function AddCategory({ majors, onAdded }: { majors: MajorCategory[]; onAdded: ()
         </button>
       </div>
       {error && (
-        <div className="banner" style={{ borderLeftColor: 'var(--crit)', marginTop: 12 }}>{error}</div>
+        <div className="banner" style={{ borderLeftColor: 'var(--critical)', marginTop: 12 }}>{error}</div>
       )}
     </section>
   )
@@ -175,7 +176,7 @@ function Majors({ majors, onChanged }: { majors: MajorCategory[]; onChanged: () 
           Add major
         </button>
       </div>
-      {error && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{error}</div>}
+      {error && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>}
       <div className="tbl-wrap">
         <table>
           <thead>
@@ -202,21 +203,21 @@ function Majors({ majors, onChanged }: { majors: MajorCategory[]; onChanged: () 
                 </td>
                 <td className="num">{major.children.length}</td>
                 <td>
-                  <span style={{ display: 'flex', gap: 12 }}>
+                  <span className="row-actions">
                     {editing === major.id ? (
                       <>
-                        <button className="link" disabled={busy || !draft.trim()}
-                          onClick={() => void run(() => api.renameMajorCategory(major.id, draft.trim()))}>
-                          save
-                        </button>
-                        <button className="link" onClick={() => setEditing(null)}>cancel</button>
+                        <IconButton
+                          label="Save" icon="save" disabled={busy || !draft.trim()}
+                          onClick={() => void run(() => api.renameMajorCategory(major.id, draft.trim()))}
+                        />
+                        <IconButton label="Cancel" icon="cancel" onClick={() => setEditing(null)} />
                       </>
                     ) : (
                       <>
-                        <button className="link"
-                          onClick={() => { setEditing(major.id); setDraft(major.name) }}>rename</button>
-                        <button className="link" disabled={busy}
-                          onClick={() => remove(major)}>delete</button>
+                        <IconButton label="Rename" icon="edit"
+                          onClick={() => { setEditing(major.id); setDraft(major.name) }} />
+                        <IconButton label="Delete" icon="delete" danger disabled={busy}
+                          onClick={() => remove(major)} />
                       </>
                     )}
                   </span>
@@ -244,7 +245,7 @@ function Unfiled({
 }) {
   if (!unmapped.length) return null
   return (
-    <section className="card" style={{ borderLeftColor: 'var(--warn, #b8860b)', borderLeftWidth: 3 }}>
+    <section className="card" style={{ borderLeftColor: 'var(--warning, #b8860b)', borderLeftWidth: 3 }}>
       <h2>Not filed under a major <span className="pill">{unmapped.length}</span></h2>
       <p className="hint">
         These still categorise transactions exactly as they always did — but they roll up into
@@ -339,11 +340,11 @@ function CategoryRow({
     <>
       <tr>
         <td>
-          <span className="order-buttons">
-            <button className="link" disabled={busy || index === 0} title="Move up"
-              onClick={() => onChanged([index, index - 1])}>↑</button>
-            <button className="link" disabled={busy || index === total - 1} title="Move down"
-              onClick={() => onChanged([index, index + 1])}>↓</button>
+          <span className="row-actions">
+            <IconButton label="Move up" icon="up" disabled={busy || index === 0}
+              onClick={() => onChanged([index, index - 1])} />
+            <IconButton label="Move down" icon="down" disabled={busy || index === total - 1}
+              onClick={() => onChanged([index, index + 1])} />
           </span>
         </td>
         <td>
@@ -382,21 +383,21 @@ function CategoryRow({
         <td className="num">{category.usage.cards}</td>
         <td className="num">{category.usage.bank}</td>
         <td>
-          <span style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+          <span className="row-actions">
             {editing ? (
               <>
-                <button className="link" disabled={busy || !name.trim()} onClick={save}>save</button>
-                <button className="link" onClick={() => {
+                <IconButton label="Save" icon="save" disabled={busy || !name.trim()} onClick={save} />
+                <IconButton label="Cancel" icon="cancel" onClick={() => {
                   setEditing(false)
                   setName(category.name)
                   setPattern(category.pattern ?? '')
                   setScope(category.applies_to)
-                }}>cancel</button>
+                }} />
               </>
             ) : (
               <>
-                <button className="link" onClick={() => setEditing(true)}>edit</button>
-                <button className="link" disabled={busy} onClick={remove}>delete</button>
+                <IconButton label="Edit" icon="edit" onClick={() => setEditing(true)} />
+                <IconButton label="Delete" icon="delete" danger disabled={busy} onClick={remove} />
               </>
             )}
           </span>
@@ -404,7 +405,7 @@ function CategoryRow({
       </tr>
       {(error || notice) && (
         <tr><td colSpan={8}>
-          <div className="banner" style={error ? { borderLeftColor: 'var(--crit)' } : undefined}>
+          <div className="banner" style={error ? { borderLeftColor: 'var(--critical)' } : undefined}>
             {error ?? notice}
           </div>
         </td></tr>
@@ -474,7 +475,7 @@ export default function Categories() {
 
   return (
     <>
-      {error && <div className="banner" style={{ borderLeftColor: 'var(--crit)' }}>{error}</div>}
+      {error && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>}
 
       <Majors majors={majors} onChanged={load} />
 
