@@ -1,4 +1,5 @@
 import datetime as dt
+from decimal import Decimal
 
 import pytest
 
@@ -392,3 +393,80 @@ def test_axis_legacy_unexplained_credit_mismatch_remains_error():
     assert not check.passed
     assert check.severity == "error"
     assert "manual parser review is required" in check.detail
+
+
+def _combined(masked_a: str, masked_b: str) -> Statement:
+    """One statement billing two cards, the way ICICI prints a relationship:
+    the table is grouped by card, and each row carries the card it sat under."""
+    from sparser.schema import Summary
+
+    return Statement(
+        template_id="test_v1", issuer="Test Bank", doc_type=DocType.CREDIT_CARD,
+        account_masked=masked_a, source_file="combined.pdf",
+        statement_date=dt.date(2026, 6, 3),
+        period_start=dt.date(2026, 5, 4), period_end=dt.date(2026, 6, 3),
+        summary=Summary(),
+        transactions=[
+            Transaction(date=dt.date(2026, 5, 21), description="primary spend",
+                        amount=Decimal("100.00"), type=TxnType.DEBIT, card_masked=masked_a),
+            Transaction(date=dt.date(2026, 5, 21), description="secondary spend",
+                        amount=Decimal("250.00"), type=TxnType.DEBIT, card_masked=masked_b),
+        ],
+    )
+
+
+def test_a_combined_statement_files_each_row_under_the_card_it_was_printed_for(tmp_path):
+    """The defect this guards against moved one card's spending onto another.
+
+    It could not be caught by the arithmetic checks: a combined statement's
+    summary covers both cards, so a parse that lumps every row onto the primary
+    card still reconciles to the paisa.
+    """
+    conn = store.connect(tmp_path / "statements.db")
+    store.import_statement(conn, _combined("4111XXXXXXXX1111", "5555XXXXXXXX4444"))
+
+    rows = conn.execute(
+        """SELECT c.masked_number AS card, t.description, t.amount FROM transactions t
+           JOIN cards c ON c.id = t.card_id ORDER BY t.description"""
+    ).fetchall()
+    assert [(r["card"], r["description"]) for r in rows] == [
+        ("4111XXXXXXXX1111", "primary spend"),
+        ("5555XXXXXXXX4444", "secondary spend"),
+    ]
+    # The statement itself still belongs to one card — its primary.
+    statement_card = conn.execute(
+        "SELECT c.masked_number FROM statements s JOIN cards c ON c.id = s.card_id"
+    ).fetchone()[0]
+    assert statement_card == "4111XXXXXXXX1111"
+
+
+def test_a_secondary_card_already_known_is_reused_not_duplicated(tmp_path):
+    conn = store.connect(tmp_path / "statements.db")
+    conn.execute(
+        """INSERT INTO cards(issuer,product,masked_number,last4,display_name)
+           VALUES('Test Bank','Rewards','5555XXXXXXXX4444','4444','Test Bank Rewards ••4444')"""
+    )
+    store.import_statement(conn, _combined("4111XXXXXXXX1111", "5555XXXXXXXX4444"))
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM cards WHERE last4='4444'"
+    ).fetchone()[0] == 1
+    # The card keeps the name it already had rather than being renamed generically.
+    assert conn.execute(
+        "SELECT display_name FROM cards WHERE last4='4444'"
+    ).fetchone()[0] == "Test Bank Rewards ••4444"
+
+
+def test_a_single_card_statement_is_unaffected(tmp_path):
+    """Rows with no card heading stay on the statement's own card."""
+    conn = store.connect(tmp_path / "statements.db")
+    stmt = _combined("4111XXXXXXXX1111", "5555XXXXXXXX4444")
+    for txn in stmt.transactions:
+        txn.card_masked = None
+    store.import_statement(conn, stmt)
+
+    assert conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 1
+    assert conn.execute(
+        """SELECT COUNT(*) FROM transactions t JOIN cards c ON c.id=t.card_id
+           WHERE c.masked_number='4111XXXXXXXX1111'"""
+    ).fetchone()[0] == 2

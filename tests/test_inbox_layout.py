@@ -182,3 +182,24 @@ def test_an_upload_lands_in_the_bank_folder_and_not_in_a_hash_directory(tmp_path
     assert saved[0].parent == root / "bank" / "_unsorted"
     assert saved[0].name.endswith("_upload_Acct Statement_5555.pdf")
     assert not (root / "bank-uploads").exists()
+
+
+def test_refile_reports_a_statement_it_cannot_read_instead_of_guessing(tmp_path, monkeypatch):
+    """`refile` re-reads _unsorted because being stuck there is temporary — a
+    password gets saved, a parser gets written. What it still cannot identify it
+    reports, and leaves exactly where it is."""
+    from sparser import refile, store
+
+    monkeypatch.setenv("SPARSER_KEY_FILE", str(tmp_path / "secret.key"))
+    db = tmp_path / "statements.db"
+    store.connect(db).close()
+    root = tmp_path / "inbox"
+    stuck = _pdf(inbox.landing(root, inbox.CARDS) / "not-really-a-pdf.pdf", b"%PDF-1.4 junk")
+
+    found = refile.refile(db, root)
+
+    assert len(found) == 1
+    assert not found[0].fileable
+    assert found[0].reason
+    assert stuck.is_file(), "an unidentifiable statement must stay put"
+    assert inbox.pdfs(root) == [stuck]

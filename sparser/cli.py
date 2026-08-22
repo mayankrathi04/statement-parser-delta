@@ -195,6 +195,44 @@ def cmd_bank_fetch(args) -> int:
     return 0 if run["status"] == "done" else 1
 
 
+def cmd_refile(args) -> int:
+    """Re-read the unsorted statements and file the ones now identifiable.
+
+    Reports whether each one's transactions are already in the ledger, because
+    that is what decides whether a stuck file is a gap in the data or just a
+    second copy of a statement already counted.
+    """
+    from . import inbox as inbox_layout, refile as refile_mod
+
+    found = (refile_mod.refile if args.apply else refile_mod.inspect)(args.db, args.inbox)
+    if not found:
+        print(f"nothing in {args.inbox}/*/{ '_unsorted' } — everything is filed")
+        return 0
+
+    filed = [c for c in found if c.fileable]
+    stuck = [c for c in found if not c.fileable]
+    for c in filed:
+        where = c.moved_to.parent if c.moved_to else inbox_layout.folder_for(
+            args.inbox, c.kind, c.label
+        )
+        ledger = (
+            f"already in your data as {c.in_ledger}" if c.in_ledger
+            else f"{RED}not in your data{RESET} — {c.txn_count} transaction(s) never imported"
+        )
+        print(f"{GREEN}{'filed' if args.apply else 'would file'}{RESET} {c.path.name}")
+        print(f"    {DIM}->{RESET} {where}")
+        print(f"    {ledger}")
+    for c in stuck:
+        print(f"{RED}stuck{RESET} {c.path.name}")
+        print(f"    {c.reason}")
+
+    print(f"\n{len(filed)} filed, {len(stuck)} still unsorted"
+          if args.apply else
+          f"\n{len(filed)} would be filed, {len(stuck)} would stay unsorted "
+          f"({DIM}re-run with --apply{RESET})")
+    return 0
+
+
 def cmd_serve(args) -> int:
     from .server import serve
 
@@ -259,6 +297,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_credentials(p)
     p.set_defaults(func=cmd_bank_fetch)
+
+    p = sub.add_parser(
+        "refile", help="file statements still sitting in the inbox's _unsorted"
+    )
+    p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    p.add_argument("--inbox", type=Path, default=Path("inbox"))
+    p.add_argument(
+        "--apply", action="store_true",
+        help="actually move the files (without this, only report what would move)",
+    )
+    p.set_defaults(func=cmd_refile)
 
     p = sub.add_parser("serve", help="run the analytics dashboard")
     p.add_argument("--db", type=Path, default=DEFAULT_DB)

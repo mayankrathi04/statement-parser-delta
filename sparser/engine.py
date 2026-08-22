@@ -201,6 +201,9 @@ class Engine:
         # as the block opener is what keeps page 2 onwards from being dropped.
         header_starts = tcfg.get("header_starts_block", False)
         default_section = tcfg.get("default_section", "domestic")
+        # A combined statement's card headings carry across page breaks: the
+        # table resumes overleaf under the same card, without repeating it.
+        card: Optional[str] = None
 
         while i < n:
             if header_starts:
@@ -229,7 +232,8 @@ class Engine:
 
             bands = self._bands_for(lines[hdr], section)
             block, i = self._collect_block(lines, hdr + 1, secs["ends"])
-            txns += self._rows_from_block(block, bands, section)
+            rows, card = self._rows_from_block(block, bands, section, card)
+            txns += rows
 
         evidence = [
             EmiEvidence(
@@ -267,11 +271,24 @@ class Engine:
         return out, i
 
     def _rows_from_block(
-        self, block: list[geo.Line], bands: dict[str, Band], section: str
-    ) -> list[Transaction]:
+        self,
+        block: list[geo.Line],
+        bands: dict[str, Band],
+        section: str,
+        card: Optional[str] = None,
+    ) -> tuple[list[Transaction], Optional[str]]:
+        """The rows in one table block, and the card heading still in force after it.
+
+        Issuers that bill several cards on one statement print the table grouped
+        by card, each group opening with the card number on a line of its own.
+        Those lines are tracked exactly like cardholder names — a row belongs to
+        the last heading above it — so a row is attributed to the card it was
+        actually printed under rather than to the statement's primary card.
+        """
         rowcfg = self.t["row"]
         date_re = re.compile(rowcfg["date_pattern"])
         holder_re = re.compile(rowcfg["cardholder_pattern"])
+        card_re = re.compile(rowcfg["card_pattern"]) if rowcfg.get("card_pattern") else None
         fcy_re = re.compile(rowcfg["fcy_pattern"])
         max_gap = float(rowcfg.get("max_orphan_gap", 20.0))
 
@@ -279,9 +296,15 @@ class Engine:
         orphans: list[tuple[geo.Line, str]] = []
         cardholder: Optional[str] = None
         holder_at: list[tuple[float, str]] = []
+        card_at: list[tuple[float, str]] = []
 
         for ln in block:
             if self._is_drop(ln.text):
+                continue
+            # Match the card heading on the whole line: it is printed on its own,
+            # and which column band it lands in is not something to rely on.
+            if card_re and (cm := card_re.match(ln.text.strip())):
+                card_at.append((ln.top, cm.group(1)))
                 continue
             c = ln.cells(bands)
             if date_re.match(c["date"]):
@@ -317,6 +340,9 @@ class Engine:
             for top, name in holder_at:
                 if top < ln.top:
                     cardholder = name
+            for top, number in card_at:
+                if top < ln.top:
+                    card = number
 
             fcy_cur = fcy_amt = None
             if fm := fcy_re.search(c.get("fcy", "")):
@@ -340,6 +366,7 @@ class Engine:
                     section=section,
                     category=squash(c.get("category", "")) or None,
                     cardholder=cardholder,
+                    card_masked=card,
                     # HDFC prints "EMI" here for purchases that are merely
                     # eligible.  Actual conversions are established from the
                     # matching credit after the complete table is parsed.
@@ -351,7 +378,7 @@ class Engine:
                     raw=ln.text,
                 )
             )
-        return out
+        return out, card
 
     # ------------------------------------------------------------- header
 
@@ -484,6 +511,8 @@ class Engine:
             head["period_start"] = dt.date(previous_year, previous_month, start_day)
             head["period_end"] = end
 
+        transactions = self._parse_tables(all_lines)
+
         return Statement(
             template_id=self.t["id"],
             issuer=self.t["issuer"],
@@ -491,14 +520,36 @@ class Engine:
             currency=self.t.get("currency", "INR"),
             product=head.get("product"),
             account_holder=head.get("account_holder"),
-            account_masked=head.get("account_masked"),
+            account_masked=_primary_card(transactions) or head.get("account_masked"),
             statement_date=head.get("statement_date"),
             period_start=head.get("period_start"),
             period_end=head.get("period_end"),
             summary=self._extract_summary(p1),
-            transactions=self._parse_tables(all_lines),
+            transactions=transactions,
             source_file=pdf_path.name,
         )
+
+
+def _primary_card(transactions: list[Transaction]) -> Optional[str]:
+    """Which card a statement grouped by card is *for*, or ``None`` if it is not.
+
+    The header regex cannot answer this: on a combined statement it matches every
+    card heading in the table and takes whichever is printed first, which is not
+    reliably the card the summary belongs to. One ICICI statement opens with a
+    zero-prefixed pseudo-card carrying a single cashback adjustment, and naming
+    the statement after that invents a card that does not exist.
+
+    The busiest group is the answer instead — the primary card is the one the
+    statement is mostly about — with ties going to whichever was printed first,
+    which is the order issuers list a relationship's cards in.
+    """
+    counts: dict[str, int] = {}
+    for txn in transactions:
+        if txn.card_masked:
+            counts[txn.card_masked] = counts.get(txn.card_masked, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda card: counts[card])
 
 
 def parse_pdf(

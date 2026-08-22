@@ -490,6 +490,27 @@ def upsert_card(conn: sqlite3.Connection, stmt: Statement, member_id: Optional[i
     return int(cur.lastrowid)
 
 
+def card_id_for_masked(
+    conn: sqlite3.Connection, masked: str, issuer: str, member_id: Optional[int] = None
+) -> int:
+    """The card this masked number belongs to, creating it if it is new.
+
+    Used for the secondary cards on a combined statement, where the number is all
+    the document gives us — there is no product name to go with it. The display
+    name therefore names the issuer and the last four, which is the same shape
+    :func:`card_display_name` produces for a card whose product is unknown.
+    """
+    row = find_card(conn, masked)
+    if row:
+        return int(row["id"])
+    cur = conn.execute(
+        "INSERT INTO cards (issuer, product, masked_number, last4, display_name, member_id)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (issuer, None, masked, masked[-4:], f"{issuer} ••{masked[-4:]}", member_id),
+    )
+    return int(cur.lastrowid)
+
+
 def import_statement(
     conn: sqlite3.Connection, stmt: Statement, member_id: Optional[int] = None
 ) -> tuple[int, int, bool]:
@@ -545,6 +566,20 @@ def import_statement(
     rules = category_rules.rules_for(
         conn, category_rules.resolve(conn, member_id), "cards"
     )
+
+    # A statement that bills several cards prints its table grouped by card, and
+    # each row belongs to the group it was printed under. Attributing the lot to
+    # the statement's primary card silently moves one card's spending onto
+    # another, and the arithmetic checks cannot see it because the summary the
+    # statement reconciles against is itself the combined one.
+    row_card: dict[Optional[str], int] = {None: card_id}
+    for txn in stmt.transactions:
+        if txn.card_masked and txn.card_masked not in row_card:
+            row_card[txn.card_masked] = (
+                card_id if same_card(txn.card_masked, stmt.account_masked or "")
+                else card_id_for_masked(conn, txn.card_masked, stmt.issuer, member_id)
+            )
+
     conn.executemany(
         """INSERT INTO transactions
            (statement_id, card_id, txn_date, txn_time, description, merchant, category,
@@ -553,7 +588,7 @@ def import_statement(
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         [
             (
-                stmt_id, card_id, t.date.isoformat(),
+                stmt_id, row_card.get(t.card_masked, card_id), t.date.isoformat(),
                 t.time.strftime("%H:%M") if t.time else None,
                 t.description, merchant_name(t.description),
                 category_rules.categorize_card(t.description, t.category, rules),
@@ -581,8 +616,10 @@ def import_statement(
             ],
         )
     # Re-evaluate the complete card history: a conversion or cancellation may
-    # arrive in a later statement than the original purchase.
-    _refresh_emi_flags(conn, card_id)
+    # arrive in a later statement than the original purchase. Every card the
+    # statement touched, not just its primary one.
+    for touched in dict.fromkeys(row_card.values()):
+        _refresh_emi_flags(conn, touched)
     conn.commit()
     return stmt_id, len(stmt.transactions), replaced
 

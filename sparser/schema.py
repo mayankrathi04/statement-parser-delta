@@ -38,6 +38,11 @@ class Transaction(BaseModel):
         default=None, description="Description reduced to a comparable merchant name"
     )
     cardholder: Optional[str] = None
+    card_masked: Optional[str] = Field(
+        default=None,
+        description="The card this row was printed under, where the statement groups "
+                    "its table by card. None when the document covers a single card.",
+    )
     is_emi: bool = False
     reward_points: Optional[int] = None
     fcy_currency: Optional[str] = None

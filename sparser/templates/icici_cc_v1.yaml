@@ -48,6 +48,18 @@ row:
   date_formats: ["%d/%m/%Y"]
   date_pattern: '^\s*(\d{2}/\d{2}/\d{4})'
   cardholder_pattern: '^(?!.*)$'
+  # A combined statement groups its table by card, printing each card number on
+  # a line of its own. Rows below such a line belong to that card, not to the
+  # statement's primary one — see Engine._rows_from_block.
+  #
+  # The leading digit must be a real card network (3 Amex/Diners, 4 Visa,
+  # 5 Mastercard, 6 RuPay/Discover). ICICI also heads a group with a
+  # zero-prefixed pseudo-number to carry statement-level adjustments such as
+  # international-spend cashback; that is not a card anyone holds, and matching
+  # it here would put it in the user's card list. Rows under such a heading are
+  # left unattributed and fall to the statement's own card, which is where a
+  # statement-level adjustment belongs.
+  card_pattern: '^([3-6]\d{3}X{8}\d{4})$'
   emi_token: "__none__"
   fcy_pattern: '(?!x)x'
   max_orphan_gap: 16.0
