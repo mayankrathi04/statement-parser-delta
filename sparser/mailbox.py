@@ -29,6 +29,7 @@ from email.message import Message
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from . import inbox as inbox_layout
 from .doctype import classify_bank_mail, classify_mail
 
 log = logging.getLogger("sparser.mailbox")
@@ -291,6 +292,7 @@ def _download_path(
     uid: bytes,
     part_no: int,
     payload: bytes,
+    known: Optional[dict] = None,
 ) -> tuple[Path, bool]:
     """Choose a stable path without confusing same-named bank attachments.
 
@@ -298,29 +300,48 @@ def _download_path(
     Keep legacy paths valid, but when that name already contains different bytes,
     use the immutable mailbox UID and attachment number as a collision suffix.
     Comparing content makes repeat scans idempotent for both naming schemes.
+
+    ``known`` maps file name to wherever the inbox already holds it. Downloads
+    land in ``_unsorted`` but are filed under their card or account once parsed,
+    so an attachment we already have is usually *not* at the path we would write
+    it to — without this lookup every sweep would re-download the lot.
     """
-    legacy = dest / _safe_name(account, subject, filename, when)
-    if not legacy.exists() or legacy.read_bytes() == payload:
-        return legacy, legacy.exists()
+    def _placed(name: str) -> Optional[Path]:
+        here = dest / name
+        if here.exists():
+            return here
+        return (known or {}).get(name)
+
+    legacy_name = _safe_name(account, subject, filename, when)
+    legacy = _placed(legacy_name)
+    if legacy is None:
+        return dest / legacy_name, False
+    if legacy.read_bytes() == payload:
+        return legacy, True
 
     uid_text = re.sub(r"[^A-Za-z0-9_-]+", "_", uid.decode("ascii", "ignore")) or "message"
-    collided = legacy.with_name(f"{legacy.stem}_uid{uid_text}_{part_no}{legacy.suffix}")
-    if collided.exists():
-        if collided.read_bytes() == payload:
-            return collided, True
-        # Defensive only: a UID/part tuple should be immutable, but never overwrite
-        # a local PDF if a provider violates that assumption.
-        digest = hashlib.sha256(payload).hexdigest()[:12]
-        collided = legacy.with_name(
-            f"{legacy.stem}_uid{uid_text}_{part_no}_{digest}{legacy.suffix}"
-        )
-    return collided, collided.exists() and collided.read_bytes() == payload
+    stem = Path(legacy_name).stem
+    collided_name = f"{stem}_uid{uid_text}_{part_no}.pdf"
+    collided = _placed(collided_name)
+    if collided is None:
+        return dest / collided_name, False
+    if collided.read_bytes() == payload:
+        return collided, True
+    # Defensive only: a UID/part tuple should be immutable, but never overwrite
+    # a local PDF if a provider violates that assumption.
+    digest = hashlib.sha256(payload).hexdigest()[:12]
+    digested_name = f"{stem}_uid{uid_text}_{part_no}_{digest}.pdf"
+    digested = _placed(digested_name)
+    if digested is None:
+        return dest / digested_name, False
+    return digested, digested.read_bytes() == payload
 
 
 def fetch_account(
     account: Account,
-    dest: Path,
+    root: Path,
     *,
+    kind: str = inbox_layout.CARDS,
     since: Optional[dt.date] = None,
     before: Optional[dt.date] = None,
     folder: str = '"[Gmail]/All Mail"',
@@ -350,8 +371,16 @@ def fetch_account(
                      ``(filename, bytes)`` pairs it retrieved by following what
                      the body links to. Whatever it returns is saved, deduplicated
                      and reported exactly like an attachment.
+
+    ``root`` is the inbox root, not a download folder: attachments land in that
+    kind's ``_unsorted`` and the pipeline files them under their card or account
+    once parsing says which one it is. See :mod:`sparser.inbox`.
     """
-    dest.mkdir(parents=True, exist_ok=True)
+    root = Path(root)
+    dest = inbox_layout.landing(root, kind)
+    # Snapshot once per mailbox: an attachment already filed away is still an
+    # attachment we have, and re-reading the tree per message would be quadratic.
+    known = inbox_layout.index(root)
     saved: list[Path] = []
     label = _account_label(account.address)
 
@@ -469,7 +498,8 @@ def fetch_account(
                         print(f"  skipped {filename[:60]}  ({reason})")
                     continue
                 out, already_present = _download_path(
-                    dest, account.address, subject, filename, when, uid, part_no, payload
+                    dest, account.address, subject, filename, when, uid, part_no, payload,
+                    known,
                 )
                 if already_present:
                     existing += 1
@@ -477,6 +507,7 @@ def fetch_account(
                         saved.append(out)
                     continue
                 out.write_bytes(payload)
+                known[out.name] = out
                 saved.append(out)
                 downloaded += 1
                 if verbose:
@@ -639,7 +670,7 @@ def hdfc_smart_statement_fetcher(passwords: Iterable[str]) -> LinkFetcher:
 
 def fetch_bank_account(
     account: Account,
-    dest: Path,
+    root: Path,
     *,
     since: Optional[dt.date] = None,
     before: Optional[dt.date] = None,
@@ -657,7 +688,7 @@ def fetch_bank_account(
     is shared.
     """
     return fetch_account(
-        account, dest,
+        account, root, kind=inbox_layout.BANK,
         since=since, before=before, verbose=verbose, include_existing=include_existing,
         senders=senders, subject_searches=subject_searches,
         classifier=classify_bank_mail,
@@ -667,7 +698,7 @@ def fetch_bank_account(
 
 
 def fetch_all(
-    accounts: list[Account], dest: Path, *, months: int = 12, verbose: bool = True
+    accounts: list[Account], root: Path, *, months: int = 12, verbose: bool = True
 ) -> list[Path]:
     since = dt.date.today() - dt.timedelta(days=31 * months)
     out: list[Path] = []
@@ -675,7 +706,7 @@ def fetch_all(
         if verbose:
             print(f"{acct.label}: searching since {since:%b %Y}")
         try:
-            out += fetch_account(acct, dest, since=since, verbose=verbose)
+            out += fetch_account(acct, root, since=since, verbose=verbose)
         except imaplib.IMAP4.error as exc:
             print(f"  ! {acct.label}: {exc}")
     return out

@@ -33,11 +33,18 @@ tests/*
 !tests/test_template_versions.py
 !tests/test_mcp_server.py
 !tests/test_mailbox_collision.py
+!tests/test_inbox_layout.py
 !tests/test_pipeline_filters.py
 !tests/test_bank_statements.py
 !tests/test_bank_corpus.py
 !tests/test_portal_members.py
 !tests/corpus.py
+
+# Last word, after the allowlist: the golden corpus is a verbatim dump of real
+# statements — masked card numbers, credit limits, merchant rows. The same PII
+# as samples/*.pdf, so it never leaves this machine either. Regenerate it with
+# `python scripts/make_golden.py`.
+tests/golden/
 
 graphify-out/
 .graphify_*

@@ -452,7 +452,9 @@ def find_statement(conn: sqlite3.Connection, stmt: Statement) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def _card_display(stmt: Statement) -> str:
+def card_display_name(stmt: Statement) -> str:
+    """The label a card is known by — in the UI, in the cards table, and as the
+    name of the folder its statements are filed under."""
     last4 = (stmt.account_masked or "")[-4:]
     product = (stmt.product or "").strip()
     # Issuers repeat their own name inside the product string ("Tata Neu Infinity
@@ -463,6 +465,18 @@ def _card_display(stmt: Statement) -> str:
     return f"{label} ••{last4}" if last4 else label
 
 
+def card_label(conn: sqlite3.Connection, stmt: Statement) -> str:
+    """What to call this card on disk: the name the card is already saved under,
+    or the one this statement implies if the card is new.
+
+    The saved name has to win. Two statements for the same card can imply
+    different names — one prints an account type the other omits — and deriving
+    the name per statement would scatter one card across two folders.
+    """
+    card = find_card(conn, stmt.account_masked or "")
+    return card["display_name"] if card else card_display_name(stmt)
+
+
 def upsert_card(conn: sqlite3.Connection, stmt: Statement, member_id: Optional[int] = None) -> int:
     masked = stmt.account_masked or f"{stmt.issuer}-unknown"
     row = find_card(conn, masked)
@@ -471,7 +485,7 @@ def upsert_card(conn: sqlite3.Connection, stmt: Statement, member_id: Optional[i
     cur = conn.execute(
         "INSERT INTO cards (issuer, product, masked_number, last4, display_name, member_id)"
         " VALUES (?, ?, ?, ?, ?, ?)",
-        (stmt.issuer, stmt.product, masked, masked[-4:], _card_display(stmt), member_id),
+        (stmt.issuer, stmt.product, masked, masked[-4:], card_display_name(stmt), member_id),
     )
     return int(cur.lastrowid)
 

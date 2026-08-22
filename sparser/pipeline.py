@@ -22,7 +22,7 @@ from typing import Iterable, Optional
 
 import pdfplumber
 
-from . import store
+from . import inbox, store
 from .decrypt import DecryptError, candidate_passwords, decrypt_to, is_encrypted
 from .doctype import document_kind
 from .engine import NoTemplateMatch, TemplateError, parse_pdf
@@ -127,12 +127,18 @@ def ingest_file(
     downloaded: bool = False,
     commit: bool = True,
     card_filter: Optional["CardFilter"] = None,
+    inbox_root: Optional[Path] = None,
 ) -> bool:
     """Run one PDF through every stage, recording each.
 
     With commit=False the document is parsed and validated but nothing is written
     to the analytics tables. That is what makes the review step honest: the list
     the user approves is built from a real parse, not a guess from the filename.
+
+    A PDF that lives in the inbox is moved into its card's folder as soon as the
+    parser says which card it is, and every path recorded from that point on is
+    the new one. Filing after the parse rather than before is what lets the
+    folder names mean something — see :mod:`sparser.inbox`.
     """
     rec.begin_file(pdf.name)
     workfile = pdf
@@ -226,6 +232,16 @@ def ingest_file(
         rec.step("extract", "ok" if stmt.transactions else "failed",
                  f"{len(stmt.transactions)} transactions, period "
                  f"{stmt.period_start} → {stmt.period_end}", parse_ms)
+
+        # The card is known now, so the PDF can stop being unsorted. `workfile`
+        # may be the decrypted temporary next to the original; it is deleted by
+        # name in `finally` and so is unaffected by the move.
+        conn = store.connect(rec.db_path)
+        try:
+            label = store.card_label(conn, stmt)
+        finally:
+            conn.close()
+        pdf = inbox.file_under(pdf, inbox_root or inbox.root(), inbox.CARDS, label)
 
         if card_filter is not None:
             keep, why = card_filter.verdict(stmt.account_masked)
@@ -552,7 +568,7 @@ def run_scan(
             rec.member_id = owner if owner is not None else creds.get("_member_id")
             ingest_file(
                 rec, pdf, creds, force=False, downloaded=True, commit=False,
-                card_filter=card_filter,
+                card_filter=card_filter, inbox_root=dest,
             )
         pending_count = rec.conn.execute(
             "SELECT COUNT(*) FROM ingest_files WHERE run_id = ? AND status = 'pending'",
@@ -730,6 +746,7 @@ def run_fetch(db_path: Path, dest: Path, creds: dict, months: int = 1, force: bo
             rec.member_id = member_id
             ok += bool(ingest_file(
                 rec, pdf, {**creds, "_member_id": member_id}, force=force, downloaded=True,
+                inbox_root=dest,
             ))
         rec.finish("done", f"{ok}/{len(new)} imported")
     except Exception as exc:

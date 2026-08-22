@@ -23,7 +23,7 @@ from typing import Iterable, Optional
 
 import pdfplumber
 
-from . import accounts, bank_store, store
+from . import accounts, bank_store, inbox, store
 from .banks import UnsupportedBankStatement, parse_bank_pdf
 from .decrypt import DecryptError, candidate_passwords, decrypt_to, is_encrypted
 from .doctype import document_kind
@@ -66,7 +66,14 @@ def ingest_file(
     commit: bool = True,
     downloaded: bool = False,
     account_filter: Optional["AccountFilter"] = None,
+    inbox_root: Optional[Path] = None,
 ) -> bool:
+    """One account statement through every stage, recording each.
+
+    The card pipeline's twin, including where the PDF ends up: a file inside the
+    inbox is moved into its account's folder the moment parsing identifies the
+    account, so every path recorded below is the filed one.
+    """
     rec.begin_file(pdf.name)
     workfile = pdf
     temporary: Optional[Path] = None
@@ -130,6 +137,14 @@ def ingest_file(
             f"{len(statement.transactions)} transactions, statement period "
             f"{statement.period_start} → {statement.period_end}", elapsed,
         )
+
+        # The account is known now, so the PDF can stop being unsorted.
+        conn = store.connect(rec.db_path)
+        try:
+            label = bank_store.account_label(conn, statement)
+        finally:
+            conn.close()
+        pdf = inbox.file_under(pdf, inbox_root or inbox.root(), inbox.BANK, label)
 
         # Which account this is can only be known after parsing, so a scan that
         # was asked for specific accounts decides here — the same point the card
@@ -485,6 +500,7 @@ def run_scan_mail(
             rec.member_id = owner if owner is not None else creds.get("_member_id")
             ingest_file(
                 rec, pdf, creds, commit=False, downloaded=True, account_filter=account_filter,
+                inbox_root=dest,
             )
         pending_count = rec.conn.execute(
             "SELECT COUNT(*) FROM ingest_files WHERE run_id=? AND status='pending'",

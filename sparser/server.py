@@ -54,7 +54,7 @@ def serve(
         log_level="info",
         access_log=False,
         reload_excludes=(
-            ["*.db", "*.db-wal", "*.db-shm", "inbox/*", "sparser/web/dist/*", "webapp/dist/*"]
+            ["*.db", "*.db-wal", "*.db-shm", "inbox/**", "sparser/web/dist/*", "webapp/dist/*"]
             if reload else None
         ),
     )

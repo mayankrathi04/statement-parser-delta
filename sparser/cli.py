@@ -84,10 +84,14 @@ def cmd_parse(args) -> int:
 
 
 def _expand(paths) -> list[Path]:
+    """A directory means every PDF beneath it: the inbox keeps one folder per
+    card or account, so a top-level glob would find nothing."""
+    from . import inbox
+
     out: list[Path] = []
     for raw in paths:
         p = Path(raw)
-        out += sorted(p.glob("*.pdf")) if p.is_dir() else [p]
+        out += inbox.pdfs(p) if p.is_dir() else [p]
     return out
 
 

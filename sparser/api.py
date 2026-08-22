@@ -15,11 +15,9 @@ import html
 import os
 import logging
 import re
-import shutil
 import tempfile
 import threading
 import urllib.parse
-import uuid
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
@@ -30,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from . import accounts, bank_pipeline, bank_store, categories, pipeline, portal, store
+from . import accounts, bank_pipeline, bank_store, categories, inbox, pipeline, portal, store
 from .env import load_local_env
 from .logging_config import configure_progress_logging
 
@@ -40,7 +38,7 @@ configure_progress_logging()
 WEB_DIST = Path(__file__).parent / "web" / "dist"
 
 DB_PATH = Path(os.environ.get("SPARSER_DB", "data/statements.db"))
-INBOX = Path(os.environ.get("SPARSER_INBOX", "inbox"))
+INBOX = inbox.root()
 
 app = FastAPI(title="sparser", description="Card and bank statement analytics", version="0.3.0")
 
@@ -1311,18 +1309,21 @@ async def bank_ingest_upload(
     if not _bank_lock.acquire(blocking=False):
         raise HTTPException(409, "a bank ingest run is already in progress")
 
-    upload_dir = INBOX / "bank-uploads" / uuid.uuid4().hex
+    # Uploads land in the same unsorted folder a mail download does, and get
+    # filed under their account by the parser like everything else. The date
+    # prefix mirrors the download naming so one folder sorts sensibly.
+    upload_dir = inbox.landing(INBOX, inbox.BANK)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     saved: list[Path] = []
     try:
-        upload_dir.mkdir(parents=True, exist_ok=False)
         for index, upload in enumerate(files, 1):
             original = Path(upload.filename or f"statement-{index}.pdf").name
             safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", original).strip(" .")
             if not safe.lower().endswith(".pdf"):
                 safe += ".pdf"
-            target = upload_dir / safe
+            target = upload_dir / f"{stamp}_upload_{safe}"
             if target.exists():
-                target = upload_dir / f"{target.stem}-{index}{target.suffix}"
+                target = target.with_name(f"{target.stem}-{index}{target.suffix}")
             size = 0
             first = b""
             with target.open("wb") as handle:
@@ -1337,7 +1338,8 @@ async def bank_ingest_upload(
                 raise HTTPException(422, f"{original} does not contain a valid PDF header")
             saved.append(target)
     except Exception:
-        shutil.rmtree(upload_dir, ignore_errors=True)
+        for path in saved:
+            path.unlink(missing_ok=True)
         _bank_lock.release()
         raise
     finally:
@@ -1548,11 +1550,13 @@ def ingest_fetch(req: FetchRequest, tasks: BackgroundTasks):
 
 
 def _collect(paths: list[str]) -> list[Path]:
+    """Every PDF the caller named. A directory is searched all the way down,
+    because the inbox files statements into a folder per card or account."""
     pdfs: list[Path] = []
     for raw in paths or [str(INBOX)]:
         p = Path(raw).expanduser()
         if p.is_dir():
-            pdfs += sorted(p.glob("*.pdf"))
+            pdfs += inbox.pdfs(p)
         elif p.exists():
             pdfs.append(p)
         else:
@@ -1679,10 +1683,11 @@ def _locate_pdf(conn, filename: Optional[str], path: Optional[str] = None) -> Op
     """Where a statement's PDF still lives on disk, or ``None``.
 
     The row's own path first, then the newest ingest row that carried the same
-    name, then the inbox. All three are needed: a statement row keeps only a
-    file name, and a row that *failed* keeps no path at all — which is exactly
-    the row whose PDF someone wants to look at. The database supplies every
-    path, so a caller cannot ask for an arbitrary local file.
+    name, then a search of the inbox by name. All three are needed: a statement
+    row keeps only a file name, a row that *failed* keeps no path at all — which
+    is exactly the row whose PDF someone wants to look at — and a stored path
+    goes stale when the file is re-filed under a renamed card. The database
+    supplies every name, so a caller cannot ask for an arbitrary local file.
     """
     if path:
         candidate = Path(path)
@@ -1698,8 +1703,7 @@ def _locate_pdf(conn, filename: Optional[str], path: Optional[str] = None) -> Op
         candidate = Path(row["path"])
         if candidate.is_file():
             return candidate
-    fallback = INBOX / filename
-    return fallback if fallback.is_file() else None
+    return inbox.find(INBOX, filename)
 
 
 def _stored_pdf(conn, filename: Optional[str]) -> Path:

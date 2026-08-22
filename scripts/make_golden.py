@@ -1,13 +1,18 @@
-"""Regenerate the golden corpus from the card statements in samples/.
+"""Regenerate the golden corpus for the card ledger.
 
 Run after any deliberate parser change, then diff the JSON: an unexpected line
 in that diff is a regression you would otherwise have shipped.
 
-    python scripts/make_golden.py
+    python scripts/make_golden.py                   # every statement in the corpus
+    python scripts/make_golden.py 202607_foo.pdf    # admit new statements to it
 
-Bank-account PDFs in the same folder are skipped. They are parsed by different
-code, and their narrations are not frozen into git — tests/test_bank_corpus.py
-holds them to their own arithmetic instead.
+The corpus is drawn from the inbox — the source of truth for documents — plus
+anything staged in samples/. A statement in the inbox joins the corpus only once
+it has a golden file, so naming it here is how it gets in; see tests/corpus.py.
+
+Bank-account statements are skipped. They are parsed by different code, and
+their narrations are not frozen into git — tests/test_bank_corpus.py holds them
+to their own arithmetic instead.
 """
 from __future__ import annotations
 
@@ -17,26 +22,41 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-
-import pdfplumber  # noqa: E402
+sys.path.insert(0, str(ROOT / "tests"))
 
 from sparser import parse_pdf  # noqa: E402
-from sparser.doctype import document_kind  # noqa: E402
 
-SAMPLES = ROOT / "samples"
-GOLDEN = ROOT / "tests" / "golden"
+import corpus  # noqa: E402
 
-
-def _is_card(pdf: Path) -> bool:
-    with pdfplumber.open(pdf) as document:
-        text = "\n".join((page.extract_text() or "") for page in document.pages)
-    return document_kind(text)[0] != "bank_account"
+GOLDEN = corpus.GOLDEN
 
 
-def main() -> int:
-    pdfs = [pdf for pdf in sorted(SAMPLES.glob("*.pdf")) if _is_card(pdf)]
+def _named(names: list[str]) -> list[Path]:
+    """Statements asked for by file name, wherever they live and however they
+    are encrypted. Names that match nothing readable are reported, not ignored."""
+    passwords = corpus._passwords()
+    available = {source.name: source for source in corpus._sources()}
+    out: list[Path] = []
+    for name in names:
+        source = available.get(name) or available.get(Path(name).name)
+        if source is None:
+            print(f"{name}: not in the inbox or samples/")
+            continue
+        readable = corpus._readable(source, passwords)
+        if readable is None:
+            print(f"{name}: encrypted, and no password on this machine opens it")
+            continue
+        if corpus.kind(readable) == "bank_account":
+            print(f"{name}: a bank account statement — see tests/test_bank_corpus.py")
+            continue
+        out.append(readable)
+    return out
+
+
+def main(argv: list[str]) -> int:
+    pdfs = _named(argv) if argv else list(corpus.CARD_PDFS)
     if not pdfs:
-        print(f"no card statement PDFs in {SAMPLES}")
+        print("no card statements to write goldens for")
         return 1
     GOLDEN.mkdir(parents=True, exist_ok=True)
 
@@ -54,4 +74,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

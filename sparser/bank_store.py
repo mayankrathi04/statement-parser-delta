@@ -28,6 +28,17 @@ def display_name(stmt: BankStatement) -> str:
     return f"{stmt.bank_name} {kind} ••{stmt.last4}"
 
 
+def account_label(conn, stmt: BankStatement) -> str:
+    """What to call this account on disk: the name it is already saved under, or
+    the one this statement implies if the account is new. See
+    :func:`sparser.store.card_label` for why the saved name wins."""
+    row = conn.execute(
+        "SELECT display_name FROM bank_accounts WHERE account_fingerprint = ?",
+        (stmt.account_fingerprint,),
+    ).fetchone()
+    return row["display_name"] if row else display_name(stmt)
+
+
 def _counterparty(description: str) -> str:
     text = " ".join((description or "").split()).strip(" -")
     upper = text.upper()

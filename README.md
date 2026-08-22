@@ -6,13 +6,40 @@ you can keep adding to. Every extraction is **proved by arithmetic** before it i
 Every statement in the regression corpus parses at 100% confidence, with every
 reconciliation check passing to the paisa.
 
-**`samples/` and `inbox/` hold different things.** `inbox/` is the archive: every PDF
-exactly as the mailbox delivered it, encrypted as the issuer sent it, named
-`YYYYMM_<mailbox>_<issuer's own attachment name>.pdf`. `samples/` is the regression
-corpus, and its files carry that same name so a statement is recognisable in both —
-but decrypted, because the golden tests must run without your PDF passwords or your
-database. Some card statements therefore exist in both folders, same
-name, same statement, one of them openable.
+**`inbox/` is the source of truth for documents**, and holds each one exactly once:
+every PDF as the mailbox delivered it, encrypted as the issuer sent it, named
+`YYYYMM_<mailbox>_<issuer's own attachment name>.pdf`. It is organised by instrument,
+one folder per card and per account:
+
+```
+inbox/
+  cards/
+    hdfc-bank-regalia-1111/       one folder per card, named for the card
+    icici-bank-2222/
+    _unsorted/                    downloaded or uploaded, not parsed yet
+  bank/
+    hdfc-bank-savings-3333/       one folder per account
+    indusind-bank-indus-classic-4444/
+    _unsorted/
+```
+
+Which card or account a statement belongs to is only known once it has been parsed,
+so every PDF lands in `_unsorted` and is moved into place the moment the parser
+identifies it. A file that never parsed stays visibly unsorted rather than being
+filed under a guess. `sparser/inbox.py` is the only module that decides any of this.
+
+**`samples/` is a staging area, not a second archive**, and is normally empty. Drop
+a PDF there while designing a parser for a statement the inbox does not have yet;
+once it parses it belongs in the inbox like everything else.
+
+The regression corpus therefore reads from the inbox, decrypting on the fly with
+the passwords already in your database (`tests/corpus.py`), so no statement is
+stored in two places. The two ledgers earn corpus membership differently, because
+their tests differ. A card test freezes the exact parse against a golden file, so
+that set is deliberate: `python scripts/make_golden.py <name>` is how a statement
+joins. A bank test only asserts that the arithmetic reconciles, so every statement
+filed under an account is in and next month's joins automatically. On a clean
+checkout with no inbox and no database, the corpus tests simply skip.
 
 ## Quick start
 
@@ -335,13 +362,16 @@ Restart the MCP client after changing its configuration.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q      # 129 passing
+.venv/bin/python -m pytest -q      # all green
 python scripts/make_golden.py      # refresh golden corpus after intended changes
 ```
 
-Unit tests always run. Golden-corpus tests parse every PDF in `samples/`, assert all
-arithmetic checks pass, and diff against frozen JSON. Statements are PII and are
-gitignored, so a clean checkout stays green.
+Unit tests always run and need nothing but the repo — a clean checkout with no
+inbox and no database passes in under two seconds. The corpus tests parse real
+statements out of your inbox, assert every arithmetic check reconciles, and diff
+the card parses against frozen JSON; with no statements to read they skip, so a
+clean checkout stays green. No statement, golden file or database is ever
+committed — see `.gitignore`.
 
 ## Known limitations
 
