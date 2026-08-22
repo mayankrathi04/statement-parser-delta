@@ -153,6 +153,44 @@ def cmd_fetch(args) -> int:
     return cmd_import(args)
 
 
+def cmd_bank_fetch(args) -> int:
+    """Sweep the mailboxes for account statements and queue them for review.
+
+    Unlike ``fetch``, this stops at the review queue rather than importing: a
+    bank statement carries a running balance, so a mis-parsed one is worth a
+    glance before it reaches the ledger. Approve from the dashboard, or with the
+    API, once the run reports what it found.
+    """
+    from . import bank_pipeline, store
+    from .mailbox import accounts_from_store
+
+    conn = store.connect(args.db)
+    try:
+        configured = accounts_from_store(conn, purpose="bank")
+    finally:
+        conn.close()
+    if not configured:
+        print(
+            f"{RED}No mailbox is enabled for bank statements.{RESET}\n"
+            "  Connect one on the Connections tab, or export SPARSER_GMAIL for an\n"
+            '  unattended run: export SPARSER_GMAIL="you@gmail.com:apppassword"',
+            file=sys.stderr,
+        )
+        return 2
+
+    run_id = bank_pipeline.run_scan_mail(
+        args.db, args.dest, _creds(args), months=args.months, month=args.month,
+        include_unrecognized_accounts=args.include_unrecognized,
+    )
+    conn = store.connect(args.db)
+    try:
+        run = conn.execute("SELECT status, note FROM ingest_runs WHERE id=?", (run_id,)).fetchone()
+    finally:
+        conn.close()
+    print(f"run #{run_id}: {run['status']} — {run['note']}")
+    return 0 if run["status"] == "done" else 1
+
+
 def cmd_serve(args) -> int:
     from .server import serve
 
@@ -203,6 +241,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--strict", action="store_true")
     _add_credentials(p)
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser(
+        "bank-fetch", help="download bank account statements from Gmail, then review"
+    )
+    p.add_argument("--dest", type=Path, default=Path("inbox"))
+    p.add_argument("--db", type=Path, default=DEFAULT_DB)
+    p.add_argument("--months", type=int, default=1, help="how far back to search")
+    p.add_argument("--month", help='a single statement month as "YYYY-MM"')
+    p.add_argument(
+        "--include-unrecognized", action="store_true",
+        help="also keep statements for accounts not imported yet",
+    )
+    _add_credentials(p)
+    p.set_defaults(func=cmd_bank_fetch)
 
     p = sub.add_parser("serve", help="run the analytics dashboard")
     p.add_argument("--db", type=Path, default=DEFAULT_DB)

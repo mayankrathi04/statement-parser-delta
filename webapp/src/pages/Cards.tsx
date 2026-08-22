@@ -2,7 +2,8 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import type { CardRow, Member } from '../api'
 import { api } from '../api'
 import { seriesVar } from '../components/Charts'
-import IconButton from '../components/IconButton'
+import IconButton, { IconLink } from '../components/IconButton'
+import ScanDefaults from '../components/ScanDefaults'
 import { money0 } from '../lib/format'
 import { importTarget } from '../lib/members'
 
@@ -392,7 +393,15 @@ export default function Cards({
                                   <tr key={h.id}>
                                     <td><b>{h.month}</b></td>
                                     <td>{h.period_start} → {h.period_end}</td>
-                                    <td><code>{h.source_file}</code></td>
+                                    <td>
+                                      <code>{h.source_file}</code>{' '}
+                                      <IconLink
+                                        label="View PDF" icon="open"
+                                        title="View PDF — opens this statement in a new tab"
+                                        href={api.statementPdfUrl(h.id)}
+                                        target="_blank" rel="noreferrer"
+                                      />
+                                    </td>
                                     <td className="num">{h.txns}</td>
                                     <td className="num">{money0(h.spend)}</td>
                                     <td className="num">{money0(h.total_dues)}</td>
@@ -417,6 +426,8 @@ export default function Cards({
           </div>
         )}
       </section>
+
+      <ScanDefaults kind="cards" />
 
       <section className="card">
         <h2>How the password is found</h2>

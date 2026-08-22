@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   api,
+  bankFiltersKey,
   type BankAnalytics as Analysis,
   type BankBootstrap,
   type BankFilters,
@@ -13,6 +14,7 @@ import IconButton from '../components/IconButton'
 import { MonthlyBars, NetBars, RankBars, seriesVar } from '../components/Charts'
 import { reconcileSelection, useCategoryOptions } from '../lib/categories'
 import { money0, money2, monthsBefore } from '../lib/format'
+import { usePagination } from '../lib/pagination'
 
 const RANGES = [
   { label: '1M', months: 1 }, { label: '4M', months: 4 },
@@ -36,7 +38,6 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
   const [transactions, setTransactions] = useState<BankTxn[]>([])
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: 'txn_date', dir: -1 })
-  const [page, setPage] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [editingCategory, setEditingCategory] = useState<number | null>(null)
   const [categoryDraft, setCategoryDraft] = useState('')
@@ -202,14 +203,14 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
     })
   }, [rows])
 
-  // Paging restarts when the result set is rebuilt — a new filter, search or
-  // sort — but not when editing a category rewrites rows already on screen.
-  useEffect(() => { setPage(0) }, [filters, query, sort])
-
+  // Keyed by what the rows are, not by the filter object: editing a category
+  // re-reads the facets and hands back an equal filter with a new identity, and
+  // paging must not restart under a reader who only retagged a row.
   const pageSize = 50
-  const pages = Math.max(1, Math.ceil(rows.length / pageSize))
-  const pageIndex = Math.min(page, pages - 1)
-  const shown = rows.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize)
+  const pager = usePagination(
+    rows, JSON.stringify([bankFiltersKey(filters), query, sort]), pageSize,
+  )
+  const shown = pager.rows
   const heading = (key: SortKey, label: string, right = false, wrapped = false) => (
     <th
       className={wrapped ? 'wrapped' : undefined}
@@ -401,7 +402,7 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
           )}
           {bulkNote && <span className="sub">{bulkNote}</span>}
         </div>
-        <div className="tbl-wrap tbl-scroll bank-tbl">
+        <div className="tbl-wrap tbl-scroll bank-tbl" ref={pager.scroller}>
           <datalist id="bank-category-options">
             {categoryOptions.map((category) => <option key={category} value={category} />)}
           </datalist>
@@ -487,12 +488,12 @@ export default function BankAnalysis({ members }: { members: Set<number> }) {
         </div>
         <div className="table-pager">
           <span className="sub">
-            Rows {rows.length ? pageIndex * pageSize + 1 : 0}–{Math.min(rows.length, (pageIndex + 1) * pageSize)} of {rows.length}
+            Rows {rows.length ? pager.page * pageSize + 1 : 0}–{Math.min(rows.length, (pager.page + 1) * pageSize)} of {rows.length}
           </span>
           <span className="spacer" />
-          <button className="btn" disabled={pageIndex === 0} onClick={() => setPage(pageIndex - 1)}>← Previous</button>
-          <span className="sub">Page {pageIndex + 1} of {pages}</span>
-          <button className="btn" disabled={pageIndex + 1 >= pages} onClick={() => setPage(pageIndex + 1)}>Next →</button>
+          <button className="btn" disabled={pager.page === 0} onClick={() => pager.setPage(pager.page - 1)}>← Previous</button>
+          <span className="sub">Page {pager.page + 1} of {pager.pages}</span>
+          <button className="btn" disabled={pager.page + 1 >= pager.pages} onClick={() => pager.setPage(pager.page + 1)}>Next →</button>
         </div>
       </section>
     </>

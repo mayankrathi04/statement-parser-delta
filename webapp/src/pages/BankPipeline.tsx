@@ -1,6 +1,33 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { api, type IngestFile, type Member, type Pending, type Run, type Step } from '../api'
+import { Link } from 'react-router-dom'
+import {
+  api, type BankAccount, type IngestFile, type Mailbox, type Member, type Pending, type Run,
+  type Step,
+} from '../api'
+import AccountSelect from '../components/AccountSelect'
+import { seriesVar } from '../components/Charts'
+import { IconLink } from '../components/IconButton'
 import { importTarget } from '../lib/members'
+
+/** Where the statements come from. Mail is searched by statement period; an
+ *  upload and a path are taken as given, so the period row is hidden for them. */
+type ScanSource = 'mail' | 'upload' | 'disk'
+
+/** Which window a mail scan covers; picks the date inputs to show. */
+type ScanMode = 'this' | 'month' | 'range' | 'last12'
+
+const SCAN_SOURCES: { value: ScanSource; label: string }[] = [
+  { value: 'mail', label: 'Scan from connection' },
+  { value: 'upload', label: 'Upload statements' },
+  { value: 'disk', label: 'Scan from file' },
+]
+
+const SCAN_MODES: { value: ScanMode; label: string }[] = [
+  { value: 'this', label: 'Scan this month' },
+  { value: 'month', label: 'Scan a specific month' },
+  { value: 'range', label: 'Scan a month range' },
+  { value: 'last12', label: 'Scan the last 12 months' },
+]
 
 const COLOUR: Record<string, string> = {
   ok: 'var(--success-fill)', done: 'var(--success-fill)', failed: 'var(--critical)',
@@ -26,6 +53,17 @@ function Result({ file }: { file: IngestFile }) {
       <div className="file-head" onClick={() => setOpen((value) => !value)}>
         <span className="dot" style={{ background: COLOUR[file.status] ?? 'var(--text-muted)' }} />
         <span className="file-name">{file.filename}</span>
+        {file.pdf_available && (
+          // Inside a header that toggles the card, so the click must not also
+          // collapse the row it was aimed at.
+          <span onClick={(event) => event.stopPropagation()}>
+            <IconLink
+              label="View PDF" icon="open"
+              title="View PDF — opens this statement in a new tab"
+              href={api.ingestFilePdfUrl(file.id)} target="_blank" rel="noreferrer"
+            />
+          </span>
+        )}
         {file.card && <span className="badge">{file.card}</span>}
         {file.template_id && <span className="badge">{file.template_id}</span>}
         {file.txn_count != null && <span className="badge">{file.txn_count} txns</span>}
@@ -55,6 +93,31 @@ function Result({ file }: { file: IngestFile }) {
   )
 }
 
+/** How much of a pending statement the ledger already holds.
+ *
+ *  Statements overlap — a yearly download and the monthly e-statements inside
+ *  it describe the same days — so "40 transactions" and "40 transactions you
+ *  already have" have to read differently before anyone approves either.
+ */
+function Overlap({ row }: { row: Pending }) {
+  const known = row.known_txn_count
+  const fresh = row.new_txn_count
+  if (known == null || fresh == null) return <span className="sub">—</span>
+  if (!known) return <span className="sub">nothing — all {fresh} are new</span>
+  if (!fresh) {
+    return (
+      <span className="badge" title="Approving re-files these; it adds no transactions">
+        all {known} already imported
+      </span>
+    )
+  }
+  return (
+    <span className="badge" style={{ color: 'var(--warning)', borderColor: 'var(--warning)' }}>
+      {fresh} new · {known} already imported
+    </span>
+  )
+}
+
 export default function BankPipeline({
   onChanged, roster, members,
 }: {
@@ -75,6 +138,41 @@ export default function BankPipeline({
   const [sending, setSending] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [scanSource, setScanSource] = useState<ScanSource>('mail')
+  const [scanMode, setScanMode] = useState<ScanMode>('this')
+  const [month, setMonth] = useState(() => new Date().toISOString().slice(0, 7))
+  const [monthFrom, setMonthFrom] = useState(() => new Date().toISOString().slice(0, 7))
+  const [monthTo, setMonthTo] = useState(() => new Date().toISOString().slice(0, 7))
+  const [paths, setPaths] = useState('samples')
+  const [accountList, setAccountList] = useState<BankAccount[]>([])
+  const [scanAccounts, setScanAccounts] = useState<Set<number>>(new Set())
+  const [scanUnknownAccounts, setScanUnknownAccounts] = useState(false)
+  const [connections, setConnections] = useState<Mailbox[]>([])
+  const [scanConnections, setScanConnections] = useState<Set<number>>(new Set())
+
+  // The accounts to filter by, scoped to the members selected at the top. An
+  // account ticked here can vanish when that selection narrows, so keep the
+  // overlap and fall back to everything visible rather than an empty set.
+  useEffect(() => {
+    api.bankBootstrap(members).then(({ accounts }) => {
+      setAccountList(accounts)
+      setScanAccounts((current) => {
+        const visible = accounts.map((account) => account.id)
+        const kept = visible.filter((id) => current.has(id))
+        return new Set(kept.length ? kept : visible)
+      })
+    }).catch(() => undefined)
+  }, [[...members].join(',')])
+
+  // Only mailboxes marked as carrying bank statements: a card-only connection
+  // has nothing to offer this pipeline and should not be offered as a choice.
+  useEffect(() => {
+    api.mailboxes().then(({ mailboxes }) => {
+      const usable = mailboxes.filter((box) => box.secret_ok && box.use_for_bank)
+      setConnections(usable)
+      setScanConnections(new Set(usable.map((box) => box.id)))
+    }).catch(() => undefined)
+  }, [])
 
   const refresh = useCallback(async () => {
     try {
@@ -142,6 +240,74 @@ export default function BankPipeline({
     }
   }
 
+  const scanWindow = (): Record<string, unknown> => {
+    if (scanMode === 'month') return { month }
+    if (scanMode === 'range') return { month_from: monthFrom, month_to: monthTo }
+    return { months: scanMode === 'last12' ? 12 : 1 }
+  }
+
+  const noScanAccounts = Boolean(
+    accountList.length && scanAccounts.size === 0 && !scanUnknownAccounts,
+  )
+  const noScanConnections = Boolean(connections.length && scanConnections.size === 0)
+  const badWindow =
+    (scanMode === 'month' && !month)
+    || (scanMode === 'range' && (!monthFrom || !monthTo || monthFrom > monthTo))
+  const scanDisabled =
+    busy || sending
+    || (scanSource === 'upload'
+      ? !uploads.length
+      : scanSource === 'disk'
+        ? !paths.trim()
+        : noScanAccounts || noScanConnections || badWindow)
+
+  const scan = async () => {
+    if (scanSource === 'upload') { void upload(); return }
+    setSending(true)
+    setError(null)
+    setMessage(null)
+    try {
+      if (scanSource === 'disk') {
+        const response = await api.scanBankLocal({
+          paths: paths.split(',').map((value) => value.trim()).filter(Boolean),
+          password: password || undefined,
+          member_id: target.id,
+        })
+        setMessage(`${response.files.length} file(s) queued for parsing.`)
+      } else {
+        await api.scanBankMail({
+          ...scanWindow(),
+          password: password || undefined,
+          member_id: target.id,
+          // Always explicit: an empty list means "every account in the database"
+          // to the backend, which would reach past the members selected above.
+          account_ids: accountList.length ? [...scanAccounts] : [],
+          include_unrecognized_accounts: scanUnknownAccounts,
+          connection_ids:
+            scanConnections.size < connections.length ? [...scanConnections] : [],
+        })
+        setMessage('Searching your mailboxes for account statements.')
+      }
+      setBusy(true)
+      setFollowLatest(true)
+      await refresh()
+    } catch (caught) {
+      setError(String((caught as Error).message))
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const toggleConnection = (id: number) => {
+    const next = new Set(scanConnections)
+    next.has(id) ? next.delete(id) : next.add(id)
+    setScanConnections(next)
+  }
+
+  const colourOf = (id: number) => seriesVar(
+    [...accountList].sort((a, b) => a.id - b.id).findIndex((account) => account.id === id),
+  )
+
   const toggle = (id: number) => {
     const next = new Set(picked)
     next.has(id) ? next.delete(id) : next.add(id)
@@ -188,51 +354,195 @@ export default function BankPipeline({
 
   return (
     <>
-      <section className="card">
-        <h2>Upload bank statements</h2>
-        <p className="hint">
-          This pipeline accepts digital-text HDFC, ICICI, IndusInd and IDFC FIRST
-          account-statement PDFs. Files are classified,
-          parsed and balance-validated first. Nothing enters the bank ledger until you review the
-          confidence and checks below and explicitly approve it.
-        </p>
-        <div className="upload-row">
-          <label className="upload-picker">
-            <span className="btn">Choose PDFs</span>
+      <div className="scan-bar">
+        <div className="scan-stack">
+          {/* Row 1 — where the statements come from. */}
+          <div className="scan-row">
+            <span className="sub">Source</span>
+            <select
+              className="select"
+              value={scanSource}
+              onChange={(event) => setScanSource(event.target.value as ScanSource)}
+              aria-label="Where to scan account statements from"
+            >
+              {SCAN_SOURCES.map((source) => (
+                <option key={source.value} value={source.value}>{source.label}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Row 2 — when to scan. An upload and a path are taken as given, so a
+              statement period means nothing for them and the row is dropped. */}
+          {scanSource === 'mail' && (
+            <div className="scan-row">
+              <span className="sub">Period</span>
+              <select
+                className="select"
+                value={scanMode}
+                onChange={(event) => setScanMode(event.target.value as ScanMode)}
+                aria-label="Statement period to scan"
+              >
+                {SCAN_MODES.map((mode) => (
+                  <option key={mode.value} value={mode.value}>{mode.label}</option>
+                ))}
+              </select>
+              {scanMode === 'month' && (
+                <span className="dates">
+                  <input type="month" value={month} onChange={(event) => setMonth(event.target.value)} />
+                </span>
+              )}
+              {scanMode === 'range' && (
+                <span className="dates">
+                  <input type="month" value={monthFrom} onChange={(event) => setMonthFrom(event.target.value)} />
+                  <span className="sub">to</span>
+                  <input type="month" value={monthTo} onChange={(event) => setMonthTo(event.target.value)} />
+                </span>
+              )}
+              {badWindow && (
+                <span className="sub" style={{ color: 'var(--critical)' }}>
+                  {scanMode === 'range'
+                    ? 'Pick a start month no later than the end month.'
+                    : 'Pick a month.'}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Row 3 — what to scan: the account and mailbox filters, or the files. */}
+          {scanSource === 'upload' ? (
+            <div className="scan-row">
+              <span className="sub">Files</span>
+              <label className="upload-picker">
+                <span className="btn">Choose PDFs</span>
+                <input
+                  type="file" accept="application/pdf,.pdf" multiple
+                  onChange={(event) => setUploads(Array.from(event.target.files ?? []))}
+                />
+              </label>
+              <span className="sub">
+                {uploads.length
+                  ? `${uploads.length} selected · ${uploads.map((file) => file.name).join(', ')}`
+                  : 'No files selected'}
+              </span>
+            </div>
+          ) : scanSource === 'disk' ? (
+            <div className="scan-row">
+              <span className="sub">File</span>
+              <input
+                className="input"
+                value={paths}
+                onChange={(event) => setPaths(event.target.value)}
+                placeholder="file, folder or glob"
+                aria-label="File, folder or glob to scan"
+              />
+              <span className="sub">Separate several with commas.</span>
+            </div>
+          ) : (
+            <div className="scan-row">
+              <span className="sub">Fetch only</span>
+              <AccountSelect
+                accounts={accountList}
+                selected={scanAccounts}
+                colourOf={colourOf}
+                onChange={setScanAccounts}
+                unrecognized={{
+                  checked: scanUnknownAccounts, onChange: setScanUnknownAccounts,
+                }}
+              />
+              {connections.length > 0 && (
+                <details className="ms">
+                  <summary className="ms-btn" style={{ cursor: 'pointer' }}>
+                    {scanConnections.size === connections.length
+                      ? `All connections (${connections.length})`
+                      : `${scanConnections.size} of ${connections.length} connections`}
+                  </summary>
+                  <div className="ms-panel">
+                    {connections.map((box) => (
+                      <label className="ms-row" key={box.id}>
+                        <input
+                          type="checkbox"
+                          checked={scanConnections.has(box.id)}
+                          onChange={() => toggleConnection(box.id)}
+                        />
+                        <span>{box.address}</span>
+                      </label>
+                    ))}
+                    <div className="ms-foot">
+                      <button
+                        className="link"
+                        onClick={() => setScanConnections(new Set(connections.map((box) => box.id)))}
+                      >
+                        Select all
+                      </button>
+                      <button className="link" onClick={() => setScanConnections(new Set())}>
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                </details>
+              )}
+              {noScanAccounts && (
+                <span className="sub" style={{ color: 'var(--critical)' }}>
+                  Select at least one account.
+                </span>
+              )}
+              {scanUnknownAccounts && (
+                <span className="sub">
+                  Including accounts you have not imported yet — the mailbox search widens to
+                  every known bank, so a scan takes longer.
+                </span>
+              )}
+              {noScanConnections && (
+                <span className="sub" style={{ color: 'var(--critical)' }}>
+                  Select at least one connection.
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Row 4 — the password. It opens an encrypted PDF and, for an HDFC
+              smart statement, the link's password gate as well. */}
+          <div className="scan-row">
+            <span className="sub">Password</span>
             <input
-              type="file" accept="application/pdf,.pdf" multiple
-              onChange={(event) => setUploads(Array.from(event.target.files ?? []))}
+              className="input" type="password" placeholder="statement password (optional)"
+              value={password} onChange={(event) => setPassword(event.target.value)}
             />
-          </label>
-          <span className="sub">
-            {uploads.length
-              ? `${uploads.length} selected · ${uploads.map((file) => file.name).join(', ')}`
-              : 'No files selected'}
-          </span>
+            <span className="sub">
+              Left blank, the name and date of birth saved on the Cards tab are used to derive it —
+              and a password already saved for the account is always tried first.
+            </span>
+          </div>
         </div>
-        <div className="form-row">
-          <input
-            className="input" type="password" placeholder="PDF password (optional)"
-            value={password} onChange={(event) => setPassword(event.target.value)}
-          />
-          <button
-            className="btn primary" disabled={!uploads.length || sending || busy} onClick={upload}
-          >
-            {sending ? 'Uploading…' : busy ? 'Pipeline busy…' : 'Upload and review'}
-          </button>
+
+        <button className="btn primary scan-go" disabled={scanDisabled} onClick={scan}>
+          {sending ? 'Working…' : busy ? 'Pipeline busy…' : '↧ Scan'}
+        </button>
+      </div>
+
+      <p className="hint" style={{ marginTop: -4 }}>
+        This pipeline accepts digital-text HDFC, ICICI, IndusInd and IDFC FIRST account statements.
+        HDFC mails a link rather than a file — the smart statement is followed through its password
+        gate and the PDF behind it is fetched. Every statement is classified, parsed and
+        balance-validated first; nothing enters the bank ledger until you review the confidence and
+        checks below and approve it.
+      </p>
+      <p className="hint">
+        Statements fetched from a mailbox are filed under whoever owns that mailbox. Anything else —
+        an upload, a disk scan, a statement from an unowned mailbox — is filed under{' '}
+        <b>{target.name}</b>{target.explicit ? '' : ' (your default member)'}, which follows the
+        member selector at the top of the page. A new account keeps that member; statements for an
+        account you already have stay with whoever owns it.
+      </p>
+      {scanSource === 'mail' && !connections.length && (
+        <div className="banner">
+          No mailbox is enabled for bank statements yet — connect one on the{' '}
+          <Link to="/connections">Connections</Link> tab and tick “Bank statements” for it.
+          Uploading and scanning from disk work without it.
         </div>
-        <p className="hint" style={{ marginBottom: 0 }}>
-          Filing under <b>{target.name}</b>
-          {target.explicit
-            ? ' — the member selected at the top of the page.'
-            : ' (your default member). To file these under someone else, pick that one member'
-              + ' in the selector at the top of the page before uploading.'}
-          {' '}A new account keeps this member; statements for an account you already
-          have stay with whoever owns it.
-        </p>
-        {message && <div className="banner upload-message">{message}</div>}
-        {error && <div className="banner upload-error">{error}</div>}
-      </section>
+      )}
+      {message && <div className="banner upload-message">{message}</div>}
+      {error && <div className="banner upload-error">{error}</div>}
 
       {!!pending.length && (
         <section className="card" style={{ borderColor: 'var(--warning)' }}>
@@ -265,7 +575,8 @@ export default function BankPipeline({
             <table>
               <thead><tr>
                 <th style={{ width: 34 }}></th><th>Statement</th><th>Account</th><th>Member</th>
-                <th>Statement period</th><th style={{ textAlign: 'right' }}>Txns</th><th>Validation</th>
+                <th>Statement period</th><th style={{ textAlign: 'right' }}>Txns</th>
+                <th>Already imported</th><th>Validation</th>
               </tr></thead>
               <tbody>
                 {pending.map((row) => {
@@ -285,6 +596,7 @@ export default function BankPipeline({
                       <td>{row.member_name ?? <span className="sub">{target.name}</span>}</td>
                       <td>{row.period_start && row.period_end ? `${row.period_start} → ${row.period_end}` : '—'}</td>
                       <td className="num">{row.txn_count ?? 0}</td>
+                      <td><Overlap row={row} /></td>
                       <td>
                         <span
                           className="badge"

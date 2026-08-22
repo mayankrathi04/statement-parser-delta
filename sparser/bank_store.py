@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import re
 import sqlite3
+from collections import Counter
 from typing import Any, Iterable, Optional
 
 from . import store
@@ -114,6 +115,85 @@ def find_statement(conn: sqlite3.Connection, stmt: BankStatement) -> Optional[di
     return dict(row) if row else None
 
 
+def unseen_transactions(
+    conn: sqlite3.Connection,
+    account_id: int,
+    transactions: list,
+    exclude_statement_id: Optional[int] = None,
+) -> list[bool]:
+    """Which of these rows the account does not already hold.
+
+    Statements overlap. A yearly download and the monthly e-statements for the
+    months inside it describe the same transactions, and storing both counted
+    every shared day twice — the only thing that ever stopped it was an exact
+    match on the statement period.
+
+    Matched on date, amount, direction and the running balance after the row,
+    and *counted* rather than merely looked up: three identical-looking rows on
+    one day are three transactions, so a statement repeating two of them adds
+    one. A plain "does one exist" test would silently drop the third.
+
+    Deliberately not matched on narration or reference. HDFC's mailed statement
+    prints no reference column at all and words its narration differently from
+    the downloaded one, so the same transaction reads differently in each and
+    every overlapping row would look new. The running balance is what the two
+    layouts agree on, and it is also what separates two payments of the same
+    amount on the same day.
+
+    ``exclude_statement_id`` drops the rows of a statement that is about to be
+    replaced: re-importing a period rewrites those rows instead of adding to
+    them, so they are not "already held".
+    """
+    if not transactions:
+        return []
+    dates = [row.date.isoformat() for row in transactions]
+    # A date range, not a list of dates: an account holds years of rows and only
+    # the days this statement touches can collide.
+    query = """SELECT txn_date, amount, direction, balance FROM bank_transactions
+               WHERE account_id = ? AND txn_date BETWEEN ? AND ?"""
+    args: list[Any] = [account_id, min(dates), max(dates)]
+    if exclude_statement_id is not None:
+        query += " AND statement_id != ?"
+        args.append(exclude_statement_id)
+    held = Counter(
+        (row["txn_date"], row["amount"], row["direction"], row["balance"])
+        for row in conn.execute(query, args).fetchall()
+    )
+    unseen = []
+    for row in transactions:
+        key = (
+            row.date.isoformat(), store.to_paise(row.amount),
+            row.type.value, store.to_paise(row.balance),
+        )
+        if held[key]:
+            held[key] -= 1
+            unseen.append(False)
+        else:
+            unseen.append(True)
+    return unseen
+
+
+def import_preview(conn: sqlite3.Connection, stmt: BankStatement) -> dict:
+    """How much of this statement the ledger already holds, storing nothing.
+
+    Read before the import so the review screen can say what approving would
+    actually do — add forty transactions, add twelve, or add none at all.
+    """
+    total = len(stmt.transactions)
+    account = conn.execute(
+        "SELECT id FROM bank_accounts WHERE account_fingerprint = ?",
+        (stmt.account_fingerprint,),
+    ).fetchone()
+    if not account:
+        return {"total": total, "known": 0, "new": total}
+    replacing = find_statement(conn, stmt)
+    new = sum(unseen_transactions(
+        conn, int(account["id"]), stmt.transactions,
+        exclude_statement_id=(replacing or {}).get("id"),
+    ))
+    return {"total": total, "known": total - new, "new": new}
+
+
 def upsert_account(
     conn: sqlite3.Connection, stmt: BankStatement, member_id: Optional[int] = None
 ) -> int:
@@ -150,8 +230,14 @@ def upsert_account(
 
 def import_statement(
     conn: sqlite3.Connection, stmt: BankStatement, member_id: Optional[int] = None
-) -> tuple[int, int, bool, int]:
-    """Insert/replace a bank statement and return statement, rows, replaced, account."""
+) -> tuple[int, int, bool, int, int]:
+    """Insert/replace a bank statement.
+
+    Returns (statement, rows stored, replaced, account, rows already held). Rows
+    the account already holds are skipped rather than stored a second time — see
+    :func:`unseen_transactions` — so statements that overlap union instead of
+    double-counting the days they share.
+    """
     _ensure_enrichment(conn)
     from . import categories as category_rules
 
@@ -185,6 +271,17 @@ def import_statement(
         }
         conn.execute("DELETE FROM bank_statements WHERE id = ?", (existing["id"],))
 
+    # After the replacement delete above, so a re-import of the same period sees
+    # its own previous rows as gone rather than as already held.
+    incoming = [
+        row for row, unseen in
+        zip(stmt.transactions, unseen_transactions(conn, account_id, stmt.transactions))
+        if unseen
+    ]
+    already_held = len(stmt.transactions) - len(incoming)
+
+    # The period the statement covers, as printed — not as stored. A statement
+    # whose rows were all held already still covered those dates.
     coverage_start = min((t.date for t in stmt.transactions), default=None)
     coverage_end = max((t.date for t in stmt.transactions), default=None)
     cur = conn.execute(
@@ -217,7 +314,7 @@ def import_statement(
                 _category(row.description, rules), store.to_paise(row.amount), row.type.value,
                 store.to_paise(row.signed), store.to_paise(row.balance), row.page, row.raw,
             )
-            for row in stmt.transactions
+            for row in incoming
         ],
     )
     if overrides:
@@ -239,7 +336,7 @@ def import_statement(
             ],
         )
     conn.commit()
-    return statement_id, len(stmt.transactions), replaced, account_id
+    return statement_id, len(incoming), replaced, account_id, already_held
 
 
 def update_transaction_category(
@@ -426,6 +523,8 @@ def accounts(conn: sqlite3.Connection, member_ids: Iterable[int] = ()) -> list[d
     for row in rows:
         item = dict(row)
         item.pop("account_fingerprint", None)
+        item["sender_ids"] = json.loads(item.pop("sender_ids_json", None) or "[]")
+        item["subject_patterns"] = json.loads(item.pop("subject_patterns_json", None) or "[]")
         item["history"] = history.get(item["id"], [])
         result.append(item)
     return result

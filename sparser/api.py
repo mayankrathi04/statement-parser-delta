@@ -11,19 +11,21 @@ a request open.
 from __future__ import annotations
 
 import datetime as dt
+import html
 import os
 import logging
 import re
 import shutil
 import tempfile
 import threading
+import urllib.parse
 import uuid
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -225,6 +227,37 @@ class FetchRequest(Credentials):
     include_unrecognized_cards: bool = False
     connection_ids: list[int] = Field(default_factory=list)
     force: bool = False
+
+
+class BankFetchRequest(Credentials):
+    """The card scan's request, with accounts where cards would be."""
+
+    months: int = Field(default=1, ge=1, le=36)
+    month: Optional[str] = Field(
+        default=None, description='Specific statement month as "YYYY-MM"; overrides months'
+    )
+    month_from: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    month_to: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}$")
+    account_ids: list[int] = Field(default_factory=list)
+    #: Keep statements whose account matches none of the saved ones. Without it
+    #: an account that has never been imported can never be scanned, because the
+    #: account list a scan filters on is only written by an import.
+    include_unrecognized_accounts: bool = False
+    connection_ids: list[int] = Field(default_factory=list)
+
+
+class ScanDefaultsIn(BaseModel):
+    """The fallback mailbox search. Either list left empty restores the built-in one."""
+
+    sender_ids: list[str] = Field(default_factory=list)
+    subject_patterns: list[str] = Field(default_factory=list)
+
+
+class MailboxScopeIn(BaseModel):
+    """Which pipelines may sweep a mailbox. Both off pauses it without deleting it."""
+
+    use_for_cards: bool = True
+    use_for_bank: bool = True
 
 
 class ApproveRequest(Credentials):
@@ -435,7 +468,12 @@ def bootstrap(members: Optional[str] = None):
             # scope would widen to every card rather than to none.
             "categories": store.category_facets(conn, sql_ids),
             "statements": [row for row in store.statements(conn) if row["card_id"] in card_ids],
-            "mailboxes_configured": bool(accounts.listing(conn, scope))
+            # `_scope(conn)`, never the member-selector scope above: a mailbox
+            # is swept by every scan whatever member owns it — the statements
+            # it yields are filed under its owner — so narrowing the top-bar
+            # selector to a member who owns none must not report the user's
+            # connected mailboxes as missing.
+            "mailboxes_configured": bool(accounts.listing(conn, _scope(conn)))
             or bool(os.environ.get("SPARSER_GMAIL", "").strip()),
         }
     finally:
@@ -521,6 +559,18 @@ def bank_bootstrap(members: Optional[str] = None):
     conn = db()
     try:
         visible = bank_store.accounts(conn, _scope(conn, _member_ids(members)))
+        # Whether a statement password is stored, never the value itself.
+        meta = accounts.bank_secret_meta(conn)
+        fingerprints = {
+            row["id"]: row["account_fingerprint"] for row in conn.execute(
+                "SELECT id, account_fingerprint FROM bank_accounts"
+            ).fetchall()
+        }
+        for row in visible:
+            entry = meta.get(fingerprints.get(row["id"], ""))
+            row["password_set"] = entry is not None
+            row["password_source"] = (entry or {}).get("source")
+            row["password_updated_at"] = (entry or {}).get("updated_at")
         ids = [row["id"] for row in visible] or [-1]
         bounds = conn.execute(
             f"SELECT MIN(txn_date) min, MAX(txn_date) max FROM bank_transactions WHERE account_id IN ({','.join('?' * len(ids))})",
@@ -991,6 +1041,56 @@ def set_card_mail_rules(card_id: int, body: CardMailRulesIn):
         conn.close()
 
 
+def _scan_kind(kind: str) -> str:
+    if kind not in ("cards", "bank"):
+        raise HTTPException(404, "scan defaults exist for 'cards' and 'bank'")
+    return kind
+
+
+@app.get("/api/scan-defaults/{kind}")
+def get_scan_defaults(kind: str):
+    """What a scan searches for a card or account with no rules of its own.
+
+    That is every unrecognized one, so this is the filter behind the
+    "Unrecognized cards/accounts" option — worth being able to see and edit
+    rather than guess at.
+    """
+    from . import mailbox
+
+    conn = db()
+    try:
+        return mailbox.scan_defaults(conn, _scan_kind(kind))
+    finally:
+        conn.close()
+
+
+@app.put("/api/scan-defaults/{kind}")
+def save_scan_defaults(kind: str, body: ScanDefaultsIn):
+    from . import mailbox
+
+    if len(body.sender_ids) > 60 or len(body.subject_patterns) > 60:
+        raise HTTPException(422, "at most 60 sender and 60 subject rules")
+    conn = db()
+    try:
+        return mailbox.set_scan_defaults(
+            conn, _scan_kind(kind), body.sender_ids, body.subject_patterns
+        )
+    finally:
+        conn.close()
+
+
+@app.delete("/api/scan-defaults/{kind}")
+def reset_scan_defaults(kind: str):
+    """Back to the lists the project ships with."""
+    from . import mailbox
+
+    conn = db()
+    try:
+        return mailbox.clear_scan_defaults(conn, _scan_kind(kind))
+    finally:
+        conn.close()
+
+
 @app.put("/api/cards/{card_id}/member")
 def assign_card_member(card_id: int, body: MemberAssignmentIn):
     conn = db()
@@ -1097,11 +1197,103 @@ def assign_mailbox_member(mailbox_id: int, body: MemberAssignmentIn):
         conn.close()
 
 
+@app.put("/api/mailboxes/{mailbox_id}/scope")
+def set_mailbox_scope(mailbox_id: int, body: MailboxScopeIn):
+    """Choose which pipelines sweep this mailbox.
+
+    A mailbox that never receives card statements should not be searched on every
+    card scan, and the reverse — the search is the slow part of a scan, so this is
+    the difference between a sweep that takes seconds and one that takes minutes.
+    """
+    conn = db()
+    try:
+        if mailbox_id not in {row["id"] for row in accounts.listing(conn, _scope(conn))}:
+            raise HTTPException(404, "no such mailbox")
+        accounts.set_scope(conn, mailbox_id, body.use_for_cards, body.use_for_bank)
+        return {
+            "status": "saved",
+            "use_for_cards": body.use_for_cards,
+            "use_for_bank": body.use_for_bank,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- ingest
 
 def _spawn(fn, *args) -> None:
     log.info("starting background job: %s", getattr(fn, "__name__", "job"))
     threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+@app.put("/api/bank/accounts/{account_id}/mail-rules")
+def set_bank_account_mail_rules(account_id: int, body: CardMailRulesIn):
+    """Narrow the mailbox search for one account, exactly as a card can."""
+    def cleaned(values: list[str]) -> list[str]:
+        return list(dict.fromkeys(v.strip().lower() for v in values if v.strip()))
+
+    senders = cleaned(body.sender_ids)
+    subjects = cleaned(body.subject_patterns)
+    if len(senders) > 30 or len(subjects) > 30:
+        raise HTTPException(422, "an account supports at most 30 sender and 30 subject rules")
+    conn = db()
+    try:
+        if account_id not in {row["id"] for row in bank_store.accounts(conn, _scope(conn))}:
+            raise HTTPException(404, "no such bank account")
+        if not store.set_bank_account_mail_rules(conn, account_id, senders, subjects):
+            raise HTTPException(404, "no such bank account")
+        return {"status": "saved", "sender_ids": senders, "subject_patterns": subjects}
+    finally:
+        conn.close()
+
+
+def _bank_fingerprint(conn, account_id: int) -> str:
+    """The account's identity, checked against what the caller may see."""
+    if account_id not in {row["id"] for row in bank_store.accounts(conn, _scope(conn))}:
+        raise HTTPException(404, "no such bank account")
+    row = conn.execute(
+        "SELECT account_fingerprint FROM bank_accounts WHERE id = ?", (account_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "no such bank account")
+    return row["account_fingerprint"]
+
+
+@app.get("/api/bank/accounts/{account_id}/password")
+def reveal_bank_account_password(account_id: int):
+    """Explicit, separate request — the value is never included in listings."""
+    conn = db()
+    try:
+        secret = accounts.bank_password(conn, _bank_fingerprint(conn, account_id))
+        if secret is None:
+            raise HTTPException(404, "no password stored for this account")
+        return {"password": secret}
+    finally:
+        conn.close()
+
+
+@app.put("/api/bank/accounts/{account_id}/password")
+def set_bank_account_password(account_id: int, body: CardPasswordIn):
+    """The password that opens this account's statements — and its HDFC smart
+    statement gate, which asks for the same thing the PDF does."""
+    conn = db()
+    try:
+        accounts.set_bank_password(
+            conn, _bank_fingerprint(conn, account_id), body.password, source="manual"
+        )
+        return {"status": "saved"}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/bank/accounts/{account_id}/password")
+def delete_bank_account_password(account_id: int):
+    conn = db()
+    try:
+        accounts.clear_bank_password(conn, _bank_fingerprint(conn, account_id))
+        return {"status": "removed"}
+    finally:
+        conn.close()
 
 
 @app.post("/api/bank/ingest/upload")
@@ -1168,6 +1360,81 @@ async def bank_ingest_upload(
 
     _spawn(job)
     return {"status": "started", "files": [path.name for path in saved]}
+
+
+@app.post("/api/bank/ingest/scan")
+def bank_ingest_scan(req: BankFetchRequest):
+    """Sweep the mailboxes for account statements, storing nothing.
+
+    The bank twin of ``/api/ingest/scan``: same windows, same connection filter,
+    same review queue at the end. Only mailboxes ticked for bank statements are
+    searched.
+    """
+    conn = db()
+    try:
+        from .mailbox import accounts_from_store
+
+        if not accounts_from_store(conn, purpose="bank"):
+            raise HTTPException(
+                400,
+                "No mailbox is enabled for bank statements. Add a Gmail account on the "
+                "Connections tab, or tick “Bank statements” for one already connected.",
+            )
+    finally:
+        conn.close()
+    if bool(req.month_from) != bool(req.month_to):
+        raise HTTPException(422, "month_from and month_to must be supplied together")
+    if req.month_from and req.month_to:
+        try:
+            pipeline.month_range_window(req.month_from, req.month_to)
+        except (ValueError, TypeError):
+            raise HTTPException(422, "month_from must be a valid month not after month_to")
+    if not _bank_lock.acquire(blocking=False):
+        raise HTTPException(409, "a bank ingest run is already in progress")
+
+    creds = _owned_credentials(req)
+    log.info(
+        "bank mail scan requested: %s",
+        f"month {req.month}" if req.month else f"last {req.months} month(s)",
+    )
+
+    def job():
+        try:
+            bank_pipeline.run_scan_mail(
+                DB_PATH, INBOX, creds, months=req.months, month=req.month,
+                month_from=req.month_from, month_to=req.month_to,
+                account_ids=req.account_ids, connection_ids=req.connection_ids,
+                include_unrecognized_accounts=req.include_unrecognized_accounts,
+            )
+        finally:
+            _bank_lock.release()
+
+    _spawn(job)
+    return {
+        "status": "started", "month": req.month, "months": req.months,
+        "month_from": req.month_from, "month_to": req.month_to,
+        "account_ids": req.account_ids,
+        "include_unrecognized_accounts": req.include_unrecognized_accounts,
+        "connection_ids": req.connection_ids,
+    }
+
+
+@app.post("/api/bank/ingest/scan-local")
+def bank_ingest_scan_local(req: ImportRequest):
+    """The same review flow for account statements already on disk."""
+    pdfs = _collect(req.paths)
+    if not _bank_lock.acquire(blocking=False):
+        raise HTTPException(409, "a bank ingest run is already in progress")
+    creds = _owned_credentials(req)
+
+    def job():
+        try:
+            bank_pipeline.run_scan(DB_PATH, pdfs, creds)
+        finally:
+            _bank_lock.release()
+
+    _spawn(job)
+    return {"status": "started", "files": [path.name for path in pdfs]}
 
 
 @app.get("/api/bank/pending")
@@ -1242,7 +1509,7 @@ def bank_run_detail(run_id: int):
         ).fetchone()
         if not found:
             raise HTTPException(404, "no such bank ingest run")
-        return pipeline.run_detail(conn, run_id)
+        return _with_pdf_availability(conn, pipeline.run_detail(conn, run_id))
     finally:
         conn.close()
 
@@ -1254,11 +1521,12 @@ def ingest_fetch(req: FetchRequest, tasks: BackgroundTasks):
     try:
         from .mailbox import accounts_from_store
 
-        if not accounts_from_store(conn):
+        if not accounts_from_store(conn, purpose="cards"):
             raise HTTPException(
                 400,
-                "No mailboxes connected. Add a Gmail account on the Connections tab "
-                "using an app password from https://myaccount.google.com/apppasswords",
+                "No mailbox is enabled for card statements. Add a Gmail account on the "
+                "Connections tab using an app password from "
+                "https://myaccount.google.com/apppasswords, and tick “Card statements” for it.",
             )
     finally:
         conn.close()
@@ -1321,11 +1589,12 @@ def ingest_scan(req: FetchRequest):
     try:
         from .mailbox import accounts_from_store
 
-        if not accounts_from_store(conn):
+        if not accounts_from_store(conn, purpose="cards"):
             raise HTTPException(
                 400,
-                "No mailboxes connected. Add a Gmail account on the Connections tab "
-                "using an app password from https://myaccount.google.com/apppasswords",
+                "No mailbox is enabled for card statements. Add a Gmail account on the "
+                "Connections tab using an app password from "
+                "https://myaccount.google.com/apppasswords, and tick “Card statements” for it.",
             )
     finally:
         conn.close()
@@ -1391,46 +1660,73 @@ def pending():
         conn.close()
 
 
-@app.get("/api/pending/{file_id}/pdf")
-def pending_pdf(file_id: int):
-    """Open the PDF attached to a pending review row in the browser.
+def _viewer_passwords(conn, member_id: Optional[int] = None) -> list[str]:
+    """What may open a stored statement: every saved password, then the
+    conventions derived from the profiles, the owner's first."""
+    from .decrypt import candidate_passwords
 
-    The database supplies the path—callers cannot request an arbitrary local
-    file. Encrypted statements are unlocked into a short-lived temporary copy
-    using the same saved card passwords/profile conventions as ingestion.
+    return list(dict.fromkeys(
+        list(accounts.all_card_passwords(conn).values())
+        + [
+            password
+            for profile in accounts.all_profiles(conn, member_id)
+            for password in candidate_passwords(profile["full_name"], profile["dob"])
+        ]
+    ))
+
+
+def _locate_pdf(conn, filename: Optional[str], path: Optional[str] = None) -> Optional[Path]:
+    """Where a statement's PDF still lives on disk, or ``None``.
+
+    The row's own path first, then the newest ingest row that carried the same
+    name, then the inbox. All three are needed: a statement row keeps only a
+    file name, and a row that *failed* keeps no path at all — which is exactly
+    the row whose PDF someone wants to look at. The database supplies every
+    path, so a caller cannot ask for an arbitrary local file.
     """
-    conn = db()
-    try:
-        row = conn.execute(
-            """SELECT filename, path FROM ingest_files
-               WHERE id = ? AND status = 'pending'
-                 AND COALESCE(document_type,'credit_card') != 'bank_account'""",
-            (file_id,),
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "no such pending statement")
-        source = Path(row["path"])
-        if not source.is_file():
-            raise HTTPException(404, "statement PDF is no longer on disk")
+    if path:
+        candidate = Path(path)
+        if candidate.is_file():
+            return candidate
+    if not filename:
+        return None
+    for row in conn.execute(
+        """SELECT path FROM ingest_files
+           WHERE filename = ? AND COALESCE(path,'') != '' ORDER BY id DESC""",
+        (filename,),
+    ).fetchall():
+        candidate = Path(row["path"])
+        if candidate.is_file():
+            return candidate
+    fallback = INBOX / filename
+    return fallback if fallback.is_file() else None
 
-        from .decrypt import DecryptError, candidate_passwords, decrypt_to, is_encrypted
 
-        if not is_encrypted(source):
-            return FileResponse(
-                source,
-                media_type="application/pdf",
-                filename=row["filename"],
-                content_disposition_type="inline",
-            )
+def _stored_pdf(conn, filename: Optional[str]) -> Path:
+    """:func:`_locate_pdf` for callers that have nothing to show without it."""
+    if not filename:
+        raise HTTPException(404, "this statement has no source file recorded")
+    found = _locate_pdf(conn, filename)
+    if found is None:
+        raise HTTPException(404, f"{filename} is no longer on disk")
+    return found
 
-        known = accounts.all_card_passwords(conn)
-        profile = accounts.get_profile(conn)
-        passwords = list(dict.fromkeys(
-            list(known.values())
-            + candidate_passwords(profile.get("full_name"), profile.get("dob"))
-        ))
-    finally:
-        conn.close()
+
+class _Locked(Exception):
+    """No password on hand opened the PDF — ask the reader for one."""
+
+
+def _pdf_response(source: Path, filename: str, passwords: list[str]) -> FileResponse:
+    """Serve a statement inline, unlocking it into a short-lived copy if needed."""
+    from .decrypt import DecryptError, decrypt_to, is_encrypted
+
+    if not is_encrypted(source):
+        return FileResponse(
+            source,
+            media_type="application/pdf",
+            filename=filename,
+            content_disposition_type="inline",
+        )
 
     handle = tempfile.NamedTemporaryFile(prefix="sparser-view-", suffix=".pdf", delete=False)
     temporary = Path(handle.name)
@@ -1439,15 +1735,220 @@ def pending_pdf(file_id: int):
         decrypt_to(source, temporary, passwords)
     except DecryptError as exc:
         temporary.unlink(missing_ok=True)
-        raise HTTPException(422, "saved passwords could not unlock this PDF") from exc
+        raise _Locked from exc
 
     return FileResponse(
         temporary,
         media_type="application/pdf",
-        filename=row["filename"],
+        filename=filename,
         content_disposition_type="inline",
         background=BackgroundTask(temporary.unlink, missing_ok=True),
     )
+
+
+#: Where each kind of viewable PDF says its password can be recorded for next time.
+_WHERE_TO_SAVE = {
+    "statement": "on the Cards tab",
+    "bank": "on the Bank Accounts tab",
+    "ingest": "on the card or account once the statement imports",
+    "pending": "on the Cards tab",
+}
+
+
+def _unlock_page(request: Request, kind: str, ident: int, filename: str, failed: bool) -> HTMLResponse:
+    """Ask for the password instead of answering a locked PDF with a JSON error.
+
+    This route is opened by a person clicking a link, not by a script, so the
+    dead end has to be one they can act on: a field, a button, and the PDF
+    itself the moment the password fits. The form POSTs — a password does not
+    belong in a URL, a browser history or an access log.
+    """
+    # The token rides the query string on links, and the form has to carry it
+    # back or the POST arrives unauthenticated.
+    token = request.query_params.get("access_token", "")
+    action = f"/api/pdf/unlock?access_token={urllib.parse.quote(token)}" if token else "/api/pdf/unlock"
+    note = (
+        "That password did not open it. Check for a different one — issuers use the customer "
+        "ID for account statements and the name/date-of-birth form for cards."
+        if failed else
+        "This statement is password protected and none of the saved passwords opened it. "
+        "A password typed into a scan box is never kept, so it has to be given again here."
+    )
+    return HTMLResponse(f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Password needed — {html.escape(filename)}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         margin: 0; display: grid; place-items: center; min-height: 100vh;
+         background: Canvas; color: CanvasText; }}
+  .box {{ width: min(30rem, calc(100vw - 2.5rem)); padding: 1.75rem;
+          border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 12px; }}
+  h1 {{ font-size: 1.05rem; margin: 0 0 .35rem; }}
+  .file {{ font-family: ui-monospace, monospace; font-size: .82rem; word-break: break-all;
+           color: color-mix(in srgb, CanvasText 65%, transparent); margin-bottom: 1rem; }}
+  p {{ margin: 0 0 1.15rem; color: color-mix(in srgb, CanvasText 75%, transparent); }}
+  .bad {{ color: #c0392b; }}
+  form {{ display: flex; gap: .5rem; flex-wrap: wrap; }}
+  input {{ flex: 1 1 12rem; padding: .6rem .7rem; font: inherit; border-radius: 8px;
+           border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+           background: Field; color: FieldText; }}
+  button {{ padding: .6rem 1.1rem; font: inherit; font-weight: 600; border: 0; border-radius: 8px;
+            background: #2f6fdb; color: #fff; cursor: pointer; }}
+</style></head>
+<body><div class="box">
+  <h1>Password needed</h1>
+  <div class="file">{html.escape(filename)}</div>
+  <p{' class="bad"' if failed else ''}>{html.escape(note)}</p>
+  <form method="post" action="{html.escape(action)}">
+    <input type="hidden" name="kind" value="{html.escape(kind)}">
+    <input type="hidden" name="ident" value="{ident}">
+    <input type="password" name="password" placeholder="statement password" autofocus
+           autocomplete="off" aria-label="Statement password">
+    <button type="submit">View PDF</button>
+  </form>
+  <p style="margin:1.15rem 0 0;font-size:.85rem">
+    Save it {html.escape(_WHERE_TO_SAVE.get(kind, ""))} and every later statement opens without asking.
+  </p>
+</div></body></html>""")
+
+
+def _resolve_pdf(conn, kind: str, ident: int) -> tuple[Path, str, Optional[int]]:
+    """(file on disk, its name, the member it belongs to) for one viewable PDF.
+
+    One resolver for every list that shows statements — the review queue, the
+    run history, the card and bank statement tables — so they cannot drift on
+    what is visible to whom or on where the file is looked for.
+    """
+    if kind == "pending":
+        row = conn.execute(
+            """SELECT filename, path, member_id FROM ingest_files
+               WHERE id = ? AND status = 'pending'
+                 AND COALESCE(document_type,'credit_card') != 'bank_account'""",
+            (ident,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "no such pending statement")
+        source = _locate_pdf(conn, row["filename"], row["path"])
+        if source is None:
+            raise HTTPException(404, "statement PDF is no longer on disk")
+        return source, row["filename"], row["member_id"]
+
+    if kind == "ingest":
+        row = conn.execute(
+            "SELECT filename, path, member_id FROM ingest_files WHERE id = ?", (ident,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "no such ingest file")
+        # Rows predating member attribution carry none; those stay as visible as
+        # the run history that lists them.
+        if row["member_id"] is not None and row["member_id"] not in set(_scope(conn)):
+            raise HTTPException(404, "no such ingest file")
+        source = _locate_pdf(conn, row["filename"], row["path"])
+        if source is None:
+            raise HTTPException(404, f"{row['filename']} is no longer on disk")
+        return source, row["filename"], row["member_id"]
+
+    if kind == "statement":
+        visible = {row["id"]: row["member_id"] for row in store.cards(conn, _scope(conn))}
+        row = conn.execute(
+            "SELECT source_file, card_id FROM statements WHERE id = ?", (ident,)
+        ).fetchone()
+        if not row or row["card_id"] not in visible:
+            raise HTTPException(404, "no such statement")
+        return _stored_pdf(conn, row["source_file"]), row["source_file"], visible[row["card_id"]]
+
+    if kind == "bank":
+        visible = {
+            row["id"]: row["member_id"] for row in bank_store.accounts(conn, _scope(conn))
+        }
+        row = conn.execute(
+            "SELECT source_file, account_id FROM bank_statements WHERE id = ?", (ident,)
+        ).fetchone()
+        if not row or row["account_id"] not in visible:
+            raise HTTPException(404, "no such bank statement")
+        return (
+            _stored_pdf(conn, row["source_file"]), row["source_file"], visible[row["account_id"]]
+        )
+
+    raise HTTPException(404, "no such statement")
+
+
+def _serve_pdf(request: Request, kind: str, ident: int, password: str = ""):
+    """A statement in the browser, or the page that asks how to open it."""
+    conn = db()
+    try:
+        source, filename, member = _resolve_pdf(conn, kind, ident)
+        # What the reader just typed comes first; it is not stored, only tried.
+        passwords = ([password] if password else []) + _viewer_passwords(conn, member)
+    finally:
+        conn.close()
+    try:
+        return _pdf_response(source, filename, passwords)
+    except _Locked:
+        return _unlock_page(request, kind, ident, filename, failed=bool(password))
+
+
+@app.post("/api/pdf/unlock")
+def unlock_pdf(
+    request: Request,
+    kind: str = Form(...),
+    ident: int = Form(...),
+    password: str = Form(""),
+):
+    """Retry one locked statement with the password the reader supplied."""
+    return _serve_pdf(request, kind, ident, password.strip())
+
+
+@app.get("/api/pending/{file_id}/pdf")
+def pending_pdf(request: Request, file_id: int):
+    """Open the PDF attached to a pending review row in the browser.
+
+    The database supplies the path—callers cannot request an arbitrary local
+    file. Encrypted statements are unlocked into a short-lived temporary copy
+    using the same saved card passwords/profile conventions as ingestion.
+    """
+    return _serve_pdf(request, "pending", file_id)
+
+
+def _with_pdf_availability(conn, detail: dict) -> dict:
+    """Say, per file, whether its PDF can still be opened from the history.
+
+    A disk check rather than a status check: "downloaded" is not the same as
+    "still there", and the history outlives the inbox.
+    """
+    for row in detail.get("files", []):
+        row["pdf_available"] = _locate_pdf(conn, row.get("filename"), row.get("path")) is not None
+    return detail
+
+
+@app.get("/api/ingest/files/{file_id}/pdf")
+def ingest_file_pdf(request: Request, file_id: int):
+    """Open the PDF behind any row of a run's history — imported, pending or failed.
+
+    The review queue and the two statement lists have their own routes; this is
+    the history's, where the row worth opening is usually the one that failed
+    and so became neither. Available for as long as the file itself is: once a
+    download step has succeeded there is something to show.
+    """
+    return _serve_pdf(request, "ingest", file_id)
+
+
+@app.get("/api/statements/{statement_id}/pdf")
+def statement_pdf(request: Request, statement_id: int):
+    """Open the PDF an imported card statement was parsed from.
+
+    Scoped through the same card listing the Cards tab is built from, so a
+    statement belonging to a member this user cannot see is not readable by id.
+    """
+    return _serve_pdf(request, "statement", statement_id)
+
+
+@app.get("/api/bank/statements/{statement_id}/pdf")
+def bank_statement_pdf(request: Request, statement_id: int):
+    """The bank twin of ``/api/statements/{id}/pdf``."""
+    return _serve_pdf(request, "bank", statement_id)
 
 
 @app.post("/api/pending/discard")
@@ -1511,7 +2012,7 @@ def run_detail(run_id: int):
         detail = pipeline.run_detail(conn, run_id)
         if not detail:
             raise HTTPException(404, "no such run")
-        return detail
+        return _with_pdf_availability(conn, detail)
     finally:
         conn.close()
 

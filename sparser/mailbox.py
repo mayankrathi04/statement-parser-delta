@@ -21,13 +21,15 @@ import imaplib
 import logging
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from email.header import decode_header, make_header
 from email.message import Message
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
-from .doctype import classify_mail
+from .doctype import classify_bank_mail, classify_mail
 
 log = logging.getLogger("sparser.mailbox")
 
@@ -50,6 +52,21 @@ STATEMENT_SENDERS = [
 # then makes the real decision.
 SUBJECT_SEARCHES = ["credit card statement", "credit card e-statement", "card statement"]
 
+# The same two lists for deposit accounts. Kept separate rather than shared: a
+# bank sends both products from one address, so only the subject can tell them
+# apart, and widening the card lists would pull account statements into card
+# scans (and the reverse) before any classifier got a say.
+BANK_STATEMENT_SENDERS = [
+    "hdfcbank.net", "hdfcbank.com", "statements.example.bank", "icicibank.com",
+    "axisbank.com", "kotak.com", "idfcfirstbank.com", "indusind.com", "sbi.co.in",
+    "yesbank.in", "rblbank.com", "aubank.in", "federalbank.co.in", "pnb.co.in",
+]
+
+BANK_SUBJECT_SEARCHES = [
+    "account statement", "bank statement", "savings account statement",
+    "statement of account", "smart statement", "e-statement",
+]
+
 
 def _account_label(address: str) -> str:
     """Recognisable in local logs without printing the full mailbox address."""
@@ -63,8 +80,15 @@ def _account_label(address: str) -> str:
 def _gmail_search_query(
     senders: Iterable[str], since: dt.date, before: Optional[dt.date],
     subject_searches: Iterable[str] = SUBJECT_SEARCHES,
+    require_pdf: bool = True,
 ) -> str:
-    """One Gmail-native query replacing many sequential IMAP SEARCH calls."""
+    """One Gmail-native query replacing many sequential IMAP SEARCH calls.
+
+    ``require_pdf`` is not always true. HDFC's smart statement mail carries a
+    link to a password gate and no attachment at all, so a bank sweep that
+    insisted on ``has:attachment`` would never see the one statement it was
+    opened for.
+    """
     sender_terms = [f"from:{sender}" for sender in senders]
     subject_terms = [f'subject:"{phrase}"' for phrase in subject_searches]
     dates = f"after:{since:%Y/%m/%d}"
@@ -77,7 +101,9 @@ def _gmail_search_query(
         groups.append("{" + " ".join(sender_terms) + "}")
     if subject_terms:
         groups.append("{" + " ".join(subject_terms) + "}")
-    raw = f"{dates} {' '.join(groups)} has:attachment filename:pdf"
+    raw = f"{dates} {' '.join(groups)}"
+    if require_pdf:
+        raw += " has:attachment filename:pdf"
     return '"' + raw.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
@@ -92,6 +118,76 @@ class Account:
     @property
     def label(self) -> str:
         return self.address
+
+
+# The built-in lists above are a starting point, not a rule. They are what a scan
+# searches for a card or account that has no rules of its own — which is every
+# unrecognized one, since only an import can create a saved rule. That makes them
+# the one filter a user cannot otherwise see or influence, so they are editable
+# and stored per install; the built-ins remain the fallback and the reset target.
+BUILT_IN_RULES = {
+    "cards": (STATEMENT_SENDERS, SUBJECT_SEARCHES),
+    "bank": (BANK_STATEMENT_SENDERS, BANK_SUBJECT_SEARCHES),
+}
+
+_RULE_KEY = "scan_defaults"
+
+
+def _rule_kind(kind: str) -> str:
+    if kind not in BUILT_IN_RULES:
+        raise ValueError(f"unknown scan kind {kind!r}; expected one of {sorted(BUILT_IN_RULES)}")
+    return kind
+
+
+def scan_defaults(conn, kind: str) -> dict:
+    """The sender/subject lists a scan falls back to, and whether they were edited."""
+    import json
+
+    senders, subjects = BUILT_IN_RULES[_rule_kind(kind)]
+    row = conn.execute(
+        "SELECT value FROM app_metadata WHERE key = ?", (f"{_RULE_KEY}.{kind}",)
+    ).fetchone()
+    saved = json.loads(row["value"]) if row else {}
+    return {
+        "senders": saved.get("senders") or list(senders),
+        "subjects": saved.get("subjects") or list(subjects),
+        "customised": bool(saved),
+        "built_in_senders": list(senders),
+        "built_in_subjects": list(subjects),
+    }
+
+
+def set_scan_defaults(conn, kind: str, senders: Iterable[str], subjects: Iterable[str]) -> dict:
+    """Replace the fallback lists. Empty for either field restores the built-in one,
+    so a scan can never be left with nothing to search."""
+    import json
+
+    cleaned = {
+        "senders": [value.strip().lower() for value in senders if value.strip()],
+        "subjects": [value.strip().lower() for value in subjects if value.strip()],
+    }
+    conn.execute(
+        """INSERT INTO app_metadata (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (f"{_RULE_KEY}.{_rule_kind(kind)}", json.dumps(cleaned)),
+    )
+    conn.commit()
+    return scan_defaults(conn, kind)
+
+
+def clear_scan_defaults(conn, kind: str) -> dict:
+    conn.execute("DELETE FROM app_metadata WHERE key = ?", (f"{_RULE_KEY}.{_rule_kind(kind)}",))
+    conn.commit()
+    return scan_defaults(conn, kind)
+
+
+#: (subject, filename, sender) -> (accept?, reason). ``doctype`` supplies one
+#: per product; the sweep itself stays neutral about which is in force.
+Classifier = Callable[..., tuple[bool, str]]
+
+#: (message, subject, sender) -> the (filename, bytes) pairs retrieved by
+#: following whatever the body links to.
+LinkFetcher = Callable[[Message, str, str], Iterable[tuple[str, bytes]]]
 
 
 @dataclass
@@ -116,18 +212,26 @@ def accounts_from_env(var: str = "SPARSER_GMAIL") -> list[Account]:
     return out
 
 
-def accounts_from_store(conn) -> list[Account]:
+def accounts_from_store(conn, purpose: Optional[str] = None) -> list[Account]:
     """Mailboxes connected through the UI, plus anything configured in the env.
 
     The env form stays supported because a scheduled job on a server has no UI to
     click through; the two sources are merged with the stored ones winning.
+
+    ``purpose`` is "cards" or "bank". A mailbox can be marked as carrying only
+    one of the two, and then it is swept only by that pipeline — a personal
+    account with no cards should not be searched on every card scan. Mailboxes
+    configured through the environment have no such marking and serve both.
     """
     from . import accounts as store_accounts
 
+    column = {"cards": "use_for_cards", "bank": "use_for_bank"}.get(purpose or "")
     out: list[Account] = []
     seen: set[str] = set()
     for row in store_accounts.listing(conn):
         if not row["secret_ok"]:
+            continue
+        if column and not row.get(column, 1):
             continue
         secret = store_accounts.secret_for(conn, row["address"])
         if secret:
@@ -224,12 +328,28 @@ def fetch_account(
     verbose: bool = True,
     include_existing: bool = False,
     subject_searches: Iterable[str] = SUBJECT_SEARCHES,
+    classifier: Classifier = classify_mail,
+    require_pdf: bool = True,
+    link_fetcher: Optional[LinkFetcher] = None,
 ) -> list[Path]:
-    """Download credit-card statement PDFs from one mailbox.
+    """Download statement PDFs from one mailbox.
 
     Only the small Subject/From/Date header is fetched for each search hit first.
     Full messages (which can contain multi-megabyte PDFs) are fetched only after
     the mail-header classifier accepts them.
+
+    Everything product-specific arrives as an argument, because card and account
+    statements differ only in *which* mail counts and *how* the document is
+    attached — never in the sweep itself:
+
+    ``classifier``   decides from the headers, and is the one place the card and
+                     bank pipelines disagree about what they are looking for.
+    ``require_pdf``  drops the ``has:attachment`` clause when statements can
+                     arrive as a link instead of a file.
+    ``link_fetcher`` is given a message that carried no PDF, and may return
+                     ``(filename, bytes)`` pairs it retrieved by following what
+                     the body links to. Whatever it returns is saved, deduplicated
+                     and reported exactly like an attachment.
     """
     dest.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
@@ -262,7 +382,8 @@ def fetch_account(
         log.info("%s Gmail combined search 1/1", label)
         try:
             status, data = conn.search(
-                None, "X-GM-RAW", _gmail_search_query(sender_list, window, before, subject_list)
+                None, "X-GM-RAW",
+                _gmail_search_query(sender_list, window, before, subject_list, require_pdf),
             )
         except imaplib.IMAP4.error:
             status, data = "NO", []
@@ -303,7 +424,7 @@ def fetch_account(
                 any(rule.lower() in sender.lower() for rule in sender_list)
                 and any(rule.lower() in subject.lower() for rule in subject_list)
             )
-            accepted, reason = classify_mail(subject, sender=sender)
+            accepted, reason = classifier(subject, sender=sender)
             if custom_match:
                 accepted, reason = True, "matched configured card mail rules"
             if not accepted:
@@ -322,11 +443,24 @@ def fetch_account(
             except Exception:
                 pass
 
-            for part_no, (filename, payload) in enumerate(_pdf_parts(msg), 1):
+            parts = list(_pdf_parts(msg))
+            if not parts and link_fetcher is not None:
+                # No attachment, but the mail passed the header gate — so the
+                # document it announces is behind a link. Failures here are the
+                # message's alone and must not abort the sweep.
+                try:
+                    parts = list(link_fetcher(msg, subject, sender))
+                except Exception as exc:
+                    rejected += 1
+                    if verbose:
+                        print(f"  skipped {subject[:60]}  ({exc})")
+                    log.warning("%s could not follow %s: %s", label, subject[:60], exc)
+                    continue
+            for part_no, (filename, payload) in enumerate(parts, 1):
                 # Re-check with the filename. It can strengthen an ambiguous
                 # issuer subject, while the PDF-text gate in pipeline.py remains
                 # the final authority on card statement vs bank account.
-                accepted, reason = classify_mail(subject, filename, sender)
+                accepted, reason = classifier(subject, filename, sender)
                 if custom_match:
                     accepted, reason = True, "matched configured card mail rules"
                 if not accepted:
@@ -362,6 +496,174 @@ def fetch_account(
             log.info("%s disconnected", label)
         except Exception:
             pass
+
+
+# ------------------------------------------------- statements that arrive as links
+
+def _body_text(msg: Message) -> str:
+    """Every text/html and text/plain part, concatenated, for link hunting."""
+    chunks: list[str] = []
+    for part in msg.walk():
+        if part.get_content_maintype() != "text":
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        chunks.append(payload.decode(charset, "replace"))
+    return "\n".join(chunks)
+
+
+#: What the button reading "View your SmartStatement" says, however it is spelt
+#: and wherever it is written — the visible words, an image's alt text, or the
+#: campaign tag the bank puts in the URL itself (``utm_tag=View_SmartStatement1``).
+SMART_BUTTON = re.compile(r"view\s*(your\s*)?smart\s*statement", re.I)
+
+
+class _Anchors(HTMLParser):
+    """Collect ``href`` → the words a reader sees on it.
+
+    Written out rather than regexed because the label is routinely broken up by
+    nested markup — ``<a><b>View your</b> SmartStatement</a>`` — or carried by an
+    image instead of text, and a regex over the raw anchor sees neither as one
+    phrase.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.labels: dict[str, str] = {}
+        self._href: Optional[str] = None
+        self._words: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        values = dict(attrs)
+        if tag == "a":
+            self._flush()
+            self._href = (values.get("href") or "").strip()
+            self._words = []
+        elif tag == "img" and self._href is not None:
+            self._words.append(values.get("alt") or values.get("title") or "")
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None:
+            self._words.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a":
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._href:
+            label = " ".join(" ".join(self._words).split())
+            # The first label that says anything wins: the same href is usually
+            # repeated in a footer that wraps it around nothing readable.
+            self.labels[self._href] = self.labels.get(self._href, "") or label
+        self._href, self._words = None, []
+
+    def close(self) -> None:  # pragma: no cover - parser bookkeeping
+        self._flush()
+        super().close()
+
+
+def _anchor_labels(body: str) -> dict[str, str]:
+    parser = _Anchors()
+    try:
+        parser.feed(body)
+        parser.close()
+    except Exception:  # noqa: BLE001 - a malformed part must not lose the links
+        log.debug("could not parse anchors out of the mail body", exc_info=True)
+    return {href.replace("&amp;", "&"): label for href, label in parser.labels.items()}
+
+
+def smart_statement_links(msg: Message) -> list[str]:
+    """Smart-statement URLs in a mail body, most specific first, deduplicated.
+
+    A campaign mail repeats the link in the button, the fallback text and the
+    footer; they are all the same job, and following one is enough.
+
+    What identifies the link is the host and its ``job``, never the wording on
+    the button: the label is decoration the bank is free to change, and a mail
+    whose button is an image or another language would stop being fetchable if
+    the label were required. It is used to *order* the candidates instead, so
+    when a mail does carry several jobs the one under "View your
+    SmartStatement" is the one walked first.
+    """
+    from .smartstatement import SMART_LINK
+
+    body = _body_text(msg)
+    labels = _anchor_labels(body)
+    found: list[str] = []
+    for match in SMART_LINK.finditer(body):
+        link = match.group(0).rstrip(").,;'\"")
+        # HTML entities survive the decode; the query string is where they land.
+        link = link.replace("&amp;", "&")
+        if "job=" in link.lower() and link not in found:
+            found.append(link)
+
+    def rank(link: str) -> int:
+        if SMART_BUTTON.search(labels.get(link, "")):
+            return 0
+        # The campaign tag is the same words, machine-readable and immune to the
+        # markup the label is wrapped in.
+        if SMART_BUTTON.search(urllib.parse.unquote(link).replace("_", " ")):
+            return 1
+        return 2
+
+    # Stable, so links of equal standing stay in the order the mail wrote them.
+    return sorted(found, key=rank)
+
+
+def hdfc_smart_statement_fetcher(passwords: Iterable[str]) -> LinkFetcher:
+    """A :data:`LinkFetcher` that walks HDFC's password gate for a linked PDF.
+
+    Bound to the password candidates the pipeline resolved, so the mailbox sweep
+    itself never has to know how a statement password is derived.
+    """
+    candidates = list(passwords)
+
+    def fetch(msg: Message, subject: str, sender: str) -> list[tuple[str, bytes]]:
+        from .smartstatement import SmartStatementError, fetch_pdf
+
+        links = smart_statement_links(msg)
+        if not links:
+            raise SmartStatementError("no attachment, and no smart statement link in the body")
+        pdf, used = fetch_pdf(links[0], candidates)
+        log.info("smart statement retrieved for %s (%d bytes)", subject[:60], len(pdf))
+        # Named after the mail, not the gate: the gate serves every statement
+        # from one path, so its own name distinguishes nothing.
+        stem = re.sub(r"[^A-Za-z0-9]+", "_", subject).strip("_")[:48] or "smart_statement"
+        return [(f"{stem}.pdf", pdf)]
+
+    return fetch
+
+
+def fetch_bank_account(
+    account: Account,
+    dest: Path,
+    *,
+    since: Optional[dt.date] = None,
+    before: Optional[dt.date] = None,
+    verbose: bool = True,
+    include_existing: bool = False,
+    senders: Iterable[str] = BANK_STATEMENT_SENDERS,
+    subject_searches: Iterable[str] = BANK_SUBJECT_SEARCHES,
+    passwords: Iterable[str] = (),
+) -> list[Path]:
+    """The mailbox sweep, pointed at deposit-account statements.
+
+    Same machinery as the card sweep with three substitutions: the bank header
+    classifier, no attachment requirement, and a link fetcher for HDFC's smart
+    statement. Everything downstream — naming, deduplication, the review queue —
+    is shared.
+    """
+    return fetch_account(
+        account, dest,
+        since=since, before=before, verbose=verbose, include_existing=include_existing,
+        senders=senders, subject_searches=subject_searches,
+        classifier=classify_bank_mail,
+        require_pdf=False,
+        link_fetcher=hdfc_smart_statement_fetcher(passwords),
+    )
 
 
 def fetch_all(

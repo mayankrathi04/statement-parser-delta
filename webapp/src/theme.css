@@ -233,6 +233,14 @@ th.wrapped, td.wrapped {
 }
 /* References are machine tokens with no spaces, so they may break anywhere. */
 td.wrapped code { white-space: normal; overflow-wrap: anywhere; }
+/* The wide twin, for columns whose content is long by nature: a regex pattern,
+   or the list of sub-categories a major collects. Wide enough to read a rule
+   without breaking it every few characters, still bounded so one long pattern
+   cannot push the table sideways. */
+th.wrapped-wide, td.wrapped-wide {
+  white-space: normal; overflow-wrap: break-word; min-width: 200px; max-width: 360px;
+}
+td.wrapped-wide code, td.wrapped-wide .pattern { overflow-wrap: anywhere; }
 .cre { color: var(--success); }
 .pill { font-size: 11.5px; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; }
 
@@ -322,6 +330,13 @@ code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-
 }
 .conn-row:last-child { border-bottom: 0; }
 .conn-addr { font-size: 14px; font-weight: 600; }
+/* Which pipelines sweep this mailbox. Stacked so the two read as one control
+   rather than two stray checkboxes competing with the row's other actions. */
+.conn-scope {
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 12.5px; color: var(--text-secondary); white-space: nowrap;
+}
+.conn-scope label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
 .input {
   background: var(--surface-1); border: 1px solid var(--border);

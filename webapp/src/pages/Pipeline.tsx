@@ -75,6 +75,17 @@ function FileCard({ file }: { file: IngestFile }) {
       <div className="file-head" onClick={() => setOpen((o) => !o)}>
         <Dot status={file.status} />
         <span className="file-name">{file.filename}</span>
+        {file.pdf_available && (
+          // Inside a header that toggles the card, so the click must not also
+          // collapse the row it was aimed at.
+          <span onClick={(event) => event.stopPropagation()}>
+            <IconLink
+              label="View PDF" icon="open"
+              title="View PDF — opens this statement in a new tab"
+              href={api.ingestFilePdfUrl(file.id)} target="_blank" rel="noreferrer"
+            />
+          </span>
+        )}
         {file.card && <span className="badge">{file.card}</span>}
         {file.encrypted && <span className="badge">🔒 encrypted</span>}
         {file.template_id && <span className="badge">{file.template_id}</span>}
@@ -201,6 +212,10 @@ function ReviewList({
       onImported()
     } catch (e) {
       setErr(String((e as Error).message))
+    } finally {
+      // Always, not only on failure: importing part of the list leaves the rest
+      // on screen, so this list stays mounted and nothing else would ever clear
+      // the flag — the buttons sat on "Importing…" for the rows still pending.
       setBusy(false)
     }
   }
@@ -332,13 +347,17 @@ export default function Pipeline({
     })
   }, [boot])
 
+  // Only mailboxes marked as carrying card statements, matching what a scan
+  // actually sweeps: a bank-only connection offered here would be silently
+  // skipped. Not scoped to the member selector either — a mailbox is swept
+  // whoever owns it, and its statements are filed under that owner.
   useEffect(() => {
     api.mailboxes().then(({ mailboxes }) => {
-      const usable = mailboxes.filter((box) => box.secret_ok)
+      const usable = mailboxes.filter((box) => box.secret_ok && box.use_for_cards)
       setConnections(usable)
       setFetchConnections(new Set(usable.map((box) => box.id)))
     }).catch(() => undefined)
-  }, [boot?.mailboxes_configured])
+  }, [])
 
   const loadRuns = useCallback(async () => {
     const r = await api.runs().catch(() => null)
@@ -561,11 +580,11 @@ export default function Pipeline({
       </p>
 
       {msg && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{msg}</div>}
-      {boot && !boot.mailboxes_configured && (
+      {!connections.length && (
         <div className="banner">
-          No mailbox connected yet — add your Gmail accounts on the{' '}
-          <Link to="/connections">Connections</Link> tab to enable fetching. Scanning from disk works
-          without it.
+          No mailbox is enabled for card statements yet — add your Gmail account on the{' '}
+          <Link to="/connections">Connections</Link> tab and tick “Card statements” for it. Scanning
+          from disk works without it.
         </div>
       )}
 

@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  api, type Analytics as A, type Bootstrap, type CategoryFacet, type Filters, type Txn,
+  api, filtersKey, type Analytics as A, type Bootstrap, type CategoryFacet, type Filters, type Txn,
 } from '../api'
 import CardSelect from '../components/CardSelect'
 import CategorySelect from '../components/CategorySelect'
 import IconButton from '../components/IconButton'
+import TablePager from '../components/TablePager'
 import { MonthlyBars, RankBars, seriesVar } from '../components/Charts'
 import { reconcileSelection, useCategoryOptions } from '../lib/categories'
 import { money0, money2, monthsBefore } from '../lib/format'
+import { usePagination } from '../lib/pagination'
 
 const RANGES: { label: string; months: number }[] = [
   { label: '1M', months: 1 },
@@ -21,69 +23,6 @@ const RANGES: { label: string; months: number }[] = [
 type SortKey =
   | 'txn_date' | 'statement_month' | 'debit' | 'credit' | 'merchant' | 'category' | 'card'
 type ForeignSortKey = 'original' | 'billed'
-type PageSize = 25 | 50 | 75 | 'all'
-
-/**
- * `resetKey` describes what the rows are — the filters, search and sort behind
- * them. Paging restarts when that changes, but not when a category edit
- * rewrites rows already on screen, which would otherwise throw the reader back
- * to page one every time they retag a transaction.
- */
-function usePagination<T>(rows: T[], resetKey: unknown) {
-  const [size, setSize] = useState<PageSize>(25)
-  const [page, setPage] = useState(0)
-  const pageSize = size === 'all' ? Math.max(rows.length, 1) : size
-  const pages = Math.max(1, Math.ceil(rows.length / pageSize))
-  const pageIndex = Math.min(page, pages - 1)
-
-  useEffect(() => { setPage(0) }, [resetKey, size])
-
-  return {
-    rows: size === 'all' ? rows : rows.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize),
-    page: pageIndex,
-    pages,
-    size,
-    setPage,
-    setSize,
-  }
-}
-
-function TablePager({
-  count, page, pages, size, setPage, setSize,
-}: {
-  count: number
-  page: number
-  pages: number
-  size: PageSize
-  setPage: (page: number) => void
-  setSize: (size: PageSize) => void
-}) {
-  const pageSize = size === 'all' ? Math.max(count, 1) : size
-  const first = count ? page * pageSize + 1 : 0
-  const last = Math.min(count, (page + 1) * pageSize)
-
-  return (
-    <div className="table-pager">
-      <span className="sub">Rows {first}–{last} of {count}</span>
-      <span className="spacer" />
-      <label className="sub">
-        Per page{' '}
-        <select
-          value={size}
-          onChange={(e) => setSize(e.target.value === 'all' ? 'all' : Number(e.target.value) as PageSize)}
-        >
-          <option value={25}>25</option>
-          <option value={50}>50</option>
-          <option value={75}>75</option>
-          <option value="all">All</option>
-        </select>
-      </label>
-      <button className="btn" disabled={page === 0} onClick={() => setPage(page - 1)}>← Previous</button>
-      <span className="sub">Page {page + 1} of {pages}</span>
-      <button className="btn" disabled={page + 1 >= pages} onClick={() => setPage(page + 1)}>Next →</button>
-    </div>
-  )
-}
 
 export default function Analytics({ boot, members }: { boot: Bootstrap | null; members: Set<number> }) {
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -241,12 +180,14 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
       foreignSort.key === 'original' ? row.fcy_amount : row.amount
     return [...source].sort((a, b) => (amount(a) - amount(b)) * foreignSort.dir)
   }, [data?.fcy.rows, foreignSort])
-  // Compared by value, so each table keeps its page until its own filters,
-  // search or sort move.
-  const rewardPager = usePagination(rewardRows, JSON.stringify(filters))
-  const emiPager = usePagination(emiRows, JSON.stringify([filters, emiAmountDir]))
-  const fcyPager = usePagination(fcyRows, JSON.stringify([filters, foreignSort]))
-  const txnPager = usePagination(rows, JSON.stringify([filters, q, sort]))
+  // Keyed by what each table is actually showing, so a table keeps its page
+  // until its own filters, search or sort move — and not when a category edit
+  // rewrites a row in place.
+  const filterKey = filtersKey(filters)
+  const rewardPager = usePagination(rewardRows, filterKey)
+  const emiPager = usePagination(emiRows, JSON.stringify([filterKey, emiAmountDir]))
+  const fcyPager = usePagination(fcyRows, JSON.stringify([filterKey, foreignSort]))
+  const txnPager = usePagination(rows, JSON.stringify([filterKey, q, sort]))
 
   const head = (key: SortKey, label: string, right = false, wrapped = false) => (
     <th
@@ -386,7 +327,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
             <p className="hint">
               Grouped by the month of the earning transaction, oldest first.
             </p>
-            <div className="tbl-wrap tbl-scroll">
+            <div className="tbl-wrap tbl-scroll" ref={rewardPager.scroller}>
               <table>
                 <thead><tr><th>Month</th><th style={{ textAlign: 'right' }}>Points earned</th></tr></thead>
                 <tbody>
@@ -399,7 +340,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
                 </tbody>
               </table>
             </div>
-            <TablePager count={rewardRows.length} {...rewardPager} />
+            <TablePager {...rewardPager} />
           </section>
         </div>
       )}
@@ -410,7 +351,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
             EMI transactions <span className="pill">{data.emi.count} · {money0(data.emi.total)}</span>
           </h2>
           <p className="hint">Rows the issuer flagged as converted to instalments.</p>
-          <div className="tbl-wrap tbl-scroll">
+          <div className="tbl-wrap tbl-scroll" ref={emiPager.scroller}>
             <table>
               <thead>
                 <tr>
@@ -435,7 +376,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
               </tbody>
             </table>
           </div>
-          <TablePager count={emiRows.length} {...emiPager} />
+          <TablePager {...emiPager} />
         </section>
       )}
 
@@ -445,7 +386,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
             Foreign currency <span className="pill">{data.fcy.count} · {money0(data.fcy.total_inr)}</span>
           </h2>
           <p className="hint">Transactions billed in another currency, with the original amount alongside.</p>
-          <div className="tbl-wrap tbl-scroll">
+          <div className="tbl-wrap tbl-scroll" ref={fcyPager.scroller}>
             <table>
               <thead>
                 <tr>
@@ -478,7 +419,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
               </tbody>
             </table>
           </div>
-          <TablePager count={fcyRows.length} {...fcyPager} />
+          <TablePager {...fcyPager} />
         </section>
       )}
 
@@ -544,7 +485,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
           {bulkNote && <span className="sub">{bulkNote}</span>}
         </div>
 
-        <div className="tbl-wrap tbl-scroll bank-tbl">
+        <div className="tbl-wrap tbl-scroll bank-tbl" ref={txnPager.scroller}>
           <datalist id="card-category-options">
             {categoryOptions.map((category) => <option key={category} value={category} />)}
           </datalist>
@@ -638,7 +579,7 @@ export default function Analytics({ boot, members }: { boot: Bootstrap | null; m
             </tbody>
           </table>
         </div>
-        <TablePager count={rows.length} {...txnPager} />
+        <TablePager {...txnPager} />
       </section>
     </>
   )

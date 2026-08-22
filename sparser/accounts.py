@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     last_checked TEXT,
     last_sync    TEXT,
     added_at     TEXT,
-    member_id    INTEGER
+    member_id    INTEGER,
+    -- Which pipeline may sweep this mailbox. Both default to on, so a mailbox
+    -- connected before this existed keeps behaving exactly as it did.
+    use_for_cards INTEGER NOT NULL DEFAULT 1,
+    use_for_bank  INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -79,7 +83,29 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     have = {row["name"] for row in conn.execute("PRAGMA table_info(mailboxes)").fetchall()}
     if "member_id" not in have:
         conn.execute("ALTER TABLE mailboxes ADD COLUMN member_id INTEGER")
+    for column in ("use_for_cards", "use_for_bank"):
+        if column not in have:
+            conn.execute(
+                f"ALTER TABLE mailboxes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1"
+            )
     conn.commit()
+
+
+def set_scope(
+    conn: sqlite3.Connection, mailbox_id: int, use_for_cards: bool, use_for_bank: bool
+) -> bool:
+    """Mark which pipelines may sweep this mailbox.
+
+    Both off is allowed and means "connected but not scanned" — a deliberate
+    pause is more useful than forcing the user to delete the credential.
+    """
+    ensure_schema(conn)
+    cur = conn.execute(
+        "UPDATE mailboxes SET use_for_cards = ?, use_for_bank = ? WHERE id = ?",
+        (int(bool(use_for_cards)), int(bool(use_for_bank)), mailbox_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def add(
@@ -133,6 +159,8 @@ def listing(conn: sqlite3.Connection, member_ids=()) -> list[dict]:
         ids,
     ).fetchall():
         d = dict(r)
+        d["use_for_cards"] = bool(d.get("use_for_cards", 1))
+        d["use_for_bank"] = bool(d.get("use_for_bank", 1))
         secret = d.pop("secret", None)
         try:
             _fernet().decrypt(secret)
@@ -275,6 +303,48 @@ def clear_card_password(conn: sqlite3.Connection, card_key: str) -> None:
     conn.commit()
 
 
+# Bank statement passwords share the card_secrets table. They are namespaced
+# rather than given a table of their own because they are the same kind of
+# secret, protected the same way — and a masked account number and a masked card
+# number could otherwise collide on the same key.
+BANK_KEY_PREFIX = "bank:"
+
+
+def bank_key(fingerprint: str) -> str:
+    return f"{BANK_KEY_PREFIX}{fingerprint}"
+
+
+def set_bank_password(
+    conn: sqlite3.Connection, fingerprint: str, password: str, source: str = "manual"
+) -> None:
+    set_card_password(conn, bank_key(fingerprint), password, source)
+
+
+def bank_password(conn: sqlite3.Connection, fingerprint: str) -> Optional[str]:
+    return card_password(conn, bank_key(fingerprint))
+
+
+def clear_bank_password(conn: sqlite3.Connection, fingerprint: str) -> None:
+    clear_card_password(conn, bank_key(fingerprint))
+
+
+def all_bank_passwords(conn: sqlite3.Connection) -> dict[str, str]:
+    """Every saved account password, keyed by account fingerprint."""
+    return {
+        key[len(BANK_KEY_PREFIX):]: secret
+        for key, secret in all_card_passwords(conn).items()
+        if key.startswith(BANK_KEY_PREFIX)
+    }
+
+
+def bank_secret_meta(conn: sqlite3.Connection) -> dict[str, dict]:
+    return {
+        key[len(BANK_KEY_PREFIX):]: meta
+        for key, meta in card_secret_meta(conn).items()
+        if key.startswith(BANK_KEY_PREFIX)
+    }
+
+
 def card_secret_meta(conn: sqlite3.Connection) -> dict[str, dict]:
     ensure_schema(conn)
     return {
@@ -343,6 +413,38 @@ def get_profile(conn: sqlite3.Connection, member_id: int = 0) -> dict:
         "dob": dec(row["dob"]),
         "updated_at": row["updated_at"],
     }
+
+
+def all_profiles(conn: sqlite3.Connection, preferred: Optional[int] = None) -> list[dict]:
+    """Every name/DOB on file, the preferred member's first.
+
+    One run carries statements for more than one member — a mailbox sweep files
+    each statement under whoever owns the mailbox it arrived in — so the profile
+    that derives a PDF's password is not necessarily the selected member's.
+    Reading only the pre-members profile left a second member's statement
+    unopenable however correctly their details had been entered.
+
+    Still not brute force: these are the identities the user recorded, and the
+    list stays a couple of dozen candidates per member.
+    """
+    ensure_schema(conn)
+    ids = [
+        int(row["member_id"]) for row in
+        conn.execute("SELECT member_id FROM member_profiles ORDER BY member_id").fetchall()
+    ]
+    if preferred and preferred in ids:
+        ids = [preferred] + [i for i in ids if i != preferred]
+    # The pre-members row last: it is usually a copy of the first member's.
+    out: list[dict] = [get_profile(conn, member_id) for member_id in ids] + [get_profile(conn)]
+    seen: set[tuple[str, str]] = set()
+    unique = []
+    for profile in out:
+        key = (profile["full_name"], profile["dob"])
+        if key == ("", "") or key in seen:
+            continue
+        seen.add(key)
+        unique.append(profile)
+    return unique
 
 
 def clear_profile(conn: sqlite3.Connection) -> None:

@@ -110,6 +110,8 @@ export type IngestFile = {
   card: string | null
   template_id: string | null
   encrypted: boolean
+  /** Whether the PDF is still on disk, so the run history can offer to open it. */
+  pdf_available?: boolean
   txn_count: number | null
   confidence: number | null
   error: string | null
@@ -125,6 +127,9 @@ export type Pending = {
   template_id: string | null
   encrypted: boolean
   txn_count: number | null
+  /** What approving would add, and what the ledger already holds. Bank rows only. */
+  new_txn_count?: number | null
+  known_txn_count?: number | null
   confidence: number | null
   statement_date: string | null
   period_start: string | null
@@ -204,6 +209,13 @@ export type BankAccount = {
   first_txn: string | null
   last_txn: string | null
   history: BankStatementRow[]
+  /** Mailbox scan rules, exactly as a card carries them. */
+  sender_ids: string[]
+  subject_patterns: string[]
+  /** Whether a statement password is stored — never the value. */
+  password_set: boolean
+  password_source: 'manual' | 'learned' | null
+  password_updated_at: string | null
 }
 
 export type BankTxn = {
@@ -288,27 +300,52 @@ function appendCategories(p: URLSearchParams, picked: string[], total: number): 
   else picked.forEach((name) => p.append('categories', name))
 }
 
-function qs(f: Filters): string {
+function qsParams(f: Filters): URLSearchParams {
   const p = new URLSearchParams()
   if (f.cards.length && f.cards.length !== f.allCards) p.set('cards', f.cards.join(','))
   if (f.members.length) p.set('members', f.members.join(','))
   if (f.from) p.set('from', f.from)
   if (f.to) p.set('to', f.to)
   appendCategories(p, f.categories, f.allCategories)
-  const s = p.toString()
-  return s ? `?${s}` : ''
+  return p
 }
 
-function bankQs(f: BankFilters): string {
+function bankQsParams(f: BankFilters): URLSearchParams {
   const p = new URLSearchParams()
   if (f.accounts.length && f.accounts.length !== f.allAccounts) p.set('accounts', f.accounts.join(','))
   if (f.members.length) p.set('members', f.members.join(','))
   if (f.from) p.set('from', f.from)
   if (f.to) p.set('to', f.to)
   appendCategories(p, f.categories, f.allCategories)
+  return p
+}
+
+const qs = (f: Filters): string => query(qsParams(f))
+const bankQs = (f: BankFilters): string => query(bankQsParams(f))
+
+const query = (p: URLSearchParams): string => {
   const s = p.toString()
   return s ? `?${s}` : ''
 }
+
+/** A filter set collapsed to what it actually asks the server for.
+ *
+ *  Two filter sets share a key when they select the same rows, whatever order
+ *  the ids or category names happen to arrive in — the facet list is re-read
+ *  after every category edit and comes back ordered by count, so an edit
+ *  re-orders it without changing the query at all. Pagers reset on this key
+ *  rather than on the filter object, which is why retagging a transaction no
+ *  longer throws the reader back to page one.
+ */
+function key(p: URLSearchParams): string {
+  return [...p.entries()]
+    .map(([name, value]) => `${name}=${value.split(',').sort().join(',')}`)
+    .sort()
+    .join('&')
+}
+
+export const filtersKey = (f: Filters): string => key(qsParams(f))
+export const bankFiltersKey = (f: BankFilters): string => key(bankQsParams(f))
 
 export type Profile = {
   full_name: string
@@ -329,6 +366,19 @@ export type Mailbox = {
   secret_ok: boolean
   member_id: number
   member_name: string
+  /** Which pipelines sweep this mailbox. Both false pauses it without deleting it. */
+  use_for_cards: boolean
+  use_for_bank: boolean
+}
+
+/** The fallback mailbox search — what a scan uses for anything with no rules of its own. */
+export type ScanDefaults = {
+  senders: string[]
+  subjects: string[]
+  /** Whether these were edited away from what the project ships with. */
+  customised: boolean
+  built_in_senders: string[]
+  built_in_subjects: string[]
 }
 
 /** One shared sub-category list drives both the card and bank ledgers. */
@@ -500,6 +550,43 @@ export const api = {
       body,
     })
   },
+  scanBankMail: (body: Record<string, unknown>) =>
+    post<{ status: string }>('/api/bank/ingest/scan', body),
+  scanBankLocal: (body: Record<string, unknown>) =>
+    post<{ status: string; files: string[] }>('/api/bank/ingest/scan-local', body),
+  setBankAccountMailRules: (id: number, sender_ids: string[], subject_patterns: string[]) =>
+    request<{ status: string }>(`/api/bank/accounts/${id}/mail-rules`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender_ids, subject_patterns }),
+    }),
+  revealBankAccountPassword: (id: number) =>
+    get<{ password: string }>(`/api/bank/accounts/${id}/password`),
+  setBankAccountPassword: (id: number, password: string) =>
+    request<{ status: string }>(`/api/bank/accounts/${id}/password`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    }),
+  clearBankAccountPassword: (id: number) =>
+    request<{ status: string }>(`/api/bank/accounts/${id}/password`, { method: 'DELETE' }),
+  scanDefaults: (kind: 'cards' | 'bank') => get<ScanDefaults>(`/api/scan-defaults/${kind}`),
+  saveScanDefaults: (kind: 'cards' | 'bank', sender_ids: string[], subject_patterns: string[]) =>
+    request<ScanDefaults>(`/api/scan-defaults/${kind}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender_ids, subject_patterns }),
+    }),
+  resetScanDefaults: (kind: 'cards' | 'bank') =>
+    request<ScanDefaults>(`/api/scan-defaults/${kind}`, { method: 'DELETE' }),
+  setMailboxScope: (id: number, use_for_cards: boolean, use_for_bank: boolean) =>
+    request<{ status: string; use_for_cards: boolean; use_for_bank: boolean }>(
+      `/api/mailboxes/${id}/scope`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ use_for_cards, use_for_bank }),
+      },
+    ),
   runs: () => get<{ runs: Run[]; busy: boolean }>('/api/runs'),
   run: (id: number) => get<{ run: Run; files: IngestFile[] }>(`/api/runs/${id}`),
   fetchMail: (body: Record<string, unknown>) =>
@@ -513,6 +600,11 @@ export const api = {
   // fetch wrapper adds, so the token rides the query string as the auth
   // middleware allows. Without it the tab shows "sign in to continue".
   pendingPdfUrl: (id: number) => authenticatedUrl(`/api/pending/${id}/pdf`),
+  /** The PDF an already-imported statement was parsed from, decrypted on the way out. */
+  statementPdfUrl: (id: number) => authenticatedUrl(`/api/statements/${id}/pdf`),
+  /** Any file in a run's history — including one that failed before it became a statement. */
+  ingestFilePdfUrl: (id: number) => authenticatedUrl(`/api/ingest/files/${id}/pdf`),
+  bankStatementPdfUrl: (id: number) => authenticatedUrl(`/api/bank/statements/${id}/pdf`),
   discard: (file_ids: number[]) =>
     post<{ discarded: number }>('/api/pending/discard', { file_ids }),
   reevaluatePending: (file_ids: number[] = []) =>

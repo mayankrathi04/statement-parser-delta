@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, type Category, type MajorCategory, type ProviderCategory } from '../api'
+import TablePager from '../components/TablePager'
+import { usePagination, type PageSize } from '../lib/pagination'
 import IconButton from '../components/IconButton'
 
 const SCOPES: { value: Category['applies_to']; label: string }[] = [
@@ -10,6 +12,10 @@ const SCOPES: { value: Category['applies_to']; label: string }[] = [
 
 const scopeLabel = (value: string) =>
   SCOPES.find((scope) => scope.value === value)?.label ?? value
+
+/** These lists run to a few dozen rows of controls, so the ladder starts far
+ *  below the 25 the transaction tables use — the point is a shorter page. */
+const LIST_SIZES: PageSize[] = [10, 25, 50, 'all']
 
 /**
  * The control that does the actual filing.
@@ -123,6 +129,9 @@ function Majors({ majors, onChanged }: { majors: MajorCategory[]; onChanged: () 
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<number | null>(null)
   const [draft, setDraft] = useState('')
+  // A constant key: adding, renaming or deleting a major should leave the
+  // reader where they were, and the pager clamps the page if the list shrinks.
+  const pager = usePagination(majors, 'majors', 10)
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true)
@@ -177,18 +186,18 @@ function Majors({ majors, onChanged }: { majors: MajorCategory[]; onChanged: () 
         </button>
       </div>
       {error && <div className="banner" style={{ borderLeftColor: 'var(--critical)' }}>{error}</div>}
-      <div className="tbl-wrap">
+      <div className="tbl-wrap tbl-scroll" ref={pager.scroller}>
         <table>
           <thead>
             <tr>
               <th>Major category</th>
-              <th>Collects</th>
+              <th className="wrapped-wide">Collects</th>
               <th style={{ textAlign: 'right' }}>Subs</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {majors.map((major) => (
+            {pager.rows.map((major) => (
               <tr key={major.id}>
                 <td>
                   {editing === major.id
@@ -198,7 +207,7 @@ function Majors({ majors, onChanged }: { majors: MajorCategory[]; onChanged: () 
                           && void run(() => api.renameMajorCategory(major.id, draft.trim()))} />
                     : <b>{major.name}</b>}
                 </td>
-                <td className="sub">
+                <td className="sub wrapped-wide">
                   {major.children.map((child) => child.name).join(', ') || '—'}
                 </td>
                 <td className="num">{major.children.length}</td>
@@ -227,6 +236,7 @@ function Majors({ majors, onChanged }: { majors: MajorCategory[]; onChanged: () 
           </tbody>
         </table>
       </div>
+      <TablePager {...pager} sizes={LIST_SIZES} />
       <p className="hint" style={{ marginTop: 14, marginBottom: 0 }}>
         Renaming a major moves no transactions — no row ever carries its name, only the
         sub-category's.
@@ -353,10 +363,10 @@ function CategoryRow({
                 onChange={(event) => setName(event.target.value)} />
             : <b>{category.name}</b>}
         </td>
-        <td>
+        <td className="wrapped-wide">
           {editing ? (
             <input
-              className="input" style={{ minWidth: 260, fontFamily: 'ui-monospace, monospace' }}
+              className="input" style={{ width: '100%', fontFamily: 'ui-monospace, monospace' }}
               value={pattern} placeholder="no pattern — manual only"
               onChange={(event) => setPattern(event.target.value)}
               onKeyDown={(event) => event.key === 'Enter' && name.trim() && save()}
@@ -438,6 +448,14 @@ export default function Categories() {
 
   useEffect(() => { void load() }, [load])
 
+  // Paired with its position in the whole list, not in the page: order decides
+  // which rule matches first, so a move has to mean the same thing on page 3.
+  const ordered = useMemo(
+    () => categories.map((category, index) => ({ category, index })), [categories],
+  )
+  // A constant key, so editing a rule does not send the reader back to page one.
+  const pager = usePagination(ordered, 'sub-categories', 10)
+
   /** Swap two positions and persist the whole order — first match wins, so it matters. */
   const swap = async (from: number, to: number) => {
     const ids = categories.map((category) => category.id)
@@ -500,12 +518,12 @@ export default function Categories() {
           </button>
         </div>
         {note && <div className="banner">{note}</div>}
-        <div className="tbl-wrap">
+        <div className="tbl-wrap tbl-scroll" ref={pager.scroller}>
           <table>
             <thead>
               <tr>
                 <th style={{ width: 54 }}>Order</th>
-                <th>Sub-category</th><th>Pattern</th><th>Applies to</th>
+                <th>Sub-category</th><th className="wrapped-wide">Pattern</th><th>Applies to</th>
                 <th style={{ width: 200 }}>Major</th>
                 <th style={{ textAlign: 'right' }}>Card rows</th>
                 <th style={{ textAlign: 'right' }}>Bank rows</th>
@@ -513,7 +531,7 @@ export default function Categories() {
               </tr>
             </thead>
             <tbody>
-              {categories.map((category, index) => (
+              {pager.rows.map(({ category, index }) => (
                 <CategoryRow
                   key={category.id}
                   category={category}
@@ -526,6 +544,7 @@ export default function Categories() {
             </tbody>
           </table>
         </div>
+        <TablePager {...pager} sizes={LIST_SIZES} />
         <p className="hint" style={{ marginTop: 14, marginBottom: 0 }}>
           Your rules take priority over the category a card issuer printed. A category you set on
           a single transaction by hand always wins, and re-applying never overwrites it.

@@ -210,7 +210,8 @@ def test_mixed_card_rules_run_two_mailbox_queries(tmp_path, monkeypatch):
         conn.close()
 
     monkeypatch.setattr(
-        mailbox, "accounts_from_store", lambda _conn: [mailbox.Account("me@example.com", "secret")]
+        mailbox, "accounts_from_store",
+        lambda _conn, purpose=None: [mailbox.Account("me@example.com", "secret")],
     )
     monkeypatch.setattr(accounts, "mark", lambda *_args, **_kwargs: None)
     searches = []

@@ -39,8 +39,14 @@ from .base import (
 
 _MARKERS = (r"IDFCFIRSTBANK", r"IFSC:?IDFB0\d{6}", r"IDFCFIRSTBANK\.COM")
 
-#: "18 Nov 25" — the transaction date, printed above its own time of day.
-_DATE = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{2}$")
+#: "18 Nov 25", optionally followed by "02:55" on the same printed line.
+#:
+#: IDFC used to break the time onto its own line under the date and now prints
+#: the two together; both forms appear in statements for the same account, months
+#: apart. Anchoring the date to the end of its line therefore silently dropped
+#: every row of a newer statement, so the time is matched and discarded here
+#: rather than being allowed to invalidate the date beside it.
+_DATE = re.compile(r"^(\d{1,2}\s+[A-Za-z]{3}\s+\d{2})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$")
 
 #: The transaction table's columns, in the order IDFC prints them.
 _ROLES = (
@@ -116,6 +122,15 @@ def _section_marks(page) -> list[tuple[float, str]]:
     return marks
 
 
+def _dated(words: list[dict]) -> Optional[dt.date]:
+    """The date a cell states, whichever way this statement era prints the time."""
+    for line in line_groups(words):
+        found = _DATE.match(line_text(line))
+        if found:
+            return _date(found.group(1))
+    return None
+
+
 def _amount(words: list[dict], band: tuple[float, float]) -> Decimal:
     word = next((w for w in cell(words, *band) if MONEY.match(w["text"])), None)
     return money(word["text"]) if word else Decimal("0")
@@ -162,11 +177,7 @@ def _page_transactions(page, page_number: int, account: str, carried: bool) -> t
             band = [w for w in words if top < float(w["top"]) < bottom]
             if not band:
                 continue
-            dated = next(
-                (line for line in line_groups(cell(band, *bands["date"]))
-                 if _DATE.match(line_text(line))),
-                None,
-            )
+            dated = _dated(cell(band, *bands["date"]))
             balance = _balance(band, bands["balance"])
             withdrawal = _amount(band, bands["withdrawal"])
             deposit = _amount(band, bands["deposit"])
@@ -176,11 +187,7 @@ def _page_transactions(page, page_number: int, account: str, carried: bool) -> t
             if withdrawal and deposit:
                 continue
 
-            value_date = next(
-                (line for line in line_groups(cell(band, *bands["value"]))
-                 if _DATE.match(line_text(line))),
-                None,
-            )
+            value_date = _dated(cell(band, *bands["value"]))
             if withdrawal:
                 direction = TxnType.DEBIT if withdrawal > 0 else TxnType.CREDIT
                 amount = abs(withdrawal)
@@ -188,8 +195,8 @@ def _page_transactions(page, page_number: int, account: str, carried: bool) -> t
                 direction = TxnType.CREDIT if deposit > 0 else TxnType.DEBIT
                 amount = abs(deposit)
             rows.append(BankTransaction(
-                date=_date(line_text(dated)),
-                value_date=_date(line_text(value_date)) if value_date else None,
+                date=dated,
+                value_date=value_date,
                 description=unwrap(cell(band, *bands["details"]), bands["details"][1]),
                 reference=unwrap(cell(band, *bands["reference"]), bands["reference"][1]) or None,
                 amount=amount,

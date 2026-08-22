@@ -152,27 +152,31 @@ def ingest_file(
             # only ever needs to be entered once.
             from . import accounts as acct_store
 
+            # Name and DOB come from the saved profiles unless the caller passed
+            # their own, so a scheduled fetch needs no arguments at all. Every
+            # member's, not just the selected one: a sweep files each statement
+            # under whoever owns the mailbox it came from, so the password a PDF
+            # wants may be derived from a member the run never mentions.
             conn = store.connect(rec.db_path)
             try:
                 known = acct_store.all_card_passwords(conn)
+                profiles = acct_store.all_profiles(conn, creds.get("_member_id"))
             finally:
                 conn.close()
 
-            # Name and DOB come from the saved profile unless the caller passed
-            # their own, so a scheduled fetch needs no arguments at all.
-            conn = store.connect(rec.db_path)
-            try:
-                profile = acct_store.get_profile(conn)
-            finally:
-                conn.close()
-            who = creds.get("name") or profile.get("full_name")
-            born = creds.get("dob") or profile.get("dob")
-
-            pws = (
+            pws = list(dict.fromkeys(
                 ([creds["password"]] if creds.get("password") else [])
-                + list(dict.fromkeys(known.values()))
-                + candidate_passwords(who, born, creds.get("card_last4"))
-            )
+                + list(known.values())
+                + [
+                    password
+                    for profile in profiles
+                    for password in candidate_passwords(
+                        creds.get("name") or profile.get("full_name"),
+                        creds.get("dob") or profile.get("dob"),
+                        creds.get("card_last4"),
+                    )
+                ]
+            ))
             tmp = pdf.with_suffix(".decrypted.pdf")
             workfile, used = decrypt_to(pdf, tmp, pws)
             used_password = used
@@ -479,7 +483,7 @@ def run_scan(
     try:
         conn = store.connect(db_path)
         try:
-            accts = mailbox.accounts_from_store(conn)
+            accts = mailbox.accounts_from_store(conn, purpose="cards")
             if connection_ids:
                 marks = ",".join("?" for _ in connection_ids)
                 selected_addresses = {
@@ -488,8 +492,12 @@ def run_scan(
                     ).fetchall()
                 }
                 accts = [acct for acct in accts if acct.address in selected_addresses]
+            # The fallback lists are whatever the Cards tab currently shows, so
+            # what a scan searches and what the user was told it searches cannot
+            # drift apart.
+            fallback = mailbox.scan_defaults(conn, "cards")
             card_filter, scan_rule_groups = _scan_card_rule_groups(
-                conn, card_ids, mailbox.STATEMENT_SENDERS, mailbox.SUBJECT_SEARCHES,
+                conn, card_ids, fallback["senders"], fallback["subjects"],
                 include_unrecognized_cards,
             )
         finally:
@@ -679,7 +687,7 @@ def run_fetch(db_path: Path, dest: Path, creds: dict, months: int = 1, force: bo
 
         conn = store.connect(db_path)
         try:
-            accounts = mailbox.accounts_from_store(conn)
+            accounts = mailbox.accounts_from_store(conn, purpose="cards")
         finally:
             conn.close()
 

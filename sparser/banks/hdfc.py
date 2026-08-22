@@ -9,6 +9,7 @@ import datetime as dt
 import re
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 import pdfplumber
 
@@ -82,26 +83,56 @@ def _metadata(page_text: str) -> dict:
     }
 
 
-def _columns(first_page) -> dict[str, float]:
+def _columns(first_page) -> dict[str, float | None]:
+    """Measure the transaction table from its own header row.
+
+    Three HDFC layouts are in circulation and they do not agree on the columns.
+    The net-banking download prints seven — ``Date Narration Chq./Ref.No. Value
+    Dt Withdrawal Amt. Deposit Amt. Closing Balance`` — while the mailed monthly
+    e-statement prints five: ``Txn Date Narration Withdrawals Deposits Closing
+    Balance``, with no reference and no value date at all. So the reference and
+    value-date columns are optional, and every heading is matched by any of the
+    words it is known to start with rather than one fixed prefix.
+    """
     words = first_page.extract_words(x_tolerance=1, y_tolerance=2)
     for line in line_groups(words):
         labels = " ".join(w["text"] for w in line).lower()
         if "narration" not in labels or "closing" not in labels:
             continue
 
-        def x(prefix: str) -> float:
-            word = next((w for w in line if w["text"].lower().startswith(prefix)), None)
-            if not word:
-                raise UnsupportedBankStatement(f"HDFC transaction table is missing {prefix}")
+        def x(*prefixes: str, required: bool = True) -> Optional[float]:
+            """The leftmost heading word starting with any of these.
+
+            Leftmost, because a heading can be several words and the column
+            begins at the first of them — "Txn Date" starts at "Txn".
+            """
+            word = next((w for w in line if w["text"].lower().startswith(prefixes)), None)
+            if word is None:
+                if required:
+                    raise UnsupportedBankStatement(
+                        f"HDFC transaction table is missing {prefixes[0]}"
+                    )
+                return None
             return float(word["x0"])
 
-        date_x = x("date")
+        date_x = x("txn", "date")
         narration_x = x("narration")
-        reference_x = x("chq")
-        value_x = x("value")
-        withdrawal_x = x("withdrawal")
-        deposit_x = x("deposit")
-        closing_x = x("closing")
+        reference_x = x("chq", "ref", required=False)
+        value_x = x("value", required=False)
+        withdrawal_x = x("withdrawal", "debit")
+        deposit_x = x("deposit", "credit")
+        closing_x = x("closing", "balance")
+
+        # Whatever column follows the narration bounds it, and bounds the search
+        # for amounts on its other side.
+        after_narration = next(
+            edge for edge in (reference_x, value_x, withdrawal_x) if edge is not None
+        )
+        # The last column before the amounts: the midpoint between it and the
+        # withdrawal heading is where an amount may first appear.
+        before_amounts = next(
+            edge for edge in (value_x, reference_x, narration_x) if edge is not None
+        )
         return {
             "date": date_x,
             "narration": narration_x,
@@ -111,12 +142,16 @@ def _columns(first_page) -> dict[str, float]:
             "deposit": deposit_x,
             "closing": closing_x,
             "narration_left": date_x + 15,
-            "narration_right": reference_x - 5,
-            "reference_right": (reference_x + value_x) / 2,
-            "value_right": (value_x + withdrawal_x) / 2,
+            "narration_right": after_narration - 5,
+            "narration_end": after_narration,
+            "reference_right": (
+                (reference_x + (value_x or withdrawal_x)) / 2 if reference_x else None
+            ),
+            "value_right": (value_x + withdrawal_x) / 2 if value_x else None,
             # Amounts are right-aligned. Their x0 shifts left as they gain
             # digits, so the next column's left edge is a safer boundary than
             # the midpoint between headings.
+            "withdrawal_left": (before_amounts + withdrawal_x) / 2,
             "withdrawal_right": deposit_x - 5,
             "deposit_right": closing_x - 5,
             "header_bottom": max(float(w["bottom"]) for w in line),
@@ -266,17 +301,21 @@ def _page_transactions(page, page_number: int, columns: dict[str, float]) -> lis
         narrative = _narration_text([
             w for w in band
             if columns["narration_left"] <= float(w["x0"]) < columns["narration_right"]
-            and float(w["x1"]) <= columns["reference"]
+            and float(w["x1"]) <= columns["narration_end"]
         ])
-        reference = _words_text([
-            w for w in band
-            if columns["reference"] - 8 <= float(w["x0"]) < columns["reference_right"]
-        ]) or None
-        value_word = next((
-            w for w in on_line
-            if _DATE.match(w["text"])
-            and columns["value"] - 8 <= float(w["x0"]) < columns["value_right"]
-        ), None)
+        reference = None
+        if columns["reference"] is not None:
+            reference = _words_text([
+                w for w in band
+                if columns["reference"] - 8 <= float(w["x0"]) < columns["reference_right"]
+            ]) or None
+        value_word = None
+        if columns["value"] is not None:
+            value_word = next((
+                w for w in on_line
+                if _DATE.match(w["text"])
+                and columns["value"] - 8 <= float(w["x0"]) < columns["value_right"]
+            ), None)
 
         def amount_between(left: float, right: float) -> Decimal:
             word = next((
@@ -285,7 +324,7 @@ def _page_transactions(page, page_number: int, columns: dict[str, float]) -> lis
             ), None)
             return money(word["text"]) if word else Decimal("0")
 
-        withdrawal = amount_between(columns["value_right"], columns["withdrawal_right"])
+        withdrawal = amount_between(columns["withdrawal_left"], columns["withdrawal_right"])
         deposit = amount_between(columns["withdrawal_right"], columns["deposit_right"])
         balance = amount_between(columns["deposit_right"], float(page.width) + 1)
         if not narrative or balance == 0 or (withdrawal == 0 and deposit == 0):

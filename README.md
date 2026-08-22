@@ -48,8 +48,11 @@ points, EMIs and foreign-currency legs each get their own section — they are
 separate ledgers, and folding points into a rupee total would be nonsense.
 
 **Cards** — one row per card, discovered from the statements themselves. Shows how
-many statements and transactions each has, and lets you store that card's PDF
-password. Passwords are tried in order: supplied → stored → derived from issuer
+many statements and transactions each has, lets you store that card's PDF
+password, and — in its own panel — the **sender and subject lists a scan searches for
+unrecognized cards**. Those lists are the filter behind the *Unrecognized cards* option:
+they apply to every card no import has introduced yet, so when a scan comes back empty
+they are the first thing to widen. Editable, with the shipped lists one click away. Passwords are tried in order: supplied → stored → derived from issuer
 conventions. When a derived one works it is **saved against that card
 automatically** and marked `learned`, so next month it opens on the first attempt.
 Values are encrypted and only sent to the page when you click *show*.
@@ -83,13 +86,32 @@ label; overrides stay separate from parser-derived enrichment.
 **Bank Accounts** — one expandable row per account. The full account number is not
 copied into account records: identity uses a one-way fingerprint and display uses
 the last four digits. Expanded rows show every imported statement's declared period,
-transaction coverage, totals, balances and source file.
+transaction coverage, totals, balances and source file — plus that account's mailbox
+scan rules (sender and subject phrases that narrow a bank scan) and its statement
+password, stored encrypted and, like a card's, saved automatically and marked `learned`
+when a derived one turns out to work. The same **unrecognized accounts** search panel as
+the Cards tab sits below the list, holding the sender and subject lists a bank scan falls
+back to.
 
-**Bank Pipeline** — upload-only for now. Digital-text account statements from **HDFC,
-ICICI, IndusInd and IDFC FIRST** are classified, reconstructed from PDF geometry, checked
-against every adjacent running balance, then held for review with confidence, checks,
-period, row count and duplicate status. Only selected statements are written to the
-bank ledger. Its run history is separate from card runs.
+**Bank Pipeline** — scan-then-approve, the same three sources as cards: **a mailbox
+connection**, an **upload**, or a **folder on disk**. Digital-text account statements from
+**HDFC, ICICI, IndusInd and IDFC FIRST** are classified, reconstructed from PDF geometry,
+checked against every adjacent running balance, then held for review with confidence,
+checks, period, row count and duplicate status. Only selected statements are written to
+the bank ledger. Its run history is separate from card runs.
+
+A mail scan takes the same windows as a card scan (this month, a specific month, a
+range, the last 12), filters by **account** — including an *unrecognized accounts* option
+for accounts no statement has introduced yet — and by **connection**. It searches only
+mailboxes ticked for bank statements, and it stops at the review queue: nothing a sweep
+downloads reaches the ledger without approval.
+
+**HDFC mails a link, not a file.** Its smart statement is a password gate, so the sweep
+follows it: read the form, fetch the one-shot token, post the scrambled password, then
+pull the PDF — one cookie jar across the whole exchange, because the gate rejects every
+call that does not return the session it opened. The password is the same one the PDF
+would have wanted, so a stored account password is tried first and the name/DOB
+convention only after; attempts are capped, since these are real logins against a bank.
 
 **Nothing ever duplicates.** A card statement is keyed by card and billing cycle;
 a bank statement by account fingerprint and statement period. Re-fetching a cycle
@@ -97,7 +119,11 @@ a bank statement by account fingerprint and statement period. Re-fetching a cycl
 verified by re-importing the whole corpus and watching every count stay put.
 
 **Connections** — add each Gmail account with an app password, test it, see status
-and last sync. App passwords are encrypted before touching the database; the key
+and last sync. Two checkboxes per mailbox say what it actually receives — **card
+statements**, **bank statements**, or both. Each pipeline sweeps only the mailboxes ticked
+for it, so an account that never gets card mail is not searched on every card scan;
+searching is the slow part of a sweep. Untick both to pause a mailbox without
+disconnecting it. App passwords are encrypted before touching the database; the key
 lives at `~/.config/sparser/secret.key` (0600, outside the project), so the
 database alone leaks nothing usable.
 
@@ -162,7 +188,7 @@ overrides, deliberately).
 ```
 sparser/
 ├── decrypt.py    pikepdf; issuer password-pattern derivation
-├── mailbox.py    Gmail over IMAP, read-only, multi-account
+├── mailbox.py    Gmail over IMAP, read-only, multi-account; one sweep, two products
 ├── accounts.py   connected mailboxes, secrets encrypted at rest
 ├── geometry.py   words → lines → column cells; label/value anchoring
 ├── normalize.py  glyph repair, amounts, dates, Dr/Cr direction
@@ -178,7 +204,8 @@ sparser/
 │   ├── indusind.py   ruled columns; masked account number; hard-wrapped narrations
 │   ├── idfc.py       fully ruled table; consolidated multi-account statements
 │   └── icici.py      fully ruled table; remarks start above their own dated line
-├── bank_pipeline.py upload-only bank ingest, separate from card templates
+├── smartstatement.py HDFC's linked statement: its password gate, its two ciphers
+├── bank_pipeline.py bank ingest — upload, disk and mail — separate from card templates
 ├── bank_store.py    bank accounts/statements/transactions + cash-flow analytics
 ├── api.py        FastAPI
 └── templates/    one YAML per issuer — hdfc, icici, axis, yes_bank
@@ -246,7 +273,8 @@ issuer. Its output is always flagged, since it has no issuer totals to reconcile
 ```bash
 python -m sparser parse  stmt.pdf -o out.xlsx        # xlsx / csv / json
 python -m sparser import samples --db data/statements.db  # into the store
-python -m sparser fetch  --months 1                  # Gmail → parse → store
+python -m sparser fetch  --months 1                  # Gmail → parse → store (cards)
+python -m sparser bank-fetch --months 1              # Gmail → parse → review (accounts)
 python -m sparser serve  --db data/statements.db          # dashboard + API
 ```
 

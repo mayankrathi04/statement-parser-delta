@@ -58,6 +58,56 @@ ANY_STATEMENT = re.compile(r"\bstatement\b|\bbill\b", re.I)
 CARD_ONLY_SENDERS = ("sbicard.com", "americanexpress.com", "amex.com", "onecard.in")
 
 
+# ------------------------------------------------- the same question, for banks
+
+# "Here is your account statement", however the bank chose to phrase it. HDFC's
+# smart statement is deliberately included: it says "statement" and nothing else,
+# because the mail carries a link rather than a document.
+BANK_MAIL = re.compile(
+    r"(savings|current|salary|deposit|nre|nro)[-\s]*account[\w\s./'-]{0,24}?statement"
+    r"|(bank|account|consolidated)[-\s]*(e[-\s]?)?statement"
+    r"|statement[-\s]*of[-\s]*(your[-\s]*)?account"
+    r"|(e[-\s]?)?statement[\w\s./'-]{0,24}?(savings|current|salary)[-\s]*account"
+    r"|smart[-\s]*statement"
+    r"|account[-\s]*statement",
+    re.I,
+)
+
+# Consulted only when nothing above matched, so "Bank Account Statement" is not
+# vetoed by a stray word. A card statement is the specific thing this must never
+# swallow: the two products share a sender and nearly share a subject.
+NOT_BANK_MAIL = re.compile(
+    r"credit[-\s]*card|debit[-\s]*card[\w\s]{0,12}?(bill|statement)"
+    r"|card[-\s]*member[\w\s]{0,12}?statement"
+    r"|mutual[-\s]*fund|demat|portfolio|folio|\bnps\b|\bppf\b|\bsip\b"
+    r"|(home|personal|auto|car|education|gold|two[-\s]*wheeler)[-\s]*loan"
+    r"|(fixed|recurring)[-\s]*deposit"
+    r"|insurance|\bpolicy\b|interest[-\s]*certificate"
+    r"|\btds\b|form[-\s]*16|\bgst\b",
+    re.I,
+)
+
+
+def classify_bank_mail(subject: str, filename: str = "", sender: str = "") -> tuple[bool, str]:
+    """Should this mail be downloaded for the *bank* pipeline?
+
+    The mirror of :func:`classify_mail`, and deliberately its opposite: what one
+    accepts the other should refuse. Same contract — a verdict and a reason, with
+    the PDF text in :func:`document_kind` remaining the authority that decides
+    whether an account statement is really what arrived.
+    """
+    text = f"{subject} {filename}"
+    if NOT_BANK_MAIL.search(text):
+        hit = NOT_BANK_MAIL.search(text).group(0).strip()
+        return False, f"not an account statement — subject says {hit!r}"
+    if BANK_MAIL.search(text):
+        return True, "subject names an account statement"
+    low = sender.lower()
+    if any(house in low for house in CARD_ONLY_SENDERS):
+        return False, "sender issues credit cards only, so this cannot be an account statement"
+    return False, "no account-statement wording in the subject"
+
+
 def classify_mail(subject: str, filename: str = "", sender: str = "") -> tuple[bool, str]:
     """Should this mail be downloaded? Returns (accept, human-readable reason)."""
     text = f"{subject} {filename}"

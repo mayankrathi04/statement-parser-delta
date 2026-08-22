@@ -209,13 +209,24 @@ _MIGRATIONS = {
         "subject_patterns_json": "TEXT DEFAULT '[]'",
         "member_id": "INTEGER",
     },
-    "bank_accounts": {"member_id": "INTEGER"},
+    "bank_accounts": {
+        "member_id": "INTEGER",
+        # The same per-card mailbox narrowing, for accounts. An account with both
+        # fields set is searched by its own rules instead of the issuer defaults.
+        "sender_ids_json": "TEXT DEFAULT '[]'",
+        "subject_patterns_json": "TEXT DEFAULT '[]'",
+    },
     "ingest_files": {
         "path": "TEXT",
         "statement_date": "TEXT",
         "period_start": "TEXT",
         "period_end": "TEXT",
         "duplicate_of": "INTEGER",
+        # What approving this file would actually add. Counted at scan time
+        # against the ledger, so the review screen can tell "forty new rows"
+        # from "forty rows you already have".
+        "new_txn_count": "INTEGER",
+        "known_txn_count": "INTEGER",
         "document_type": "TEXT DEFAULT 'credit_card'",
         "bank_account_id": "INTEGER",
         # Which member this file was uploaded/fetched for. Recorded at scan time
@@ -645,6 +656,17 @@ def set_card_mail_rules(
     cur = conn.execute(
         "UPDATE cards SET sender_ids_json = ?, subject_patterns_json = ? WHERE id = ?",
         (json.dumps(sender_ids), json.dumps(subject_patterns), card_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def set_bank_account_mail_rules(
+    conn: sqlite3.Connection, account_id: int, sender_ids: list[str], subject_patterns: list[str]
+) -> bool:
+    cur = conn.execute(
+        "UPDATE bank_accounts SET sender_ids_json = ?, subject_patterns_json = ? WHERE id = ?",
+        (json.dumps(sender_ids), json.dumps(subject_patterns), account_id),
     )
     conn.commit()
     return cur.rowcount > 0

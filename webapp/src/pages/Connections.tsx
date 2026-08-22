@@ -61,6 +61,25 @@ export default function Connections({ onChanged, members }: { onChanged: () => v
     }
   }
 
+  /** Which pipelines sweep this mailbox. Written straight through — the row is
+   *  reloaded from the server, so a rejected change cannot linger on screen. */
+  const setScope = async (box: Mailbox, cards: boolean, bank: boolean) => {
+    setMsg(null)
+    try {
+      await api.setMailboxScope(box.id, cards, bank)
+      if (!cards && !bank) {
+        setMsg({
+          ok: true,
+          text: `${box.address} is connected but no longer scanned by either pipeline.`,
+        })
+      }
+    } catch (e) {
+      setMsg({ ok: false, text: String((e as Error).message) })
+    } finally {
+      load()
+    }
+  }
+
   const remove = async (id: number, addr: string) => {
     if (!confirm(`Disconnect ${addr}? Statements already imported are kept.`)) return
     await api.removeMailbox(id).catch(() => undefined)
@@ -75,6 +94,12 @@ export default function Connections({ onChanged, members }: { onChanged: () => v
         <p className="hint">
           Statements are fetched read-only over IMAP. Nothing in the mailbox is read beyond the
           statement mails, and nothing is ever modified or deleted.
+        </p>
+        <p className="hint">
+          Tick what each mailbox actually receives. A card scan searches only the mailboxes marked
+          for card statements and a bank scan only those marked for bank statements, so an account
+          that never gets one of the two is not searched for it — which is most of what makes a
+          scan slow. Untick both to pause a mailbox without disconnecting it.
         </p>
 
         {!boxes.length && <p className="sub">No mailboxes connected yet.</p>}
@@ -96,6 +121,24 @@ export default function Connections({ onChanged, members }: { onChanged: () => v
               </div>
             </span>
             <span className="spacer" />
+            <span className="conn-scope">
+              <label title="Search this mailbox on credit-card scans">
+                <input
+                  type="checkbox"
+                  checked={m.use_for_cards}
+                  onChange={(event) => setScope(m, event.target.checked, m.use_for_bank)}
+                />{' '}
+                Card statements
+              </label>
+              <label title="Search this mailbox on bank account scans">
+                <input
+                  type="checkbox"
+                  checked={m.use_for_bank}
+                  onChange={(event) => setScope(m, m.use_for_cards, event.target.checked)}
+                />{' '}
+                Bank statements
+              </label>
+            </span>
             <select className="input" value={m.member_id ?? ''} onChange={async (event) => {
               await api.assignMailboxMember(m.id, Number(event.target.value)); void load()
             }}>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select>

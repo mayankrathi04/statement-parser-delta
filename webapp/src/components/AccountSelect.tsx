@@ -6,11 +6,19 @@ export default function AccountSelect({
   selected,
   colourOf,
   onChange,
+  unrecognized,
 }: {
   accounts: BankAccount[]
   selected: Set<number>
   colourOf: (id: number) => string
   onChange: (next: Set<number>) => void
+  /**
+   * Adds an "Unrecognized accounts" row. A statement for an account that has
+   * never been imported matches nothing in this list, so on a filtered scan it
+   * is silently dropped — and it can never become a saved account, because only
+   * an import creates one. Offering it here is the way out of that loop.
+   */
+  unrecognized?: { checked: boolean; onChange: (next: boolean) => void }
 }) {
   const [open, setOpen] = useState(false)
   const box = useRef<HTMLDivElement>(null)
@@ -23,12 +31,13 @@ export default function AccountSelect({
     return () => document.removeEventListener('mousedown', away)
   }, [])
 
+  const extra = unrecognized?.checked ? ' + unrecognized' : ''
   const label =
-    selected.size === 0 || selected.size === accounts.length
+    (selected.size === 0 || selected.size === accounts.length
       ? `All accounts (${accounts.length})`
       : selected.size === 1
         ? (accounts.find((account) => selected.has(account.id))?.display_name ?? '1 account')
-        : `${selected.size} of ${accounts.length} accounts`
+        : `${selected.size} of ${accounts.length} accounts`) + extra
 
   const toggle = (id: number) => {
     const next = new Set(selected)
@@ -66,6 +75,21 @@ export default function AccountSelect({
               </span>
             </label>
           ))}
+          {unrecognized && (
+            <label
+              className="ms-row"
+              title="Statements whose account number matches none of the accounts above — an account you have not imported yet"
+              style={{ borderTop: '1px solid var(--border)' }}
+            >
+              <input
+                type="checkbox"
+                checked={unrecognized.checked}
+                onChange={() => unrecognized.onChange(!unrecognized.checked)}
+              />
+              <i className="swatch" style={{ background: 'var(--text-muted)' }} />
+              <span>Unrecognized accounts</span>
+            </label>
+          )}
           <div className="ms-foot">
             <button className="link" onClick={() => onChange(new Set(accounts.map((a) => a.id)))}>
               Select all
