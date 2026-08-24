@@ -2,6 +2,7 @@
 name = "statement-parser-delta"
 version = "0.1.0"
 description = "Industry-grade bank and credit card statement parser (PDF -> Excel/CSV/JSON)"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "pdfplumber>=0.11",

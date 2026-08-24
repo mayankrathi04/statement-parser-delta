@@ -26,21 +26,15 @@ inbox/
 # Frontend
 webapp/node_modules/
 webapp/dist/
+webapp/tsconfig.tsbuildinfo
 sparser/web/dist/
-tests/
-!tests/
-tests/*
-!tests/test_template_versions.py
-!tests/test_mcp_server.py
-!tests/test_mailbox_collision.py
-!tests/test_inbox_layout.py
-!tests/test_pipeline_filters.py
-!tests/test_bank_statements.py
-!tests/test_bank_corpus.py
-!tests/test_portal_members.py
-!tests/corpus.py
+# The whole suite ships. The two files that once held real values — a password
+# captured from HDFC's live gate and a real account number in a subject fixture —
+# now carry fabricated stand-ins of the same shape, so there is nothing left here
+# to withhold. What stays ignored below is the golden corpus, which is a verbatim
+# dump of real statements and cannot be sanitised the same way.
 
-# Last word, after the allowlist: the golden corpus is a verbatim dump of real
+# The golden corpus is a verbatim dump of real
 # statements — masked card numbers, credit limits, merchant rows. The same PII
 # as samples/*.pdf, so it never leaves this machine either. Regenerate it with
 # `python scripts/make_golden.py`.

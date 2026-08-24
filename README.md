@@ -384,3 +384,7 @@ committed — see `.gitignore`.
   repeated header. Template mode is unaffected.
 - **The server is loopback-only and unauthenticated.** It serves unredacted
   financial history — do not expose it without auth in front.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
