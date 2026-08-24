@@ -57,8 +57,12 @@ _HEADERS = {
 }
 
 #: The gate is a live banking endpoint; a wrong password is a failed login there
-#: too. Stop well before anything that could look like guessing at scale.
-MAX_PASSWORD_ATTEMPTS = 5
+#: too. The caller only ever hands us passwords a person actually entered — the
+#: one supplied for the run and the ones saved per account, never a derived
+#: guess — so this cap is a hard ceiling on those, not a guessing budget. It
+#: stays low so that a user with several saved accounts still cannot rack up
+#: failed logins against the gate.
+MAX_PASSWORD_ATTEMPTS = 3
 
 _TIMEOUT = 45
 
@@ -239,9 +243,12 @@ def _hidden(page: str, name: str) -> str:
 def fetch_pdf(link: str, passwords: Iterable[str]) -> tuple[bytes, str]:
     """Walk the gate and return (pdf_bytes, password_that_worked).
 
-    Candidates are tried in the order given — an explicitly supplied password
-    first, then the conventions derived from the profile — and the attempt count
-    is capped, because these are real login attempts against a bank.
+    The passwords here are only ones a person actually entered — the supplied
+    password first, then any saved per-account passwords — never a derived guess.
+    Deriving a password from a name and date of birth happens only for an
+    already-downloaded PDF, on this machine, where a wrong attempt reaches no one;
+    the gate is a live bank login and is deliberately never given one. The attempt
+    count is capped on top of that, because every attempt here is a real login.
     """
     tried: list[str] = []
     for candidate in passwords:
@@ -250,8 +257,8 @@ def fetch_pdf(link: str, passwords: Iterable[str]) -> tuple[bytes, str]:
         if len(tried) >= MAX_PASSWORD_ATTEMPTS:
             raise SmartStatementError(
                 f"stopped after {MAX_PASSWORD_ATTEMPTS} password attempts without success — "
-                f"set the statement password on the account rather than relying on the "
-                f"name/date-of-birth convention"
+                f"set this account's statement password on the Bank tab so the gate is given "
+                f"the right one directly"
             )
         tried.append(candidate)
         # A fresh gate per attempt: the token is single-use and a rejected
@@ -269,8 +276,9 @@ def fetch_pdf(link: str, passwords: Iterable[str]) -> tuple[bytes, str]:
         return gate.pdf(job, sequence), candidate
     if not tried:
         raise SmartStatementError(
-            "no statement password available — set one on the bank account, or save your "
-            "name and date of birth on the Cards tab so the usual convention can be derived"
+            "no statement password available — set this account's statement password on the "
+            "Bank tab. The smart statement gate is a live bank login, so it is only ever given "
+            "a password you saved, never one derived from your name and date of birth"
         )
     raise SmartStatementError(
         f"the statement password was not accepted ({len(tried)} attempt(s))"

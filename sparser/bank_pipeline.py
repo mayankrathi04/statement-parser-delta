@@ -58,6 +58,28 @@ def _password_candidates(db_path: Path, creds: dict) -> list[str]:
     ))
 
 
+def _explicit_passwords(db_path: Path, creds: dict) -> list[str]:
+    """Only passwords a person actually entered: the run's supplied password and
+    the ones saved per account. Never the name/DOB-derived guesses.
+
+    This is the *only* list allowed to reach HDFC's smart-statement gate. Every
+    attempt there is a real login against a live banking endpoint, so nothing that
+    was merely derived — and therefore might be wrong — is ever sent to it. The
+    derived conventions stay in :func:`_password_candidates`, which only opens an
+    already-downloaded PDF sitting on this machine, where a wrong guess costs
+    nothing and reaches no one.
+    """
+    conn = store.connect(db_path)
+    try:
+        known = accounts.all_bank_passwords(conn)
+    finally:
+        conn.close()
+    return list(dict.fromkeys(
+        ([creds["password"]] if creds.get("password") else [])
+        + list(known.values())
+    ))
+
+
 def ingest_file(
     rec: Recorder,
     pdf: Path,
@@ -463,9 +485,10 @@ def run_scan_mail(
         else:
             since, before = dt.date.today() - dt.timedelta(days=31 * months), None
 
-        # HDFC's smart statement is fetched, not attached, and the gate wants the
-        # same password the PDF would have wanted. Resolve the candidates once.
-        passwords = _password_candidates(db_path, creds)
+        # HDFC's smart statement is fetched, not attached: the gate is a live
+        # login, so it receives only passwords a person actually entered — the
+        # supplied one and the ones saved per account — never a derived guess.
+        passwords = _explicit_passwords(db_path, creds)
 
         found: list[Path] = []
         member_of: dict[Path, Optional[int]] = {}

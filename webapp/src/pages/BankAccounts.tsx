@@ -6,7 +6,7 @@ import ScanDefaults from '../components/ScanDefaults'
 import { money2 } from '../lib/format'
 
 /** The password that opens this account's statement PDFs — and, for HDFC, the
- *  smart statement link's gate, which asks for the same thing. */
+ *  only password sent to the smart statement link's live gate (never a derived one). */
 function PasswordCell({ account, onSaved }: { account: BankAccount; onSaved: () => void }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState('')
@@ -202,8 +202,10 @@ export default function BankAccounts({
         </p>
         <p className="hint">
           Expand an account to narrow which mails a bank scan searches for it. The statement
-          password is stored encrypted and tried before anything is derived — for an HDFC smart
-          statement it is also what opens the link's password gate.
+          password is stored encrypted and tried before anything is derived when opening a
+          downloaded PDF. For an HDFC smart statement — a live login behind the mailed link — the
+          gate is only ever given a password you saved here, never one derived from a name and
+          date of birth, so set it explicitly if you want smart statements fetched.
         </p>
         {!accounts.length && (
           <p className="empty">
