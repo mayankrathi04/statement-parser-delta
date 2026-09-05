@@ -44,3 +44,9 @@ graphify-out/
 .graphify_*
 .env
 *.bak
+
+# Local-only tooling: the demo-data generator and the screenshot runner. They
+# exist to keep real statements out of published pictures, and are kept off the
+# repository so nobody mistakes their invented ledgers for shipped fixtures.
+scripts/seed_demo.py
+scripts/shoot_demo.py

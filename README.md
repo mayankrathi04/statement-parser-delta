@@ -6,6 +6,11 @@ you can keep adding to. Every extraction is **proved by arithmetic** before it i
 Every statement in the regression corpus parses at 100% confidence, with every
 reconciliation check passing to the paisa.
 
+**Every screenshot on this page is of invented data** — fictional issuers, generated
+statements, amounts nobody spent. A dashboard over real statements is a disclosure of
+which cards someone holds and what they spend, so none of this repository's images are
+of one.
+
 **`inbox/` is the source of truth for documents**, and holds each one exactly once:
 every PDF as the mailbox delivered it, encrypted as the issuer sent it, named
 `YYYYMM_<mailbox>_<issuer's own attachment name>.pdf`. It is organised by instrument,
@@ -74,6 +79,8 @@ top merchants, and the full transaction table (sortable, searchable). Reward
 points, EMIs and foreign-currency legs each get their own section — they are
 separate ledgers, and folding points into a rupee total would be nonsense.
 
+[![Card Analysis — stat tiles, monthly spend against payments, category and merchant breakdowns, and the full transaction table](docs/screenshots/card-analysis.png)](docs/screenshots/card-analysis.png)
+
 **Cards** — one row per card, discovered from the statements themselves. Shows how
 many statements and transactions each has, lets you store that card's PDF
 password, and — in its own panel — the **sender and subject lists a scan searches for
@@ -83,6 +90,8 @@ they are the first thing to widen. Editable, with the shipped lists one click aw
 conventions. When a derived one works it is **saved against that card
 automatically** and marked `learned`, so next month it opens on the first attempt.
 Values are encrypted and only sent to the page when you click *show*.
+
+[![Cards — one row per card, with the stored statement password and the sender and subject lists a scan falls back to](docs/screenshots/cards.png)](docs/screenshots/cards.png)
 
 **Card Pipeline** — scan-then-approve. Pick *this month*, a **specific month**, the last
 12 months, or a folder on disk. A scan downloads and fully parses each PDF but
@@ -104,11 +113,15 @@ or discard. Every PDF's journey is recorded step by step:
 
 Runs are kept, so "why is this statement missing?" is answerable months later.
 
+[![Card Pipeline — a scan held for review, with each stage of the extraction and every arithmetic check](docs/screenshots/card-pipeline.png)](docs/screenshots/card-pipeline.png)
+
 **Bank Analysis** — account and date filters, cash-flow totals, opening/closing
 balances, monthly withdrawals vs deposits, debit categories, counterparties, and
 the complete bank transaction table with reference, value date and running balance.
 Click a category to set a manual label (including `Tax`) or restore the automatic
 label; overrides stay separate from parser-derived enrichment.
+
+[![Bank Analysis — cash-flow totals, monthly withdrawals against deposits, categories, counterparties and the bank ledger](docs/screenshots/bank-analysis.png)](docs/screenshots/bank-analysis.png)
 
 **Bank Accounts** — one expandable row per account. The full account number is not
 copied into account records: identity uses a one-way fingerprint and display uses
@@ -120,12 +133,16 @@ when a derived one turns out to work. The same **unrecognized accounts** search 
 the Cards tab sits below the list, holding the sender and subject lists a bank scan falls
 back to.
 
+[![Bank Accounts — an account expanded to show every imported statement, its own mailbox rules and its stored password](docs/screenshots/bank-accounts.png)](docs/screenshots/bank-accounts.png)
+
 **Bank Pipeline** — scan-then-approve, the same three sources as cards: **a mailbox
 connection**, an **upload**, or a **folder on disk**. Digital-text account statements from
 **HDFC, ICICI, IndusInd and IDFC FIRST** are classified, reconstructed from PDF geometry,
 checked against every adjacent running balance, then held for review with confidence,
 checks, period, row count and duplicate status. Only selected statements are written to
 the bank ledger. Its run history is separate from card runs.
+
+[![Bank Pipeline — account statements parsed and held for review, with their own run history](docs/screenshots/bank-pipeline.png)](docs/screenshots/bank-pipeline.png)
 
 A mail scan takes the same windows as a card scan (this month, a specific month, a
 range, the last 12), filters by **account** — including an *unrecognized accounts* option
@@ -153,6 +170,23 @@ searching is the slow part of a sweep. Untick both to pause a mailbox without
 disconnecting it. App passwords are encrypted before touching the database; the key
 lives at `~/.config/sparser/secret.key` (0600, outside the project), so the
 database alone leaks nothing usable.
+
+[![Connections — one row per mailbox, with what each is swept for](docs/screenshots/connections.png)](docs/screenshots/connections.png)
+
+**Categories** — the labels both ledgers group by, and the rules that assign them.
+Two levels: a short list of **majors** the household thinks in, and the **sub-categories**
+that actually match a narration, tried top down with the first match winning. A rule you
+write beats the category an issuer printed; a category you set on one transaction by hand
+beats everything and survives re-applying the rules across both ledgers.
+
+[![Categories — majors, sub-categories and the regexes behind them](docs/screenshots/categories.png)](docs/screenshots/categories.png)
+
+**Members** — one row per person in the household. Cards, accounts and mailboxes each
+belong to a member, which is what keeps their spending separable behind the member
+selector at the top of every screen. A member can only be removed once nothing is filed
+under them, and removing one never deletes statements.
+
+[![Members — the household roster, with what is filed under each person](docs/screenshots/members.png)](docs/screenshots/members.png)
 
 ## Why the extraction is trustworthy
 
