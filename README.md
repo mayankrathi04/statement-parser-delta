@@ -419,6 +419,32 @@ committed — see `.gitignore`.
 - **The server is loopback-only and unauthenticated.** It serves unredacted
   financial history — do not expose it without auth in front.
 
+## Disclaimer
+
+A personal tool for reading **your own** statements, out of **your own** mailbox, with
+**your own** credentials. It holds no accounts, ships no credentials, and connects to
+nothing you have not connected yourself.
+
+- **Not affiliated with, endorsed by or supported by any bank or card issuer.** Issuer
+  and product names appear only to say which document layouts are recognised.
+- **It authenticates as you.** Where a statement sits behind a password gate, this
+  supplies a password you already know, to fetch a document already addressed to you. It
+  bypasses no access control, exploits no vulnerability, and can reach no account but
+  yours. Attempts against a live gate are capped, and only a password you typed or saved
+  is ever sent to one — a derived guess never leaves your machine, because a wrong
+  password there is a failed login on your real account.
+- **Your bank's terms are between you and your bank.** Some customer agreements restrict
+  automated access to online banking. Read yours before pointing the mail fetcher at your
+  accounts. Nothing else here depends on that decision: parsing a PDF you already hold,
+  storing it locally and analysing it involves no one but you.
+- **Mailbox access is read-only.** Statement mails are fetched over IMAP with an app
+  password you issue and can revoke; nothing in the mailbox is modified or deleted.
+- **Nothing leaves your machine.** No telemetry, no upload, no third-party service. The
+  server binds to loopback and is unauthenticated — see *Known limitations*.
+- **No warranty.** See [LICENSE](LICENSE). This prints numbers about money; it is not
+  financial or tax advice, and figures should be checked against the statements
+  themselves before anyone relies on them.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
