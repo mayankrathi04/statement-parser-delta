@@ -150,12 +150,30 @@ for accounts no statement has introduced yet — and by **connection**. It searc
 mailboxes ticked for bank statements, and it stops at the review queue: nothing a sweep
 downloads reaches the ledger without approval.
 
-**HDFC mails a link, not a file.** Its smart statement is a password gate, so the sweep
-follows it: read the form, fetch the one-shot token, post the scrambled password, then
-pull the PDF — one cookie jar across the whole exchange, because the gate rejects every
-call that does not return the session it opened. The password is the same one the PDF
-would have wanted, so a stored account password is tried first and the name/DOB
-convention only after; attempts are capped, since these are real logins against a bank.
+**Some banks mail a link, not a file.** The statement sits behind a password gate, so
+the sweep follows it: read the form, fetch the one-shot token, post the scrambled
+password, then pull the PDF — one cookie jar across the whole exchange, because the gate
+rejects every call that does not return the session it opened. The password is the same
+one the PDF would have wanted, so a stored account password is tried first; a password
+*derived* from a name and date of birth is never sent to a gate, only ever tried against
+a PDF already on disk. Attempts are capped at three, because these are real logins.
+
+**No bank's gate is described in this repository.** `sparser/smartstatement.py` is the
+client — the exchange, the cookie handling, the ciphers, the cap. Which host, which
+endpoints, which form fields and which cipher key belong to a **gate profile**, a small
+JSON file that lives with your other local secrets:
+
+```
+~/.config/sparser/gates/<name>.json          # or $SPARSER_GATES
+```
+
+[`sparser/gates/example.json`](sparser/gates/example.json) documents the format and is
+what the tests run against; its host does not resolve and its key is nobody's. A profile
+describes one institution's private endpoints, and shipping one would make this
+repository the thing that hands them out — a different object from a tool that fetches
+your own statement from your own bank. Write the profile you need and nothing else has
+to change. With none installed, a linked statement is simply a mail with no attachment,
+and every other part of the pipeline is unaffected.
 
 **Nothing ever duplicates.** A card statement is keyed by card and billing cycle;
 a bank statement by account fingerprint and statement period. Re-fetching a cycle
@@ -265,7 +283,8 @@ sparser/
 │   ├── indusind.py   ruled columns; masked account number; hard-wrapped narrations
 │   ├── idfc.py       fully ruled table; consolidated multi-account statements
 │   └── icici.py      fully ruled table; remarks start above their own dated line
-├── smartstatement.py HDFC's linked statement: its password gate, its two ciphers
+├── smartstatement.py linked statements: the password-gate client; gates/ holds
+│                  the profile format, never a real bank's coordinates
 ├── bank_pipeline.py bank ingest — upload, disk and mail — separate from card templates
 ├── bank_store.py    bank accounts/statements/transactions + cash-flow analytics
 ├── api.py        FastAPI

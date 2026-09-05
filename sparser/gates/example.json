@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "The format of a gate profile, and the fixture the tests run against.",
+    "Nothing here is a real bank: the host does not resolve and the key is not",
+    "anyone's. Copy this to ~/.config/sparser/gates/<name>.json and fill in the",
+    "gate you actually need — the file stays on your machine, like secret.key.",
+    "Fields: {job} and {sequence} are substituted, url-quoted, into the paths."
+  ],
+
+  "name": "example-bank-statement-gate",
+  "link_pattern": "https?://[\\w.-]*statements\\.example\\.bank/[^\\s\"'<>\\\\]+",
+  "button": "view\\s*(your\\s*)?statement",
+
+  "form": {
+    "job_query_param": "job",
+    "job_field": "ke",
+    "sequence_fields": ["sequence", "seq"],
+    "password_field": "pwd"
+  },
+
+  "endpoints": {
+    "token": "/GetToken?job={job}",
+    "authenticate": "/service/app/htmlformat",
+    "pdf": "/service/app/pdfformat?job={job}&reqid={sequence}&format=pdf"
+  },
+
+  "password_cipher": { "kind": "chained-xor", "key": "exampleKey" },
+
+  "response": {
+    "cipher": "aes-ecb",
+    "payload_call": "Data\\(\\s*[\"']([^\"']+)[\"']\\s*,\\s*[\"']([^\"']*)[\"']\\s*\\)",
+    "refusal": "invalid\\s+password|incorrect\\s+password|please\\s+enter\\s+the\\s+valid"
+  },
+
+  "max_password_attempts": 3
+}

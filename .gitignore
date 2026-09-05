@@ -50,3 +50,8 @@ graphify-out/
 # repository so nobody mistakes their invented ledgers for shipped fixtures.
 scripts/seed_demo.py
 scripts/shoot_demo.py
+
+# Gate profiles name one bank's private endpoints. The example is the format;
+# a real one belongs in ~/.config/sparser/gates/, not in the repository.
+sparser/gates/*.json
+!sparser/gates/example.json

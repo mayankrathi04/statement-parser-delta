@@ -58,7 +58,7 @@ SUBJECT_SEARCHES = ["credit card statement", "credit card e-statement", "card st
 # apart, and widening the card lists would pull account statements into card
 # scans (and the reverse) before any classifier got a say.
 BANK_STATEMENT_SENDERS = [
-    "hdfcbank.net", "hdfcbank.com", "statements.example.bank", "icicibank.com",
+    "hdfcbank.net", "hdfcbank.com", "icicibank.com",
     "axisbank.com", "kotak.com", "idfcfirstbank.com", "indusind.com", "sbi.co.in",
     "yesbank.in", "rblbank.com", "aubank.in", "federalbank.co.in", "pnb.co.in",
 ]
@@ -545,10 +545,12 @@ def _body_text(msg: Message) -> str:
     return "\n".join(chunks)
 
 
-#: What the button reading "View your SmartStatement" says, however it is spelt
-#: and wherever it is written — the visible words, an image's alt text, or the
-#: campaign tag the bank puts in the URL itself (``utm_tag=View_SmartStatement1``).
-SMART_BUTTON = re.compile(r"view\s*(your\s*)?smart\s*statement", re.I)
+#: The words on the button that opens a statement gate, however they are spelt
+#: and wherever they are written — the visible label, an image's alt text, or the
+#: campaign tag in the URL itself. Which words those are is a property of the
+#: institution, so it comes from its gate profile; this is only the fallback for
+#: a profile that names none.
+DEFAULT_STATEMENT_BUTTON = re.compile(r"view\s*(your\s*)?statement", re.I)
 
 
 class _Anchors(HTMLParser):
@@ -607,48 +609,39 @@ def _anchor_labels(body: str) -> dict[str, str]:
 
 
 def smart_statement_links(msg: Message) -> list[str]:
-    """Smart-statement URLs in a mail body, most specific first, deduplicated.
+    """Statement-gate URLs in a mail body, most promising first, deduplicated.
 
-    A campaign mail repeats the link in the button, the fallback text and the
-    footer; they are all the same job, and following one is enough.
-
-    What identifies the link is the host and its ``job``, never the wording on
-    the button: the label is decoration the bank is free to change, and a mail
-    whose button is an image or another language would stop being fetchable if
-    the label were required. It is used to *order* the candidates instead, so
-    when a mail does carry several jobs the one under "View your
-    SmartStatement" is the one walked first.
+    The link itself is recognised by :func:`sparser.smartstatement.links_in`,
+    against the profiles installed on this machine — host and job parameter, the
+    two things a gate itself consumes. What this adds is the mail: an anchor's
+    visible label, or its image's alt text, which live in the markup and not in
+    the URL. They *order* the candidates when a mail carries several; they never
+    gate them, so a plain-text mail, a relabelled campaign or another language is
+    still followed.
     """
-    from .smartstatement import SMART_LINK
+    from .smartstatement import links_in, profiles
 
     body = _body_text(msg)
     labels = _anchor_labels(body)
-    found: list[str] = []
-    for match in SMART_LINK.finditer(body):
-        link = match.group(0).rstrip(").,;'\"")
-        # HTML entities survive the decode; the query string is where they land.
-        link = link.replace("&amp;", "&")
-        if "job=" in link.lower() and link not in found:
-            found.append(link)
+    found = links_in(body)
+    buttons = [profile.button for profile in profiles() if profile.button] \
+        or [DEFAULT_STATEMENT_BUTTON]
 
     def rank(link: str) -> int:
-        if SMART_BUTTON.search(labels.get(link, "")):
-            return 0
-        # The campaign tag is the same words, machine-readable and immune to the
-        # markup the label is wrapped in.
-        if SMART_BUTTON.search(urllib.parse.unquote(link).replace("_", " ")):
-            return 1
-        return 2
+        label = labels.get(link, "")
+        return 0 if any(button.search(label) for button in buttons) else 1
 
-    # Stable, so links of equal standing stay in the order the mail wrote them.
+    # Stable, so links of equal standing keep the order links_in gave them.
     return sorted(found, key=rank)
 
 
-def hdfc_smart_statement_fetcher(passwords: Iterable[str]) -> LinkFetcher:
-    """A :data:`LinkFetcher` that walks HDFC's password gate for a linked PDF.
+def linked_statement_fetcher(passwords: Iterable[str]) -> LinkFetcher:
+    """A :data:`LinkFetcher` that walks a mailed password gate for the PDF behind it.
 
     Bound to the password candidates the pipeline resolved, so the mailbox sweep
-    itself never has to know how a statement password is derived.
+    itself never has to know how a statement password is derived. Which gates can
+    be walked is whatever :mod:`sparser.smartstatement` has profiles for; with
+    none installed, a linked statement is simply a mail with no attachment.
     """
     candidates = list(passwords)
 
@@ -693,7 +686,7 @@ def fetch_bank_account(
         senders=senders, subject_searches=subject_searches,
         classifier=classify_bank_mail,
         require_pdf=False,
-        link_fetcher=hdfc_smart_statement_fetcher(passwords),
+        link_fetcher=linked_statement_fetcher(passwords),
     )
 
 
