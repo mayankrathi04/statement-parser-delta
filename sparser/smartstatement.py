@@ -5,12 +5,14 @@ gate that asks for the same password the PDF would have wanted and only serves
 the document once it is satisfied. This module is a faithful client of that
 *shape* of gate — and only the shape. Which host, which endpoints, which form
 fields and which cipher key are not in this file. They live in a **gate
-profile**: a small JSON document kept with your other local secrets.
+profile**: a small JSON document that sits beside this module and is not
+committed.
 
-    ~/.config/sparser/gates/<name>.json        (or $SPARSER_GATES)
+    sparser/gates/<name>.json                  (or $SPARSER_GATES)
 
-`sparser/gates/example.json` documents the format and is what the tests run
-against. **No real institution's profile ships with this project.** A profile is
+`.gitignore` keeps every profile in that folder out of the repository except
+`sparser/gates/example.json`, which documents the format and is what the tests
+run against. **No real institution's profile ships with this project.** A profile is
 a description of one bank's private endpoints, and publishing one would make
 this repository the thing that hands them out; that is a different object from a
 tool that fetches your own statement from your own bank. Write the profile you
@@ -139,12 +141,18 @@ class GateProfile:
 
 
 def gates_dir() -> Path:
-    """Where installed profiles live — beside the encryption key, not in the tree."""
+    """Where installed profiles live: next to this module, ignored by git.
+
+    In the folder rather than in ``~/.config`` because a profile is not a
+    credential — it unlocks nothing on its own — and keeping it with the code
+    that reads it means one directory to copy when the project moves machines.
+    ``.gitignore`` is what keeps it unpublished, and the packaging manifest
+    ships only ``example.json``, so an install carries no profile either.
+    """
     override = os.environ.get("SPARSER_GATES")
     if override:
         return Path(override).expanduser()
-    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "sparser"
-    return base / "gates"
+    return Path(__file__).resolve().parent / "gates"
 
 
 _cache: Optional[tuple[Path, tuple[GateProfile, ...]]] = None

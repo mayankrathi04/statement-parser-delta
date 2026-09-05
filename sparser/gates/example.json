@@ -2,8 +2,9 @@
   "_comment": [
     "The format of a gate profile, and the fixture the tests run against.",
     "Nothing here is a real bank: the host does not resolve and the key is not",
-    "anyone's. Copy this to ~/.config/sparser/gates/<name>.json and fill in the",
-    "gate you actually need — the file stays on your machine, like secret.key.",
+    "anyone's. Copy it to sparser/gates/<name>.json and fill in the gate you",
+    "actually need: .gitignore keeps every profile here but this one out of the",
+    "repository, and packaging ships only this one.",
     "Fields: {job} and {sequence} are substituted, url-quoted, into the paths."
   ],
 

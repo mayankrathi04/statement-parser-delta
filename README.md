@@ -161,11 +161,15 @@ a PDF already on disk. Attempts are capped at three, because these are real logi
 **No bank's gate is described in this repository.** `sparser/smartstatement.py` is the
 client — the exchange, the cookie handling, the ciphers, the cap. Which host, which
 endpoints, which form fields and which cipher key belong to a **gate profile**, a small
-JSON file that lives with your other local secrets:
+JSON file that sits beside the module and is never committed:
 
 ```
-~/.config/sparser/gates/<name>.json          # or $SPARSER_GATES
+sparser/gates/<name>.json                    # or $SPARSER_GATES
 ```
+
+`.gitignore` keeps everything in that folder out of the repository except the example,
+and the packaging manifest ships only the example, so neither a clone nor an install
+carries anyone's gate.
 
 [`sparser/gates/example.json`](sparser/gates/example.json) documents the format and is
 what the tests run against; its host does not resolve and its key is nobody's. A profile
